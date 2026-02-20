@@ -65,14 +65,14 @@ folders = ["uploads/reports", "generated_invoices", "generated_delivery_notes", 
 for folder in folders:
     os.makedirs(os.path.join(EXE_DIR, folder), exist_ok=True)
 
-# --- 5. ROUTER REGISTRATION ---
+# --- 5. ROUTER REGISTRATION (API ROUTES FIRST) ---
 app.include_router(auth_router, prefix="/auth")
-app.include_router(enquiry_router)
-app.include_router(quotation_router) # Already has /quotations in its file
-app.include_router(project_router)
-app.include_router(test_request_router) # Already has /test-requests in its file
-app.include_router(samples_workflow_router) # Already has /samples-workflow in its file
-app.include_router(invoice_router) # Already has /invoices in its file
+app.include_router(enquiry_router)  # Already has /enquiries in its file
+app.include_router(quotation_router)  # Already has /quotations in its file
+app.include_router(project_router)  # Already has /projects in its file
+app.include_router(test_request_router)  # Already has /test-requests in its file
+app.include_router(samples_workflow_router)  # Already has /samples-workflow in its file
+app.include_router(invoice_router)  # Already has /invoices in its file
 app.include_router(reports_router, prefix="/reports")
 app.include_router(search_router, prefix="/search")
 
@@ -80,13 +80,21 @@ app.include_router(search_router, prefix="/search")
 if os.path.exists(DIST_PATH) and os.path.exists(os.path.join(DIST_PATH, "assets")):
     app.mount("/assets", StaticFiles(directory=os.path.join(DIST_PATH, "assets")), name="assets")
 
-# --- 7. REACT CATCH-ALL ROUTE ---
-@app.get("/{full_path:path}")
-async def serve_react_or_api(full_path: str):
-    # If the path starts with these, it's a broken API call, not a React route
-    api_prefixes = ['auth', 'reports', 'invoices', 'search', 'enquiries', 'quotations', 'projects', 'test-requests', 'samples-workflow', 'api']
-    if any(full_path.startswith(prefix) for prefix in api_prefixes):
-        raise HTTPException(status_code=404, detail="API route not found")
+# --- 7. API HEALTH CHECK (OPTIONAL) ---
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "api": "running", "frontend": os.path.exists(DIST_PATH)}
+
+# --- 8. REACT CATCH-ALL ROUTE (MUST BE LAST!) ---
+# This catches any routes not matched above and serves the React app
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_frontend(full_path: str):
+    """
+    Serve React app for any non-API routes.
+    This only runs if no other route (API, docs, static files) matches.
+    """
+    # Let FastAPI handle its own docs paths automatically
+    # This function only runs for paths not matched by any previous route
     
     index_path = os.path.join(DIST_PATH, "index.html")
     if os.path.exists(index_path):
@@ -94,10 +102,11 @@ async def serve_react_or_api(full_path: str):
     
     return {
         "message": "GEL LIMS Backend is running",
-        "frontend_status": "Not Found at " + index_path
+        "frontend_status": f"Frontend not found at {index_path}",
+        "note": "API endpoints available at /docs, /redoc, /openapi.json"
     }
 
-# --- 8. RUN SERVER ---
+# --- 9. RUN SERVER ---
 if __name__ == "__main__":
     # Auto-open browser after 3 seconds if running as EXE
     if getattr(sys, 'frozen', False):
