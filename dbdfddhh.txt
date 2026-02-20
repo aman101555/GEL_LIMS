@@ -1,0 +1,243 @@
+@router.get("/{invoice_id}/excel")
+def generate_excel_invoice(invoice_id: int):
+    """
+    Generate Excel invoice using the template, insert rows dynamically,
+    fill test items, report numbers, amounts, totals and save on server.
+    """
+
+    # Path to converted template (.xlsx)
+    template_path = r"C:\Users\USER\my-react-app\public\templates\invoice.xlsx"
+
+    if not os.path.exists(template_path):
+        raise HTTPException(status_code=404, detail="Invoice template not found. Convert invoice.xls → .xlsx")
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        # =====================================================
+        # 1. Load full invoice from DB
+        # =====================================================
+        invoice = get_invoice_complete(invoice_id, cur)
+        project_details = invoice.get("project_details", {})
+        items = invoice.get("items", [])
+        
+        # DEBUG: Print what data we're getting
+        print("=== DEBUG INVOICE DATA ===")
+        print(f"Invoice: {invoice.get('invoice_no')}")
+        print(f"Subtotal: {invoice.get('subtotal')}")
+        print(f"VAT (5%): {invoice.get('vat')}")
+        print(f"Total: {invoice.get('total')}")
+        print(f"Number of items: {len(items)}")
+        print("==========================")
+
+        # =====================================================
+        # 2. Load the Excel template
+        # =====================================================
+        wb = openpyxl.load_workbook(template_path, data_only=False)  # Keep formulas accessible
+        ws = wb.active
+
+        # =====================================================
+        # 3. Fill Header Fields
+        # =====================================================
+        ws["I4"] = invoice.get("invoice_no", " - ")
+        
+        # Invoice date
+        invoice_date = invoice.get("invoice_date")
+        if invoice_date:
+            if isinstance(invoice_date, str):
+                ws["I5"] = invoice_date
+            else:
+                ws["I5"] = invoice_date.strftime("%d-%b-%Y")
+        else:
+            ws["I5"] = " - "
+
+        # Client Section
+        ws["A5"] = project_details.get("client_name", " - ")
+        ws["C10"] = project_details.get("client_contact", " - ")
+
+        # Project details
+        ws["C13"] = project_details.get("project_no", " - ")
+        ws["C15"] = project_details.get("project_name", " - ")
+        ws["C14"] = project_details.get("location", " - ")
+
+        # LPO
+        lpo_reference = invoice.get("lpo_reference", " - ")
+        ws["C18"] = lpo_reference
+        
+        # LPO date
+        lpo_date = invoice.get("lpo_date")
+        if lpo_date:
+            if isinstance(lpo_date, str):
+                ws["I6"] = lpo_date
+            else:
+                ws["I6"] = lpo_date.strftime("%d-%b-%Y")
+        else:
+            ws["I6"] = " - "
+
+        # Payment Terms
+        ws["I8"] = invoice.get("payment_terms", " - ")
+
+        # =====================================================
+        # 4. Insert Dynamic Item Rows (Start at Row 18)
+        # =====================================================
+        start_row = 18
+        num_items = len(items)
+
+        if num_items > 1:
+            ws.insert_rows(start_row + 1, amount=num_items - 1)
+
+        # =====================================================
+        # 5. Fill Item Rows
+        # =====================================================
+        for index, item in enumerate(items):
+            row = start_row + index
+
+            # Fetch report for this sample (if exists)
+            cur.execute("""
+                SELECT report_no, created_at
+                FROM reports
+                WHERE sample_id = %s
+                ORDER BY report_id DESC LIMIT 1
+            """, (item.get("sample_id"),))
+
+            r = cur.fetchone()
+            report_no = r[0] if r else " - "
+            
+            if r and r[1]:
+                report_date = r[1].strftime("%d-%b-%Y") if hasattr(r[1], 'strftime') else str(r[1])
+            else:
+                report_date = " - "
+
+            # Fill columns A–K
+            ws[f"A{row}"] = report_no
+            ws[f"B{row}"] = report_date
+            ws[f"D{row}"] = item.get("description", " - ")
+            ws[f"E{row}"] = item.get("test_standard", " - ")
+            ws[f"I{row}"] = int(item.get("quantity", 0))
+            ws[f"J{row}"] = float(item.get("unit_rate", 0))
+            ws[f"K{row}"] = float(item.get("amount", 0))
+
+        # =====================================================
+        # 6. CRITICAL: UPDATE EXCEL FORMULAS DYNAMICALLY
+        # =====================================================
+        # Calculate the last row with data
+        last_item_row = start_row + num_items - 1
+        
+        print(f"=== UPDATING EXCEL FORMULAS ===")
+        print(f"First item row: {start_row}")
+        print(f"Last item row: {last_item_row}")
+        print(f"Total items: {num_items}")
+        print("===============================")
+        
+        # ORIGINAL FORMULAS (from your template):
+        # K35: =SUM(K18:K34)  - sums amounts from row 18 to 34
+        # K36: =K35*5%        - calculates 5% VAT
+        # K37: =K35+K36       - calculates total
+        
+        # UPDATE K35 FORMULA: Adjust the SUM range to match actual item rows
+        # If items are in rows 18-19, formula becomes: =SUM(K18:K19)
+        ws["K35"].value = f"=SUM(K{start_row}:K{last_item_row})"
+        
+        # K36 FORMULA: Keep as 5% of K35 (already correct in template)
+        # No need to change - it's already =K35*5%
+        
+        # K37 FORMULA: Keep as K35 + K36 (already correct in template)
+        # No need to change - it's already =K35+K36
+        
+        # Amount in words (static value - no formula)
+        ws["B38"] = invoice.get("amount_in_words", " - ")
+        
+        # DEBUG: Verify formulas are set correctly
+        print(f"K35 formula set to: {ws['K35'].value}")
+        print(f"K36 formula: {ws['K36'].value}")
+        print(f"K37 formula: {ws['K37'].value}")
+        
+        # =====================================================
+        # 7. OPTIONAL: Verify calculations match our database
+        # =====================================================
+        # Calculate what Excel should show after formulas update
+        excel_subtotal = sum(item.get("amount", 0) for item in items)
+        excel_vat = excel_subtotal * 0.05
+        excel_total = excel_subtotal + excel_vat
+        
+        db_subtotal = float(invoice.get("subtotal", 0))
+        db_vat = float(invoice.get("vat", 0))
+        db_total = float(invoice.get("total", 0))
+        
+        print(f"=== VERIFICATION ===")
+        print(f"Database values -> Subtotal: {db_subtotal}, VAT: {db_vat}, Total: {db_total}")
+        print(f"Excel should show -> Subtotal: {excel_subtotal}, VAT: {excel_vat}, Total: {excel_total}")
+        
+        # If there's a mismatch, it means our item amounts don't match the DB totals
+        if abs(excel_subtotal - db_subtotal) > 0.01:
+            print(f"⚠️ WARNING: Subtotal mismatch! Database: {db_subtotal}, Excel sum: {excel_subtotal}")
+            print("This could be due to:")
+            print("1. Grouping/consolidation of items in database")
+            print("2. Rounding differences")
+            print("3. Items with different unit rates grouped together")
+        
+        # =====================================================
+        # 8. Save Final File on Server
+        # =====================================================
+        output_dir = r"C:\Users\USER\my-react-app\public\generated_invoices"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Create download filename
+        invoice_no = invoice.get('invoice_no', 'invoice')
+        project_name = project_details.get('project_name', '')
+        lpo_reference = invoice.get("lpo_reference", "")
+        
+        # Replace slash with hyphen in invoice number for filename
+        invoice_no_hyphen = invoice_no.replace('/', '-')
+        
+        # Clean up strings for filename
+        import re
+        
+        def clean_filename(text):
+            if not text:
+                return ""
+            text = re.sub(r'[\\/*?:"<>|]', '-', text)
+            text = re.sub(r'\s+', '-', text)
+            text = text.strip('- ')
+            return text
+        
+        clean_project_name = clean_filename(project_name)
+        
+        has_lpo = lpo_reference and lpo_reference != " - " and lpo_reference != ""
+        
+        if has_lpo:
+            clean_lpo_number = clean_filename(str(lpo_reference))
+            download_filename = f"{invoice_no_hyphen}-{clean_project_name}-{clean_lpo_number}.xlsx"
+        else:
+            download_filename = f"{invoice_no_hyphen}-{clean_project_name}.xlsx"
+        
+        # Save file
+        output_path = os.path.join(output_dir, f"{invoice_no_hyphen}.xlsx")
+        wb.save(output_path)
+
+        # =====================================================
+        # 9. Return File for Download
+        # =====================================================
+        import urllib.parse
+        encoded_filename = urllib.parse.quote(download_filename)
+        
+        return FileResponse(
+            output_path,
+            filename=download_filename,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}; filename=\"{download_filename}\""
+            }
+        )
+
+    except Exception as e:
+        print("Error generating invoice:", e)
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cur.close()
+        conn.close()
+

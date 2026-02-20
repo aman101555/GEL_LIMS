@@ -1,0 +1,116 @@
+def _prepare_context(self, quotation_data, client_data, items):
+        """Prepare all data for template with proper empty value handling"""
+        print(f"DEBUG: Starting _prepare_context")
+        print(f"DEBUG: items type: {type(items)}, length: {len(items) if items else 0}")
+
+        def safe_get(data, key, default=""):  # Changed default from " - " to empty string
+            if isinstance(data, dict):
+                value = data.get(key)
+            else:
+                value = getattr(data, key, None) if hasattr(data, 'keys') else None
+            
+            if value is None or (isinstance(value, str) and value.strip() == ""):
+                return default  # Returns empty string instead of " - "
+            return value
+
+        def format_currency(value):
+            if value is None or value == 0:
+                return ""  # Empty string instead of " - "
+            try:
+                if isinstance(value, Decimal):
+                    return f"{float(value):,.2f}"
+                return f"{float(value):,.2f}"
+            except (ValueError, TypeError):
+                return ""  # Empty string instead of " - "
+
+        # Debug: Show what we received
+        if items:
+            print(f"DEBUG: First item structure: {items[0] if isinstance(items, list) else 'Not a list'}")
+            print(f"DEBUG: Items list preview: {items[:2] if isinstance(items, list) else items}")
+        
+        try:
+            # ---------------------------------------------------
+            # FIXED: SIMPLIFIED CATEGORY PROCESSING
+            # ---------------------------------------------------
+            # Define categories in exact order as they should appear
+            categories = [
+                {
+                    "main_title": "Geotechnical Investigation",
+                    "subitems": []
+                },
+                {
+                    "main_title": "Drilling & Field Works Tests", 
+                    "subitems": []
+                },
+                {
+                    "main_title": "Samples",
+                    "subitems": []
+                },
+                {
+                    "main_title": "In-situ Testing",
+                    "subitems": []
+                },
+                {
+                    "main_title": "Laboratory Testing",
+                    "subitems": []
+                },
+                {
+                    "main_title": "Engineering Report",
+                    "subitems": []
+                }
+            ]
+            
+            # Category mapping keywords
+            category_keywords = [
+                ['geotechnical', 'investigation', 'test'],  # Category 1
+                ['drill', 'borehole', 'field', 'percussion', 'rotary'],  # Category 2
+                ['sample', 'specimen'],  # Category 3
+                ['in-situ', 'insitu', 'field test', 'penetration'],  # Category 4
+                ['laboratory', 'lab', 'analysis', 'chemical'],  # Category 5
+                ['report', 'engineering', 'document']  # Category 6
+            ]
+
+            total_amount = 0.0
+            
+            if items and isinstance(items, list):
+                print(f"DEBUG: Processing {len(items)} items")
+                
+                for idx, item in enumerate(items):
+                    print(f"DEBUG: Processing item {idx}: {type(item)}")
+                    
+                    # Extract item data safely
+                    if isinstance(item, dict):
+                        description = item.get('description', '').lower() if item.get('description') else ''
+                        unit_rate = item.get('unit_rate', 0) or item.get('rate', 0)
+                        quantity = item.get('quantity', 1) or item.get('qty', 1)
+                        amount = item.get('amount')
+                        
+                        # Calculate amount if not provided
+                        if amount is None:
+                            try:
+                                amount = float(unit_rate) * float(quantity)
+                            except (ValueError, TypeError):
+                                amount = 0
+                        
+                        total_amount += float(amount) if amount else 0
+                        
+                        # Determine category based on description
+                        category_index = 0  # Default to first category
+                        for cat_idx, keywords in enumerate(category_keywords):
+                            if any(keyword in description for keyword in keywords):
+                                category_index = cat_idx
+                                break
+                        
+                        # Add to appropriate category
+                        categories[category_index]["subitems"].append({
+                            'description': item.get('description', ''),
+                            'standard': item.get('test_standard', item.get('standard', '')),
+                            'unit': item.get('unit', ''),
+                            'qty': quantity,
+                            'rate': unit_rate,
+                            'amount': amount
+                        })
+                    else:
+                        print(f"WARNING: Item {idx} is not a dict: {type(item)}")
+            else:
+                print(f"DEBUG: No items or items is not a list: {items}")

@@ -1,0 +1,21 @@
+pyinstaller --noconfirm --onefile --noconsole ^
+  --add-data "dist;dist" ^
+  --add-data "templates;templates" ^
+  --hidden-import "asyncio" ^
+  --hidden-import "uvicorn" ^
+  --hidden-import "psycopg2" ^
+  --hidden-import "psycopg2._psycopg" ^
+  --collect-all "uvicorn" ^
+  --name "GEL_LIMS" ^
+  main.py
+
+
+pyinstaller --noconfirm --onefile --noconsole ^
+  --add-data "dist;dist" ^
+  --hidden-import "asyncio" ^
+  --hidden-import "uvicorn" ^
+  --hidden-import "psycopg2" ^
+  --hidden-import "psycopg2._psycopg" ^
+  --collect-all "uvicorn" ^
+  --name "GEL_LIMS" ^
+  main.py

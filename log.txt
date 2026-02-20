@@ -1,0 +1,16 @@
+main.py:141: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+BASE_DIR: C:\Users\USER\gel_backend\dist
+DIST_PATH: C:\Users\USER\gel_backend\dist\dist
+DIST exists: False
+Created directory: C:\Users\USER\gel_backend\dist\uploads/reports
+Created directory: C:\Users\USER\gel_backend\dist\generated_invoices
+Created directory: C:\Users\USER\gel_backend\dist\generated_delivery_notes
+Created directory: C:\Users\USER\gel_backend\dist\temp_filled_worksheets
+Created directory: C:\Users\USER\gel_backend\dist\generated_proforma
+WARNING: React build not found at C:\Users\USER\gel_backend\dist\dist

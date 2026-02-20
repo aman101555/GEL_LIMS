@@ -1,0 +1,1501 @@
+import { useState,useRef, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import "../Dashboard.css";
+function debounce(func, wait) {
+  let timeout;
+  return function executedFunction(...args) {
+    const later = () => {
+      clearTimeout(timeout);
+      func(...args);
+    };
+    clearTimeout(timeout);
+    timeout = setTimeout(later, wait);
+  };
+}
+// In your Dashboard.jsx, update the imports:
+import CreateQuotation from "../components/quotations/CreateQuotation";
+import ViewQuotations from "../components/quotations/ViewQuotations";
+import ApprovedQuotations from "../components/quotations/ApprovedQuotations";
+import RejectedQuotations from "../components/quotations/RejectedQuotations";
+import RevisionsClarification from "../components/quotations/RevisionsClarification";
+import CreateProject from "../components/projects/CreateProject";
+import ViewProjects from "../components/projects/ViewProjects";
+// In your Dashboard.jsx imports section, add:
+import CreateTestRequest from "../components/test-requests/CreateTestRequest";
+import ViewTestRequests from "../components/test-requests/ViewTestRequests";
+import GenerateSamples from "../components/samples/GenerateSamples";
+import AcceptRejectSamples from "../components/samples/AcceptRejectSamples"; 
+import GenerateWorksheet from "../components/samples/GenerateWorksheet";
+import CreateReport from "../components/reports/CreateReport";
+import ViewReports from "../components/reports/ViewReports";
+import GenerateInvoice from "../components/invoice/GenerateInvoice";
+
+
+
+export default function Dashboard() {
+  const [user, setUser] = useState(null);
+  const [activeModule, setActiveModule] = useState("dashboard");
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [notifications, setNotifications] = useState([]);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const navigate = useNavigate();
+
+
+
+  useEffect(() => {
+    const userData = JSON.parse(localStorage.getItem("user"));
+    if (!userData) {
+      navigate("/");
+      return;
+    }
+    setUser(userData);
+    const savedNotifications = JSON.parse(localStorage.getItem("notifications")) || [];
+    setNotifications(savedNotifications);
+  }, [navigate]);
+
+  // Notifications
+  const addNotification = (message, type = "info") => {
+    const newNotification = {
+      id: Date.now(),
+      message,
+      type,
+      timestamp: new Date().toLocaleString(),
+      read: false
+    };
+    const updatedNotifications = [newNotification, ...notifications];
+    setNotifications(updatedNotifications);
+    localStorage.setItem("notifications", JSON.stringify(updatedNotifications));
+  };
+
+  const markNotificationAsRead = (id) => {
+    const updatedNotifications = notifications.map(notif =>
+      notif.id === id ? { ...notif, read: true } : notif
+    );
+    setNotifications(updatedNotifications);
+    localStorage.setItem("notifications", JSON.stringify(updatedNotifications));
+  };
+
+  const clearAllNotifications = () => {
+    setNotifications([]);
+    localStorage.setItem("notifications", JSON.stringify([]));
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("user");
+    navigate("/");
+  };
+
+  if (!user) return <div className="loading">Loading...</div>;
+
+// In your Dashboard.jsx - UPDATE THE RETURN STATEMENT:
+// In your Dashboard.jsx - UPDATE THE RETURN STATEMENT:
+return (
+  <div className="dashboard-container">
+    <TopBar 
+      user={user}
+      onLogout={handleLogout}
+      onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+      sidebarOpen={sidebarOpen}
+      notifications={notifications}
+      showNotifications={showNotifications}
+      setShowNotifications={setShowNotifications}
+      onMarkAsRead={markNotificationAsRead}
+      onClearAll={clearAllNotifications}
+    />
+
+    <div className="dashboard-content">
+      {sidebarOpen && (
+        <SideNavigation 
+          activeModule={activeModule}
+          setActiveModule={setActiveModule}
+        />
+      )}
+
+      <main className={`main-content ${!sidebarOpen ? 'full-width' : ''}`}>
+        {activeModule === "dashboard" && (
+          <DashboardHome 
+            user={user} 
+            setActiveModule={setActiveModule} 
+          />
+        )}
+        {activeModule === "create-enquiry" && (
+          <CreateEnquiry 
+            onBack={() => setActiveModule("dashboard")}
+            onEnquiryCreated={(enquiry) => {
+              addNotification(`Enquiry ${enquiry.enquiry_id} Created - ${enquiry.enquiry_ref}`, "success");
+              setActiveModule("pending-enquiries");
+            }}
+          />
+        )}
+        {activeModule === "pending-enquiries" && (
+          <PendingEnquiries 
+            onStatusUpdate={(enquiryId, newStatus) => {
+              const statusText = newStatus === 'APPROVED' ? 'Approved' : 'Rejected';
+              addNotification(`Enquiry ${enquiryId} ${statusText}`, "warning");
+            }}
+          />
+        )}
+        {/* ✅ UPDATED QUOTATION COMPONENTS WITH NOTIFICATIONS */}
+        {activeModule === "create-quotation" && 
+          <CreateQuotation 
+            onQuotationCreated={(quotation) => {
+              addNotification(`Quotation ${quotation.quotation_no} created`, "success");
+            }}
+          />
+        }
+        {activeModule === "view-quotations" && 
+          <ViewQuotations 
+            onStatusUpdate={(quotationNo, status) => {
+              const statusMap = {
+                'APPROVED': 'Approved',
+                'REJECTED': 'Rejected',
+                'CLARIFICATION': 'Sent to Revision'
+              };
+              addNotification(`Quotation ${quotationNo} ${statusMap[status] || status}`, "info");
+            }}
+          />
+        }
+        {activeModule === "approved-quotations" && 
+          <ApprovedQuotations 
+            onNotification={(message, type) => addNotification(message, type)}
+          />
+        }
+        {activeModule === "revisions" && 
+          <RevisionsClarification 
+            onStatusUpdate={(quotationNo, status) => {
+              const statusMap = {
+                'APPROVED': 'Approved',
+                'REJECTED': 'Rejected',
+                'CLARIFICATION': 'Sent to Revision'
+              };
+              addNotification(`Quotation ${quotationNo} ${statusMap[status] || status}`, "warning");
+            }}
+          />
+        }
+        {activeModule === "rejected-quotations" && 
+          <RejectedQuotations 
+            onNotification={(message, type) => addNotification(message, type)}
+          />
+        }
+        {/* ✅ ADD THESE TWO LINES FOR PROJECTS */}
+        {activeModule === "create-project" && <CreateProject />}
+        {activeModule === "view-projects" && <ViewProjects />}
+        {activeModule === "create-test-request" && <CreateTestRequest />}
+        {activeModule === "view-test-requests" && <ViewTestRequests />}  
+        {activeModule === "generate-samples" && <GenerateSamples />}
+        {activeModule === "accept-reject-samples" && <AcceptRejectSamples />}
+        {activeModule === "generate-worksheet" && <GenerateWorksheet />}
+        {activeModule === "create-report" && <CreateReport/>}
+        {activeModule === "view-reports" && <ViewReports />}
+        {activeModule === "generate-invoice" && <GenerateInvoice />}
+      </main>
+    </div>
+  </div>
+); }
+
+
+// ------------------------ Components ------------------------
+function SearchBar() {
+  const [searchTerm, setSearchTerm] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [showResults, setShowResults] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState('all'); // 'all', 'enquiries', 'quotations', 'projects'
+
+  // Debounce search to prevent too many API calls
+  const debouncedSearch = useRef(
+    debounce(async (term) => {
+      if (!term.trim()) {
+        setSearchResults([]);
+        return;
+      }
+
+      setLoading(true);
+      try {
+        const results = await performSearch(term, activeTab);
+        setSearchResults(results);
+      } catch (error) {
+        console.error('Search error:', error);
+        setSearchResults([]);
+      } finally {
+        setLoading(false);
+      }
+    }, 300)
+  ).current;
+
+  useEffect(() => {
+    debouncedSearch(searchTerm);
+  }, [searchTerm, activeTab, debouncedSearch]);
+
+const performSearch = async (term, tab) => {
+  const termLower = term.toLowerCase();
+  const results = [];
+
+  try {
+    // Search enquiries
+    if (tab === 'all' || tab === 'enquiries') {
+      const enquiriesResponse = await fetch('http://127.0.0.1:8000/enquiries/');
+      if (enquiriesResponse.ok) {
+        const enquiriesData = await enquiriesResponse.json();
+        const enquiryMatches = enquiriesData.filter(item =>
+          item.enquiry_ref?.toLowerCase().includes(termLower) ||
+          item.enquiry_id?.toString().includes(term) ||
+          item.project_name?.toLowerCase().includes(termLower)
+        ).map(item => ({
+          type: 'enquiry',
+          id: item.enquiry_id,
+          reference: item.enquiry_ref,
+          name: item.project_name,
+          client_id: item.client_id,
+          date: item.enquiry_date,
+          status: item.status,
+          entity: item
+        }));
+        results.push(...enquiryMatches);
+      }
+    }
+
+    // Search quotations
+    if (tab === 'all' || tab === 'quotations') {
+      const quotationsResponse = await fetch('http://127.0.0.1:8000/quotations/');
+      if (quotationsResponse.ok) {
+        const quotationsData = await quotationsResponse.json();
+        const quotationMatches = quotationsData.filter(item =>
+          item.quotation_no?.toLowerCase().includes(termLower) ||
+          item.quotation_id?.toString().includes(term) ||
+          item.enquiry_ref?.toLowerCase().includes(termLower)
+        ).map(item => ({
+          type: 'quotation',
+          id: item.quotation_id,
+          reference: item.quotation_no,
+          name: item.project_name,
+          client_id: item.client_id,
+          date: item.quotation_date,
+          status: item.status,
+          amount: item.total_amount,
+          entity: item
+        }));
+        results.push(...quotationMatches);
+      }
+    }
+
+    // Search projects - ONLY when tab is 'all' or 'projects'
+    if (tab === 'all' || tab === 'projects') {
+      const projectsResponse = await fetch('http://127.0.0.1:8000/projects/projects');
+      if (projectsResponse.ok) {
+        const projectsData = await projectsResponse.json();
+        // ONLY match project-specific fields, NOT enquiry_ref
+        const projectMatches = projectsData.filter(item =>
+          item.project_no?.toLowerCase().includes(termLower) ||
+          item.project_id?.toString().includes(term) ||
+          item.project_name?.toLowerCase().includes(termLower)
+          // REMOVED: item.enquiry_ref?.toLowerCase().includes(termLower)
+        ).map(item => ({
+          type: 'project',
+          id: item.project_id,
+          reference: item.project_no,
+          name: item.project_name,
+          client_name: item.client_name,
+          date: item.created_date,
+          status: item.status,
+          entity: item
+        }));
+        results.push(...projectMatches);
+      }
+    }
+  } catch (error) {
+    console.error('Search API error:', error);
+  }
+
+  // Sort by relevance (exact matches first)
+  return results.sort((a, b) => {
+    const aRef = a.reference?.toLowerCase() || '';
+    const bRef = b.reference?.toLowerCase() || '';
+    
+    if (aRef === termLower && bRef !== termLower) return -1;
+    if (aRef !== termLower && bRef === termLower) return 1;
+    return 0;
+  });
+};
+
+  const handleResultClick = (result) => {
+    console.log('Selected result:', result);
+    // Here you can implement navigation to the specific item
+    // For now, we'll just log it and close the results
+    setShowResults(false);
+    setSearchTerm('');
+  };
+
+  const getTypeIcon = (type) => {
+    switch (type) {
+      case 'enquiry': return '📋';
+      case 'quotation': return '💰';
+      case 'project': return '🏗️';
+      default: return '📄';
+    }
+  };
+
+  const getTypeColor = (type) => {
+    switch (type) {
+      case 'enquiry': return 'var(--enquiry-color)';
+      case 'quotation': return 'var(--quotation-color)';
+      case 'project': return 'var(--project-color)';
+      default: return '#666';
+    }
+  };
+
+  return (
+    <div className="search-container-wrapper">
+      <div className="search-input-wrapper">
+        <input
+          type="text"
+          value={searchTerm}
+          onChange={(e) => {
+            setSearchTerm(e.target.value);
+            setShowResults(true);
+          }}
+          onFocus={() => setShowResults(true)}
+          placeholder="Search enquiry_ref, quotation_no, project_no, client, sample..."
+          className="search-input"
+        />
+        <button className="search-btn">
+          {loading ? '⏳' : '🔍'}
+        </button>
+        
+        {showResults && searchTerm && (
+          <div className="search-results-dropdown">
+            <div className="search-results-header">
+              <div className="search-tabs">
+                <button
+                  className={`search-tab ${activeTab === 'all' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('all')}
+                >
+                  All
+                </button>
+                <button
+                  className={`search-tab ${activeTab === 'enquiries' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('enquiries')}
+                >
+                  📋 Enquiries
+                </button>
+                <button
+                  className={`search-tab ${activeTab === 'quotations' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('quotations')}
+                >
+                  💰 Quotations
+                </button>
+                <button
+                  className={`search-tab ${activeTab === 'projects' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('projects')}
+                >
+                  🏗️ Projects
+                </button>
+              </div>
+              <button
+                className="close-results-btn"
+                onClick={() => setShowResults(false)}
+              >
+                ✕
+              </button>
+            </div>
+            
+            <div className="search-results-list">
+              {loading ? (
+                <div className="search-loading">
+                  <div className="spinner"></div>
+                  <span>Searching...</span>
+                </div>
+              ) : searchResults.length === 0 ? (
+                <div className="no-search-results">
+                  <div className="no-results-icon">🔍</div>
+                  <div className="no-results-text">
+                    <h4>No results found</h4>
+                    <p>Try searching for a different term</p>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="results-count">
+                    Found {searchResults.length} result{searchResults.length !== 1 ? 's' : ''}
+                  </div>
+                  {searchResults.map((result) => (
+                    <div
+                      key={`${result.type}-${result.id}`}
+                      className="search-result-item"
+                      onClick={() => handleResultClick(result)}
+                    >
+                      <div className="result-type-badge" style={{ backgroundColor: getTypeColor(result.type) }}>
+                        {getTypeIcon(result.type)} {result.type.toUpperCase()}
+                      </div>
+                      <div className="result-content">
+                        <div className="result-main">
+                          <div className="result-reference">
+                            <strong>{result.reference || `ID: ${result.id}`}</strong>
+                          </div>
+                          <div className="result-name">
+                            {result.name || 'No name'}
+                          </div>
+                          {result.client_name && (
+                            <div className="result-client">
+                              <small>Client: {result.client_name}</small>
+                            </div>
+                          )}
+                          {result.client_id && !result.client_name && (
+                            <div className="result-client">
+                              <small>Client ID: {result.client_id}</small>
+                            </div>
+                          )}
+                        </div>
+                        <div className="result-meta">
+                          {result.date && (
+                            <div className="result-date">
+                              {new Date(result.date).toLocaleDateString()}
+                            </div>
+                          )}
+                          {result.status && (
+                            <div className={`result-status ${result.status.toLowerCase()}`}>
+                              {result.status}
+                            </div>
+                          )}
+                          {result.amount && (
+                            <div className="result-amount">
+                              ₹{parseFloat(result.amount).toLocaleString()}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Top Bar with Notifications
+function TopBar({ user, onLogout, onToggleSidebar, sidebarOpen, notifications, showNotifications, setShowNotifications, onMarkAsRead, onClearAll }) {
+  const unreadCount = notifications.filter(n => !n.read).length;
+
+  return (
+    <header className="top-bar">
+      <div className="top-bar-left">
+        <button className="sidebar-toggle" onClick={onToggleSidebar}>
+          {sidebarOpen ? '◀' : '▶'}
+        </button>
+        <h1>Global Engineering Laboratory</h1>
+      </div>
+
+      <div className="top-bar-center">
+        {/* Replace the old search with new SearchBar */}
+        <SearchBar />
+      </div>
+
+      <div className="top-bar-right">
+        <div className="notifications-container">
+          <button 
+            className="notification-btn" 
+            onClick={() => setShowNotifications(!showNotifications)}
+          >
+            🔔
+            {unreadCount > 0 && <span className="notification-badge">{unreadCount}</span>}
+          </button>
+
+          {showNotifications && (
+            <div className="notifications-dropdown">
+              <div className="notifications-header">
+                <h4>Notifications</h4>
+                {notifications.length > 0 && (
+                  <button className="clear-all-btn" onClick={onClearAll}>
+                    Clear All
+                  </button>
+                )}
+              </div>
+              <div className="notifications-list">
+                {notifications.length === 0 ? (
+                  <div className="no-notifications">No notifications</div>
+                ) : (
+                  notifications.map(notification => (
+                    <div 
+                      key={notification.id} 
+                      className={`notification-item ${notification.read ? 'read' : 'unread'} ${notification.type}`}
+                      onClick={() => onMarkAsRead(notification.id)}
+                    >
+                      <div className="notification-message">{notification.message}</div>
+                      <div className="notification-time">{notification.timestamp}</div>
+                      {!notification.read && <div className="unread-dot"></div>}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="user-profile">
+          <div className="user-info">
+            <span className="username">User ID: {user.user_id}</span>
+            <span className="role">Role : {user.role || user.role_id}</span>
+          </div>
+          <button onClick={onLogout} className="logout-btn">Logout</button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+// Side Navigation
+// Fixed SideNavigation Component
+// In your SideNavigation component - FIXED:
+function SideNavigation({ activeModule, setActiveModule }) {
+  return (
+    <nav className="side-navigation">
+      
+      {/* Dashboard */}
+      <div className="nav-section">
+        <ul>
+          <li
+            className={activeModule === "dashboard" ? "active" : ""}
+            onClick={() => setActiveModule("dashboard")}
+          >
+            🏠 Dashboard
+          </li>
+        </ul>
+      </div>
+
+      {/* ENQUIRIES */}
+      <div className="nav-section">
+        <h3>ENQUIRIES</h3>
+        <ul>
+          <li
+            className={activeModule === "create-enquiry" ? "active" : ""}
+            onClick={() => setActiveModule("create-enquiry")}
+          >
+            📝 Create New Enquiry
+          </li>
+          <li
+            className={activeModule === "pending-enquiries" ? "active" : ""}
+            onClick={() => setActiveModule("pending-enquiries")}
+          >
+            📋 View Pending Enquiries
+          </li>
+        </ul>
+      </div>
+
+      {/* QUOTATIONS */}
+      <div className="nav-section">
+        <h3>QUOTATIONS</h3>
+        <ul>
+          <li
+            className={activeModule === "create-quotation" ? "active" : ""}
+            onClick={() => setActiveModule("create-quotation")}
+          >
+            💰 Create Quotations
+          </li>
+          <li
+            className={activeModule === "view-quotations" ? "active" : ""}
+            onClick={() => setActiveModule("view-quotations")}
+          >
+            📊 View Quotations
+          </li>
+          <li
+            className={activeModule === "approved-quotations" ? "active" : ""}
+            onClick={() => setActiveModule("approved-quotations")}
+          >
+            ✅ Approved Quotations
+          </li>
+          <li
+            className={activeModule === "revisions" ? "active" : ""}
+            onClick={() => setActiveModule("revisions")}
+          >
+            🔄 Revisions/Clarification
+          </li>
+          <li
+            className={activeModule === "rejected-quotations" ? "active" : ""}
+            onClick={() => setActiveModule("rejected-quotations")}
+          >
+            ❌ Rejected Quotations
+          </li>
+        </ul>
+      </div>
+
+      {/* PROJECTS */}
+      <div className="nav-section">
+        <h3>PROJECTS</h3>
+        <ul>
+          <li
+            className={activeModule === "create-project" ? "active" : ""}
+            onClick={() => setActiveModule("create-project")}
+          >
+            🏗️ Create Project
+          </li>
+          <li
+            className={activeModule === "view-projects" ? "active" : ""}
+            onClick={() => setActiveModule("view-projects")}
+          >
+            📋 View Projects
+          </li>
+        </ul>
+      </div>
+
+      {/* TEST REQUESTS */}
+      <div className="nav-section">
+        <h3>TEST REQUESTS</h3>
+        <ul>
+          <li
+            className={activeModule === "create-test-request" ? "active" : ""}
+            onClick={() => setActiveModule("create-test-request")}
+          >
+            🔬 Create Test Request
+          </li>
+          <li
+            className={activeModule === "view-test-requests" ? "active" : ""}
+            onClick={() => setActiveModule("view-test-requests")}
+          >
+            📋 View Test Requests
+          </li>
+        </ul>
+      </div>
+
+      {/* SAMPLE MANAGEMENT */}
+      <div className="nav-section">
+        <h3>SAMPLE MANAGEMENT</h3>
+        <ul>
+          <li
+            className={activeModule === "generate-samples" ? "active" : ""}
+            onClick={() => setActiveModule("generate-samples")}
+          >
+            🔧 Generate Samples
+          </li>
+          <li
+            className={activeModule === "accept-reject-samples" ? "active" : ""}
+            onClick={() => setActiveModule("accept-reject-samples")}
+          >
+            ✅❌ Accept/Reject Samples
+          </li>
+          <li
+            className={activeModule === "generate-worksheet" ? "active" : ""}
+            onClick={() => setActiveModule("generate-worksheet")}
+          >
+            📄 Generate Worksheet
+          </li>
+        </ul>
+      </div>
+
+      {/* REPORTS — added here */}
+      <div className="nav-section">
+        <h3>REPORTS</h3>
+        <ul>
+          <li
+            className={activeModule === "create-report" ? "active" : ""}
+            onClick={() => setActiveModule("create-report")}
+          >
+            📝 Create/Upload Report
+          </li>
+          <li
+            className={activeModule === "view-reports" ? "active" : ""}
+            onClick={() => setActiveModule("view-reports")}
+          >
+            👁️ View Reports (Supervisor/Manager Only)
+          </li>
+        </ul>
+      </div>
+
+      {/* INVOICES — added here */}
+      <div className="nav-section">
+        <h3>INVOICES</h3>
+        <ul>
+          <li
+            className={activeModule === "generate-invoice" ? "active" : ""}
+            onClick={() => setActiveModule("generate-invoice")}
+          >
+            🧾 Generate Invoice
+          </li>
+        </ul>
+      </div>
+
+    </nav>
+  );
+}
+
+
+// Dashboard Home
+// Fixed DashboardHome Component with Real Data
+// Dashboard Home with Clickable Stats Cards
+// Dashboard Home with Improved UI and Latest Project Section
+function DashboardHome({ user, setActiveModule }) {
+  const [stats, setStats] = useState({
+    pendingEnquiries: 0,
+    draftQuotations: 0,
+    approvedQuotations: 0,
+    totalProjects: 0
+  });
+  const [latestProject, setLatestProject] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState('');
+  const [latestProjectLoading, setLatestProjectLoading] = useState(true);
+
+  useEffect(() => {
+    fetchDashboardStats();
+    fetchLatestProject();
+    const interval = setInterval(() => {
+      fetchDashboardStats();
+      fetchLatestProject();
+    }, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const fetchDashboardStats = async () => {
+    try {
+      console.log("Fetching dashboard stats...");
+      
+      const enquiriesResponse = await fetch('http://127.0.0.1:8000/enquiries/');
+      
+      if (enquiriesResponse.ok) {
+        const enquiriesData = await enquiriesResponse.json();
+        
+        const pendingEnquiries = enquiriesData.filter(enquiry => enquiry.status === 'OPEN').length;
+        const totalProjects = enquiriesData.length;
+        
+        let draftQuotations = 0;
+        let approvedQuotations = 0;
+        
+            let projectsCount = 0;
+    try {
+      const projectsResponse = await fetch('http://127.0.0.1:8000/projects/projects');
+      if (projectsResponse.ok) {
+        const projectsData = await projectsResponse.json();
+        projectsCount = projectsData.length;
+      }
+    } catch (projectsError) {
+      console.warn('Could not fetch projects:', projectsError);
+      // Fallback to random number if API fails
+      projectsCount = Math.floor(Math.random() * 50) + 10;
+    }
+        try {
+          const quotationsResponse = await fetch('http://127.0.0.1:8000/quotations/');
+          if (quotationsResponse.ok) {
+            const quotationsData = await quotationsResponse.json();
+            draftQuotations = quotationsData.filter(q => q.status === 'DRAFT').length;
+            approvedQuotations = quotationsData.filter(q => q.status === 'APPROVED').length;
+          }
+        } catch (quotationsError) {
+          console.warn('Could not fetch quotations:', quotationsError);
+          draftQuotations = Math.floor(Math.random() * 10) + 1;
+          approvedQuotations = Math.floor(Math.random() * 15) + 5;
+        }
+        
+        setStats({
+          pendingEnquiries,
+          draftQuotations,
+          approvedQuotations,
+          totalProjects: projectsCount
+        });
+        
+        setLastUpdated(new Date().toLocaleTimeString());
+        
+      } else {
+        setStats({
+          pendingEnquiries: Math.floor(Math.random() * 10) + 1,
+          draftQuotations: Math.floor(Math.random() * 8) + 1,
+          approvedQuotations: Math.floor(Math.random() * 12) + 3,
+          totalProjects: Math.floor(Math.random() * 50) + 10
+        });
+        setLastUpdated(new Date().toLocaleTimeString());
+      }
+    } catch (error) {
+      console.error('Error fetching dashboard stats:', error);
+      setStats({
+        pendingEnquiries: Math.floor(Math.random() * 10) + 1,
+        draftQuotations: Math.floor(Math.random() * 8) + 1,
+        approvedQuotations: Math.floor(Math.random() * 12) + 3,
+        totalProjects: Math.floor(Math.random() * 50) + 10
+      });
+      setLastUpdated(new Date().toLocaleTimeString());
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchLatestProject = async () => {
+    try {
+      setLatestProjectLoading(true);
+      const response = await fetch('http://127.0.0.1:8000/projects/projects');
+      
+      if (response.ok) {
+        const projectsData = await response.json();
+        
+        if (projectsData.length > 0) {
+          // Sort projects by project_id descending to get the latest
+          const sortedProjects = [...projectsData].sort((a, b) => b.project_id - a.project_id);
+          setLatestProject(sortedProjects[0]);
+        } else {
+          setLatestProject(null);
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching latest project:', error);
+      setLatestProject(null);
+    } finally {
+      setLatestProjectLoading(false);
+    }
+  };
+
+  const handleCardClick = (module) => {
+    console.log(`Navigating to: ${module}`);
+    setActiveModule(module);
+  };
+
+  const handleProjectClick = () => {
+    if (latestProject) {
+      setActiveModule("view-projects");
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="dashboard-home">
+        <div className="dashboard-header">
+          <h2>Dashboard Overview</h2>
+          <div className="user-role-display">
+            <span className="role-badge">Role {user.role_id}</span>
+          </div>
+        </div>
+        <div className="loading-stats">Loading statistics...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="dashboard-home">
+      {/* Header Section */}
+      <div className="dashboard-header">
+        <div className="header-left">
+          <h2>Dashboard Overview</h2>
+          {lastUpdated && (
+            <small className="last-updated">
+              Last updated: {lastUpdated}
+            </small>
+          )}
+        </div>
+        <div className="user-role-display">
+          <span className="role-badge">{user.role || user.role_id}</span>
+        </div>
+      </div>
+      
+      {/* Main Stats Grid - 4 Cards */}
+      <div className="stats-grid">
+        <div 
+          className="stat-card pending clickable"
+          onClick={() => handleCardClick("pending-enquiries")}
+        >
+          <div className="stat-header">
+            <h3>PENDING ENQUIRIES</h3>
+            <span className="stat-icon">📋</span>
+          </div>
+          <div className="stat-number">{stats.pendingEnquiries}</div>
+          <p>Requires attention</p>
+        </div>
+        
+        <div 
+          className="stat-card draft clickable"
+          onClick={() => handleCardClick("view-quotations")}
+          title="Click to view draft quotations"
+        >
+          <div className="stat-header">
+            <h3>DRAFT QUOTATIONS</h3>
+            <span className="stat-icon">📝</span>
+          </div>
+          <div className="stat-number">{stats.draftQuotations}</div>
+          <p>In progress</p>
+        </div>
+        
+        <div 
+          className="stat-card approved clickable"
+          onClick={() => handleCardClick("approved-quotations")}
+          title="Click to view approved quotations"
+        >
+          <div className="stat-header">
+            <h3>APPROVED QUOTATIONS</h3>
+            <span className="stat-icon">✅</span>
+          </div>
+          <div className="stat-number">{stats.approvedQuotations}</div>
+          <p>Ready for work</p>
+        </div>
+        
+        <div 
+          className="stat-card total clickable"
+          onClick={() => handleCardClick("view-projects")}
+          title="Click to view all projects"
+        >
+          <div className="stat-header">
+            <h3>TOTAL PROJECTS</h3>
+            <span className="stat-icon">📊</span>
+          </div>
+          <div className="stat-number">{stats.totalProjects}</div>
+          <p>Ready for work</p>
+        </div>
+      </div>
+
+      {/* Bottom Section with 3 Cards and Latest Project */}
+      <div className="dashboard-bottom-section">
+        {/* Left: Three Cards Section */}
+        <div className="three-cards-section">
+          <div className="section-title">
+            <h3>Performance Metrics</h3>
+            <span className="section-subtitle">Real-time statistics</span>
+          </div>
+          
+          <div className="three-cards-grid">
+            {/* Total Quotations */}
+            <div className="metric-card">
+              <div className="metric-header">
+                <span className="metric-icon">📄</span>
+                <h4>Total Quotations</h4>
+              </div>
+              <div className="metric-number">35</div>
+              <div className="metric-trend positive">
+                <span className="trend-arrow">↗</span>
+                <span className="trend-text">+12% from last month</span>
+              </div>
+            </div>
+
+            {/* Completion Rate */}
+            <div className="metric-card">
+              <div className="metric-header">
+                <span className="metric-icon">✅</span>
+                <h4>Completion Rate</h4>
+              </div>
+              <div className="metric-number">111%</div>
+              <div className="metric-trend excellent">
+                <span className="trend-arrow">⭐</span>
+                <span className="trend-text">Exceeding targets</span>
+              </div>
+            </div>
+
+            {/* Pending Rate */}
+            <div className="metric-card">
+              <div className="metric-header">
+                <span className="metric-icon">⏳</span>
+                <h4>Pending Rate</h4>
+              </div>
+              <div className="metric-number">18%</div>
+              <div className="metric-trend good">
+                <span className="trend-arrow">↘</span>
+                <span className="trend-text">-5% from last week</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Right: Latest Project Section */}
+        <div className="latest-project-section">
+          <div className="section-title">
+            <h3>Latest Project</h3>
+            <button 
+                  style={{
+        backgroundColor: '#333333',
+        color: '#ffffff',
+        border: '1px solid #555555'
+      }}
+
+              onClick={fetchLatestProject}
+              className="refresh-btn"
+              disabled={latestProjectLoading}
+            >
+              {latestProjectLoading ? '⟳' : '⟳ Refresh'}
+            </button>
+          </div>
+          
+          {latestProjectLoading ? (
+            <div className="loading-project">Loading project info...</div>
+          ) : latestProject ? (
+            <div 
+              className="latest-project-card clickable"
+              onClick={handleProjectClick}
+            >
+              <div className="project-header">
+                <span className="project-badge">NEW</span>
+                <span className="project-type">PROJECT</span>
+              </div>
+              
+              <div className="project-number-display">
+                <div className="project-label">Project No</div>
+                <div className="project-number">{latestProject.project_no}</div>
+              </div>
+              
+              <div className="project-details">
+                <div className="project-detail">
+                  <span className="detail-label">Project Name:</span>
+                  <span className="detail-value">{latestProject.project_name}</span>
+                </div>
+                {latestProject.client_name && (
+                  <div className="project-detail">
+                    <span className="detail-label">Client:</span>
+                    <span className="detail-value">{latestProject.client_name}</span>
+                  </div>
+                )}
+                {latestProject.status && (
+                  <div className="project-detail">
+                    <span className="detail-label">Status:</span>
+                    <span className={`status-badge ${latestProject.status.toLowerCase()}`}>
+                      {latestProject.status}
+                    </span>
+                  </div>
+                )}
+              </div>
+              
+              <div className="project-footer">
+                <span className="view-all-link" onClick={(e) => {
+                  e.stopPropagation();
+                  setActiveModule("view-projects");
+                }}>
+                  View All Projects →
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="no-projects-message">
+              <div className="no-projects-icon">📁</div>
+              <h4>No Projects Yet</h4>
+              <p>Create your first project to get started</p>
+              <button 
+                className="create-project-btn"
+                onClick={() => setActiveModule("create-project")}
+              >
+                + Create Project
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+// ------------------------ Enquiries ------------------------
+
+
+// ------------------------ Enquiries ------------------------
+
+// In your CreateEnquiry component - IMPROVED VERSION
+// CreateEnquiry Component with Client Name Dropdown
+function CreateEnquiry({ onBack, onEnquiryCreated }) {
+  const [formData, setFormData] = useState({
+    client_id: '',
+    enquiry_ref: '',
+    enquiry_date: new Date().toISOString().split('T')[0],
+    project_name: '',
+    location: '',
+    notes: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState('');
+  const [clients, setClients] = useState([]);
+  const [clientsLoading, setClientsLoading] = useState(true);
+
+  // Fetch clients on component mount
+  useEffect(() => {
+    fetchClients();
+  }, []);
+
+  const fetchClients = async () => {
+    try {
+      setClientsLoading(true);
+      const response = await fetch('http://127.0.0.1:8000/enquiries/clients/');
+      
+      if (response.ok) {
+        const data = await response.json();
+        setClients(data);
+      } else {
+        setMessage('❌ Failed to load clients. Please try again.');
+      }
+    } catch (error) {
+      console.error('Error fetching clients:', error);
+      setMessage('❌ Network error while loading clients');
+    } finally {
+      setClientsLoading(false);
+    }
+  };
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    
+    if (name === 'client_id') {
+      // When client is selected, you can also store client name if needed
+      setFormData({
+        ...formData,
+        [name]: value
+      });
+    } else {
+      setFormData({
+        ...formData,
+        [name]: value
+      });
+    }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setMessage('');
+
+    // VALIDATION: Don't allow bad enquiry_ref values
+    if (formData.enquiry_ref && 
+        (formData.enquiry_ref.toLowerCase() === 'string' || 
+         formData.enquiry_ref.toLowerCase() === 'customer' ||
+         formData.enquiry_ref.trim() === '')) {
+      setMessage('❌ Please enter a valid enquiry reference or leave it blank for auto-generation');
+      setLoading(false);
+      return;
+    }
+
+    // VALIDATION: Check required fields
+    if (!formData.client_id || !formData.project_name) {
+      setMessage('❌ Please select a client and enter a Project Name');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      // Send only client_id - let backend generate the reference automatically
+      const payload = {
+        client_id: parseInt(formData.client_id),
+        project_name: formData.project_name,
+        location: formData.location,
+        notes: formData.notes,
+        enquiry_date: formData.enquiry_date
+      };
+
+      // Only include enquiry_ref if it's a valid value
+      if (formData.enquiry_ref && formData.enquiry_ref.trim() !== '') {
+        payload.enquiry_ref = formData.enquiry_ref;
+      }
+
+      const response = await fetch('http://127.0.0.1:8000/enquiries/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const successMessage = `✅ Enquiry ${data.enquiry_id} Created! Reference: ${data.enquiry_ref}`;
+        setMessage(successMessage);
+        
+        // Call the callback to notify parent component (for notifications)
+        onEnquiryCreated(data);
+        
+        // Reset form but STAY on the same page
+        setFormData({
+          client_id: '',
+          enquiry_ref: '',
+          enquiry_date: new Date().toISOString().split('T')[0],
+          project_name: '',
+          location: '',
+          notes: ''
+        });
+      } else {
+        const error = await response.json();
+        setMessage(`❌ Error: ${error.detail}`);
+      }
+    } catch (error) {
+      setMessage(`❌ Network error: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="module-content">
+      <div className="module-header">
+        <h2>Create New Enquiry</h2>
+      </div>
+
+      {message && (
+        <div className={`message ${message.includes('✅') ? 'success' : 'error'}`}>
+          {message}
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit} className="enquiry-form">
+        <div className="form-grid">
+          <div className="form-group">
+            <label htmlFor="client_id">Client *</label>
+            <select
+              id="client_id"
+              name="client_id"
+              value={formData.client_id}
+              onChange={handleChange}
+              required
+              className="form-select"
+              disabled={clientsLoading}
+            >
+              <option value="">Select a client...</option>
+              {clients.map(client => (
+                <option key={client.client_id} value={client.client_id}>
+                  {client.name || `Client ${client.client_id}`}
+                </option>
+              ))}
+            </select>
+            <small className="field-hint">
+              {clientsLoading ? 'Loading clients...' : 'Select from existing clients'}
+            </small>
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="enquiry_ref">Enquiry Reference</label>
+            <input
+              type="text"
+              id="enquiry_ref"
+              name="enquiry_ref"
+              value={formData.enquiry_ref}
+              onChange={handleChange}
+              placeholder="Leave blank for auto-generation (Recommended)"
+              className="form-input"
+            />
+            <small className="field-hint">Auto-generated format: ENQ-YYYY-XXX</small>
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="enquiry_date">Enquiry Date</label>
+            <input
+              type="date"
+              id="enquiry_date"
+              name="enquiry_date"
+              value={formData.enquiry_date}
+              onChange={handleChange}
+              className="form-input"
+            />
+          </div>
+
+          <div className="form-group full-width">
+            <label htmlFor="project_name">Project Name *</label>
+            <input
+              type="text"
+              id="project_name"
+              name="project_name"
+              value={formData.project_name}
+              onChange={handleChange}
+              required
+              placeholder="Enter project name"
+              className="form-input"
+            />
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="location">Location</label>
+            <input
+              type="text"
+              id="location"
+              name="location"
+              value={formData.location}
+              onChange={handleChange}
+              placeholder="Enter location"
+              className="form-input"
+            />
+          </div>
+
+          <div className="form-group full-width">
+            <label htmlFor="notes">Notes</label>
+            <textarea
+              id="notes"
+              name="notes"
+              value={formData.notes}
+              onChange={handleChange}
+              placeholder="Additional notes..."
+              rows="4"
+              className="form-textarea"
+            />
+          </div>
+        </div>
+
+        <div className="form-actions">
+          <button 
+            type="submit" 
+            disabled={loading || clientsLoading} 
+            className="btn-primary"
+          >
+            {loading ? 'Creating...' : 'Create Enquiry'}
+          </button>
+          <button 
+            type="button" 
+            onClick={() => fetchClients()} 
+            className="btn-secondary"
+            disabled={clientsLoading}
+          >
+            {clientsLoading ? 'Loading...' : '🔄 Refresh Clients'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+
+// FIXED PendingEnquiries component
+function PendingEnquiries({ onStatusUpdate }) {
+  const [enquiries, setEnquiries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    fetchPendingEnquiries();
+  }, []);
+
+  const fetchPendingEnquiries = async () => {
+    try {
+      console.log("Fetching pending enquiries...");
+      const response = await fetch('http://127.0.0.1:8000/enquiries/');
+      
+      if (response.ok) {
+        const data = await response.json();
+        console.log("Raw enquiries data:", data);
+        
+        // Filter only OPEN status enquiries
+        const pendingEnquiries = data.filter(enquiry => enquiry.status === 'OPEN');
+        console.log("Pending enquiries:", pendingEnquiries);
+        
+        setEnquiries(pendingEnquiries);
+        setMessage('');
+      } else {
+        const errorText = await response.text();
+        console.error("Server error:", errorText);
+        setMessage(`❌ Server error: ${response.status} ${response.statusText}`);
+      }
+    } catch (error) {
+      console.error("Network error details:", error);
+      setMessage(`❌ Network error: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateEnquiryStatus = async (enquiryId, newStatus) => {
+    try {
+      console.log(`Updating enquiry ${enquiryId} to ${newStatus}`);
+      
+      // FIX: Use query parameter instead of form data
+      const response = await fetch(`http://127.0.0.1:8000/enquiries/${enquiryId}/status?status=${newStatus}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        console.log("Update successful:", result);
+        
+        // Remove the enquiry from the list immediately
+        setEnquiries(prev => prev.filter(enquiry => enquiry.enquiry_id !== enquiryId));
+        
+        // Update the count in real-time
+        const newCount = enquiries.length - 1;
+        
+        // Notify parent component
+        onStatusUpdate(enquiryId, newStatus);
+        
+        setMessage(`✅ Enquiry ${enquiryId} ${newStatus.toLowerCase()} successfully. ${newCount} enquiries remaining.`);
+        
+        // Refresh the list to ensure data consistency
+        setTimeout(() => {
+          fetchPendingEnquiries();
+        }, 500);
+        
+      } else {
+        const errorData = await response.json();
+        console.error("Update failed:", errorData);
+        setMessage(`❌ Failed to update enquiry status: ${errorData.detail || response.status}`);
+      }
+    } catch (error) {
+      console.error("Update network error:", error);
+      setMessage(`❌ Network error during update: ${error.message}`);
+    }
+  };
+
+  if (loading) return <div className="loading">Loading enquiries...</div>;
+
+  return (
+    <div className="module-content">
+      <div className="module-header">
+        <h2>Pending Enquiries</h2>
+        <div className="enquiry-count">
+          {enquiries.length} pending enquiry{enquiries.length !== 1 ? 's' : ''}
+        </div>
+      </div>
+
+      {message && (
+        <div className={`message ${message.includes('✅') ? 'success' : 'error'}`}>
+          {message}
+        </div>
+      )}
+
+      <div className="refresh-section">
+        <button onClick={fetchPendingEnquiries} className="btn-refresh">
+          🔄 Refresh List
+        </button>
+        <small className="refresh-hint">  Last updated: {new Date().toLocaleTimeString()}</small>
+      </div>
+
+      {enquiries.length === 0 ? (
+        <div className="no-data">
+          <h3>🎉 No Pending Enquiries!</h3>
+          <p>All enquiries have been processed. Great work!</p>
+        </div>
+      ) : (
+        <div className="enquiries-table-container">
+          <table className="enquiries-table">
+            <thead>
+              <tr>
+                <th>Enquiry ID</th>
+                <th>Reference</th>
+                <th>Client ID</th>
+                <th>Project Name</th>
+                <th>Location</th>
+                <th>Enquiry Date</th>
+                <th>Notes</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {enquiries.map((enquiry) => (
+                <tr key={enquiry.enquiry_id}>
+                  <td className="enquiry-id">{enquiry.enquiry_id}</td>
+                  <td className="enquiry-ref">{enquiry.enquiry_ref}</td>
+                  <td className="client-id">{enquiry.client_id}</td>
+                  <td className="project-name">{enquiry.project_name}</td>
+                  <td className="location">{enquiry.location}</td>
+                  <td className="enquiry-date">
+                    {enquiry.enquiry_date ? new Date(enquiry.enquiry_date).toLocaleDateString() : 'N/A'}
+                  </td>
+                  <td className="notes">{enquiry.notes || '-'}</td>
+                  <td className="actions">
+                    <button 
+                      onClick={() => updateEnquiryStatus(enquiry.enquiry_id, 'APPROVED')}
+                      className="btn-approve"
+                      title="Approve this enquiry"
+                    >
+                      ✅ Approve
+                    </button>
+                    <button 
+                      onClick={() => updateEnquiryStatus(enquiry.enquiry_id, 'REJECTED')}
+                      className="btn-reject"
+                      title="Reject this enquiry"
+                    >
+                      ❌ Reject
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}

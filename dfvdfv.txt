@@ -1,0 +1,639 @@
+// src/components/quotations/QuotationDetails.jsx - UPDATED with edit/delete functionality
+import { useState, useEffect } from "react";
+
+export default function QuotationDetails({ quotation, onClose, onStatusUpdate, onQuotationUpdate }) {
+  const [quotationData, setQuotationData] = useState(quotation);
+  const [addingItem, setAddingItem] = useState(false);
+  const [addingCatalogItem, setAddingCatalogItem] = useState(false);
+  const [catalogItems, setCatalogItems] = useState([]);
+  const [newItem, setNewItem] = useState({
+    description: '',
+    test_standard: '',
+    unit_rate: '',
+    quantity: 1
+  });
+  const [catalogSelection, setCatalogSelection] = useState({
+    catalog_id: '',
+    quantity: 1
+  });
+  const [loading, setLoading] = useState(false);
+  const [debugInfo, setDebugInfo] = useState('');
+  const [message, setMessage] = useState('');
+  
+  // NEW: State for editing quantity
+  const [editingItemId, setEditingItemId] = useState(null);
+  const [editedQuantity, setEditedQuantity] = useState('');
+  
+  // Fetch fresh data when component mounts
+  useEffect(() => {
+    const fetchFreshData = async () => {
+      try {
+        const response = await fetch(`http://127.0.0.1:8000/quotations/${quotation.quotation_id}`);
+        if (response.ok) {
+          const updatedData = await response.json();
+          setQuotationData(updatedData);
+        }
+      } catch (error) {
+        console.log('Failed to fetch fresh quotation data:', error.message);
+      }
+    };
+    
+    fetchFreshData();
+  }, [quotation.quotation_id]);
+
+  useEffect(() => {
+    if (addingCatalogItem) {
+      fetchCatalogItems();
+    }
+  }, [addingCatalogItem]);
+
+  const fetchCatalogItems = async () => {
+    try {
+      setLoading(true);
+      setDebugInfo('Starting to fetch catalog items...');
+      
+      const response = await fetch('http://127.0.0.1:8000/quotations/price-catalog/');
+      setDebugInfo(`Response status: ${response.status}`);
+      
+      if (response.ok) {
+        const data = await response.json();
+        setDebugInfo(`Received ${data.length} catalog items`);
+        console.log('Catalog items:', data);
+        
+        // Filter only active items
+        const activeItems = data.filter(item => item.active === true);
+        setCatalogItems(activeItems);
+        setDebugInfo(prev => prev + ` | ${activeItems.length} active items`);
+      } else {
+        const errorText = await response.text();
+        setDebugInfo(`Error: ${response.status} - ${errorText}`);
+        console.error('Failed to fetch catalog items:', errorText);
+      }
+    } catch (error) {
+      setDebugInfo(`Network error: ${error.message}`);
+      console.error('Failed to fetch catalog items:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Helper function to fetch fresh quotation data
+  const fetchFreshQuotationData = async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:8000/quotations/${quotationData.quotation_id}`);
+      if (response.ok) {
+        const updatedData = await response.json();
+        setQuotationData(updatedData);
+        
+        // 🔥 CRITICAL: Update the parent component with the new data
+        if (onQuotationUpdate) {
+          onQuotationUpdate(updatedData);
+        }
+      }
+    } catch (error) {
+      console.log('Failed to fetch fresh data:', error.message);
+    }
+  };
+
+  // NEW: Function to delete an item
+  const handleDeleteItem = async (itemIndex) => {
+    if (!window.confirm('Are you sure you want to delete this item?')) {
+      return;
+    }
+
+    try {
+      // Since we don't have item_id in the frontend, we'll delete based on the index
+      // We need to create a new endpoint that can handle this, or modify existing one
+      // For now, let's work with item_id - we need to get it from the data
+      
+      // First, let's update the backend to support item deletion
+      const response = await fetch(`http://127.0.0.1:8000/quotations/${quotationData.quotation_id}/items/${itemIndex}`, {
+        method: 'DELETE',
+      });
+
+      if (response.ok) {
+        setMessage('✅ Item deleted successfully');
+        // Fetch fresh data after deleting item
+        await fetchFreshQuotationData();
+      } else {
+        const errorData = await response.json();
+        setMessage(`❌ Failed to delete item: ${errorData.detail || 'Unknown error'}`);
+      }
+    } catch (error) {
+      console.error("Failed to delete item:", error);
+      setMessage(`❌ Network error: ${error.message}`);
+    }
+  };
+
+  // NEW: Function to start editing quantity
+  const handleStartEdit = (itemIndex, currentQuantity) => {
+    setEditingItemId(itemIndex);
+    setEditedQuantity(currentQuantity);
+  };
+
+  // NEW: Function to save edited quantity
+  const handleSaveEdit = async (itemIndex) => {
+    if (editedQuantity <= 0) {
+      setMessage('❌ Quantity must be greater than 0');
+      return;
+    }
+
+    try {
+      // Call backend to update quantity
+      const response = await fetch(`http://127.0.0.1:8000/quotations/${quotationData.quotation_id}/items/${itemIndex}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ quantity: parseInt(editedQuantity) }),
+      });
+
+      if (response.ok) {
+        setMessage('✅ Quantity updated successfully');
+        setEditingItemId(null);
+        setEditedQuantity('');
+        // Fetch fresh data after updating
+        await fetchFreshQuotationData();
+      } else {
+        const errorData = await response.json();
+        setMessage(`❌ Failed to update quantity: ${errorData.detail || 'Unknown error'}`);
+      }
+    } catch (error) {
+      console.error("Failed to update quantity:", error);
+      setMessage(`❌ Network error: ${error.message}`);
+    }
+  };
+
+  // NEW: Function to cancel editing
+  const handleCancelEdit = () => {
+    setEditingItemId(null);
+    setEditedQuantity('');
+  };
+
+  const handleAddCustomItem = async (e) => {
+    e.preventDefault();
+    try {
+      const payload = {
+        description: newItem.description,
+        test_standard: newItem.test_standard,
+        unit_rate: parseFloat(newItem.unit_rate),
+        quantity: parseInt(newItem.quantity)
+      };
+
+      const response = await fetch(`http://127.0.0.1:8000/quotations/${quotationData.quotation_id}/items`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        setNewItem({
+          description: '',
+          test_standard: '',
+          unit_rate: '',
+          quantity: 1
+        });
+        setAddingItem(false);
+        // Fetch fresh data after adding item AND update parent
+        await fetchFreshQuotationData();
+      } else {
+        const errorData = await response.json();
+        setMessage(`❌ Failed to add item: ${errorData.detail}`);
+      }
+    } catch (error) {
+      console.error("Failed to add custom item:", error);
+      setMessage(`❌ Network error: ${error.message}`);
+    }
+  };
+
+  const handleAddCatalogItem = async (e) => {
+    e.preventDefault();
+    try {
+      const payload = {
+        catalog_id: parseInt(catalogSelection.catalog_id),
+        quantity: parseInt(catalogSelection.quantity)
+      };
+
+      console.log('Adding catalog item:', payload);
+
+      const response = await fetch(`http://127.0.0.1:8000/quotations/${quotationData.quotation_id}/items/from-catalog`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        setCatalogSelection({
+          catalog_id: '',
+          quantity: 1
+        });
+        setAddingCatalogItem(false);
+        // Fetch fresh data after adding item AND update parent
+        await fetchFreshQuotationData();
+      } else {
+        const errorData = await response.json();
+        console.error("Failed to add catalog item:", errorData);
+        setMessage(`❌ Failed to add item: ${errorData.detail}`);
+      }
+    } catch (error) {
+      console.error("Failed to add catalog item:", error);
+      setMessage(`❌ Network error: ${error.message}`);
+    }
+  };
+
+  const getSelectedCatalogItem = () => {
+    return catalogItems.find(item => item.catalog_id === parseInt(catalogSelection.catalog_id));
+  };
+
+  const downloadQuotation = async () => {
+    try {
+      setLoading(true);
+      const response = await fetch(`http://127.0.0.1:8000/quotations/${quotationData.quotation_id}/download`);
+      
+      if (response.ok) {
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `Quotation_${quotationData.quotation_no}.docx`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        setMessage('✅ Quotation downloaded successfully');
+      } else {
+        setMessage('❌ Failed to download quotation');
+      }
+    } catch (error) {
+      setMessage(`❌ Download error: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const selectedCatalogItem = getSelectedCatalogItem();
+
+  return (
+    <div className="quotation-details-overlay">
+      <div className="quotation-details-modal">
+        <div className="modal-header">
+          <h3>Quotation Details: {quotationData.quotation_no}</h3>
+          <button onClick={onClose} className="close-btn">×</button>
+        </div>
+
+        {/* Message display */}
+        {message && (
+          <div className="message-info" style={{
+            background: message.includes('✅') ? '#d4edda' : '#f8d7da',
+            border: message.includes('✅') ? '1px solid #c3e6cb' : '1px solid #f5c6cb',
+            color: message.includes('✅') ? '#155724' : '#721c24',
+            padding: '10px',
+            margin: '10px 0',
+            borderRadius: '4px',
+            fontSize: '14px'
+          }}>
+            {message}
+          </div>
+        )}
+
+        {/* Debug info - remove this after fixing */}
+        {debugInfo && (
+          <div className="debug-info" style={{
+            background: '#fff3cd',
+            border: '1px solid #ffeaa7',
+            padding: '10px',
+            margin: '10px 0',
+            borderRadius: '4px',
+            fontSize: '12px'
+          }}>
+            <strong>Debug:</strong> {debugInfo}
+          </div>
+        )}
+
+        <div className="quotation-info">
+          <div className="info-grid">
+            <div className="info-item">
+              <label>Client:</label>
+              <span>{quotationData.client_name}</span>
+            </div>
+            <div className="info-item">
+              <label>Project:</label>
+              <span>{quotationData.project_name}</span>
+            </div>
+            <div className="info-item">
+              <label>Division:</label>
+              <span>{quotationData.division}</span>
+            </div>
+            <div className="info-item">
+              <label>Status:</label>
+              <span className={`status-badge status-${quotationData.status.toLowerCase()}`}>
+                {quotationData.status}
+              </span>
+            </div>
+            <div className="info-item">
+              <label>Total Amount:</label>
+              <span className="amount">AED {quotationData.grand_total?.toFixed(2)}</span>
+            </div>
+            <div className="info-item">
+              <label>VAT (5%):</label>
+              <span>AED {quotationData.vat?.toFixed(2)}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="items-section">
+          <div className="section-header">
+            <h4>Quotation Items</h4>
+            {quotationData.status === 'DRAFT'&& (
+              <div className="item-action-buttons">
+                <button 
+                  onClick={() => {
+                    setAddingCatalogItem(!addingCatalogItem);
+                    setAddingItem(false);
+                    setDebugInfo('');
+                  }} 
+                  className="btn-primary btn-sm"
+                  disabled={loading}
+                >
+                  {loading ? 'Loading Catalog...' : addingCatalogItem ? 'Cancel' : '+ From Catalog'}
+                </button>
+                <button 
+                  onClick={() => {
+                    setAddingItem(!addingItem);
+                    setAddingCatalogItem(false);
+                    setDebugInfo('');
+                  }} 
+                  className="btn-secondary btn-sm"
+                >
+                  {addingItem ? 'Cancel' : '+ Custom Item'}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Add Item From Catalog Form - WORKING VERSION */}
+          {addingCatalogItem && (
+            <form onSubmit={handleAddCatalogItem} className="add-item-form catalog-form">
+              <div className="form-row-catalog">
+                <div className="select-group">
+                  <label><strong>Select Test from Catalog:</strong></label>
+                  <select
+                    value={catalogSelection.catalog_id}
+                    onChange={(e) => setCatalogSelection({...catalogSelection, catalog_id: e.target.value})}
+                    required
+                    className="catalog-select-working"
+                    size="5"
+                  >
+                    <option value="">-- Choose a test from catalog --</option>
+                    {catalogItems.map((item) => (
+                      <option key={item.catalog_id} value={item.catalog_id}>
+                        {item.code} - {item.description} (AED {item.unit_rate})
+                      </option>
+                    ))}
+                  </select>
+                  <small style={{color: '#666', fontStyle: 'italic'}}>
+                    Scroll to see all {catalogItems.length} available tests
+                  </small>
+                </div>
+                
+                {selectedCatalogItem && (
+                  <div className="selected-item-info" style={{
+                    background: '#e8f5e8',
+                    padding: '12px',
+                    borderRadius: '6px',
+                    borderLeft: '4px solid #28a745',
+                    margin: '10px 0'
+                  }}>
+                    <strong>Selected Test:</strong> {selectedCatalogItem.description}
+                    <br />
+                    <strong>Standard:</strong> {selectedCatalogItem.test_standard}
+                    <br />
+                    <strong>Rate:</strong> AED {selectedCatalogItem.unit_rate} per {selectedCatalogItem.unit}
+                  </div>
+                )}
+                
+                <div className="quantity-group" style={{margin: '15px 0'}}>
+                  <label><strong>Quantity:</strong></label>
+                  <input
+                    type="number"
+                    value={catalogSelection.quantity}
+                    onChange={(e) => setCatalogSelection({...catalogSelection, quantity: e.target.value})}
+                    required
+                    min="1"
+                    className="quantity-input-working"
+                    style={{
+                      padding: '10px',
+                      border: '2px solid #007bff',
+                      borderRadius: '6px',
+                      fontSize: '16px',
+                      width: '100px'
+                    }}
+                  />
+                </div>
+                
+                <button 
+                  type="submit" 
+                  className="btn-success-working"
+                  disabled={!catalogSelection.catalog_id}
+                  style={{
+                    background: '#28a745',
+                    color: 'white',
+                    padding: '12px 24px',
+                    border: 'none',
+                    borderRadius: '6px',
+                    cursor: catalogSelection.catalog_id ? 'pointer' : 'not-allowed',
+                    fontWeight: '600',
+                    fontSize: '14px',
+                    opacity: catalogSelection.catalog_id ? 1 : 0.6
+                  }}
+                >
+                  Add to Quotation
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* Add Custom Item Form */}
+          {addingItem && (
+            <form onSubmit={handleAddCustomItem} className="add-item-form">
+              <div className="form-row">
+                <input
+                  type="text"
+                  placeholder="Description *"
+                  value={newItem.description}
+                  onChange={(e) => setNewItem({...newItem, description: e.target.value})}
+                  required
+                  className="form-input-sm"
+                />
+                <input
+                  type="text"
+                  placeholder="Test Standard"
+                  value={newItem.test_standard}
+                  onChange={(e) => setNewItem({...newItem, test_standard: e.target.value})}
+                  className="form-input-sm"
+                />
+                <input
+                  type="number"
+                  placeholder="Unit Rate *"
+                  value={newItem.unit_rate}
+                  onChange={(e) => setNewItem({...newItem, unit_rate: e.target.value})}
+                  required
+                  min="0"
+                  step="0.01"
+                  className="form-input-sm"
+                />
+                <input
+                  type="number"
+                  placeholder="Quantity *"
+                  value={newItem.quantity}
+                  onChange={(e) => setNewItem({...newItem, quantity: e.target.value})}
+                  required
+                  min="1"
+                  className="form-input-sm"
+                />
+                <button type="submit" className="btn-success btn-sm">
+                  Add Custom
+                </button>
+              </div>
+            </form>
+          )}
+
+          <table className="items-table">
+            <thead>
+              <tr>
+                <th style={{width: '35%'}}>Description</th>
+                <th style={{width: '20%'}}>Test Standard</th>
+                <th style={{width: '15%'}}>Unit Rate</th>
+                <th style={{width: '15%'}}>Quantity</th>
+                <th style={{width: '15%'}}>Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              {quotationData.items?.map((item, index) => (
+                <tr key={index}>
+                  <td>
+                    <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between'}}>
+                      <span>{item.description}</span>
+                      {quotationData.status === 'DRAFT' && (
+                        <button
+                          onClick={() => handleDeleteItem(index)}
+                          className="delete-btn"
+                          title="Delete item"
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            color: '#dc3545',
+                            cursor: 'pointer',
+                            fontSize: '16px',
+                            padding: '0 5px',
+                            marginLeft: '10px'
+                          }}
+                        >
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                  <td>{item.test_standard || '-'}</td>
+                  <td>AED {item.unit_rate?.toFixed(2)}</td>
+                  <td>
+                    {editingItemId === index ? (
+                      <div style={{display: 'flex', alignItems: 'center', gap: '5px'}}>
+                        <input
+                          type="number"
+                          value={editedQuantity}
+                          onChange={(e) => setEditedQuantity(e.target.value)}
+                          min="1"
+                          style={{
+                            width: '70px',
+                            padding: '3px 5px',
+                            border: '1px solid #007bff',
+                            borderRadius: '3px'
+                          }}
+                        />
+                        <button
+                          onClick={() => handleSaveEdit(index)}
+                          style={{
+                            background: '#28a745',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '3px 8px',
+                            fontSize: '12px',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          ✓
+                        </button>
+                        <button
+                          onClick={handleCancelEdit}
+                          style={{
+                            background: '#6c757d',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '3px',
+                            padding: '3px 8px',
+                            fontSize: '12px',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          ✗
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{display: 'flex', alignItems: 'center', gap: '5px'}}>
+                        <span>{item.quantity}</span>
+                        {quotationData.status === 'DRAFT' && (
+                          <button
+                            onClick={() => handleStartEdit(index, item.quantity)}
+                            className="edit-btn"
+                            title="Edit quantity"
+                            style={{
+                              background: 'none',
+                              border: 'none',
+                              color: '#007bff',
+                              cursor: 'pointer',
+                              fontSize: '12px',
+                              padding: '0 5px'
+                            }}
+                          >
+                            ✏️
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </td>
+                  <td>AED {item.amount?.toFixed(2)}</td>
+                  <td></td>
+                </tr>
+              ))}
+              {(!quotationData.items || quotationData.items.length === 0) && (
+                <tr>
+                  <td colSpan="6" className="no-items">No items added yet</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        
+        <div className="modal-actions">
+          <button 
+            onClick={downloadQuotation} 
+            disabled={loading}
+            className="btn-primary"
+            style={{marginRight: '10px'}}
+          >
+            {loading ? 'Downloading...' : '📥 Download'}
+          </button>
+          <button onClick={onClose} className="btn-secondary">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

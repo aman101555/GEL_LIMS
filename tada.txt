@@ -1,0 +1,566 @@
+import { useState, useEffect, useRef } from "react";
+
+const debounce = (fn, delay) => {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), delay);
+  };
+};
+
+function SearchBar() {
+  const [searchTerm, setSearchTerm] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [showResults, setShowResults] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState('all'); // 'all', 'enquiries', 'quotations', 'projects'
+  const [quotationDetails, setQuotationDetails] = useState(null);
+  const [showQuotationModal, setShowQuotationModal] = useState(false);
+  
+  /* ---------- NEW STATE (MODAL) ---------- */
+  const [selectedResult, setSelectedResult] = useState(null);
+  const [showDetailsModal, setShowDetailsModal] = useState(false);
+  const [projectDetails, setProjectDetails] = useState(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+
+  // Debounce search to prevent too many API calls
+  const debouncedSearch = useRef(
+    debounce(async (term) => {
+      if (!term.trim()) {
+        setSearchResults([]);
+        return;
+      }
+
+      setLoading(true);
+      try {
+        const results = await performSearch(term, activeTab);
+        setSearchResults(results);
+      } catch (error) {
+        console.error('Search error:', error);
+        setSearchResults([]);
+      } finally {
+        setLoading(false);
+      }
+    }, 300)
+  ).current;
+
+  useEffect(() => {
+    debouncedSearch(searchTerm);
+  }, [searchTerm, activeTab, debouncedSearch]);
+
+  const performSearch = async (term, tab) => {
+    console.log(`🔍 Searching for "${term}" in tab: "${tab}"`);
+    const termLower = term.toLowerCase();
+    const results = [];
+    
+    try {
+      // Fetch clients ONCE to build a lookup map
+      const clientsResponse = await fetch('http://127.0.0.1:8000/enquiries/clients/');
+      const clients = clientsResponse.ok ? await clientsResponse.json() : [];
+      
+      // Create a lookup map: { client_id: client_name }
+      const clientNameMap = {};
+      clients.forEach(client => {
+        clientNameMap[client.client_id] = client.name || `Client ${client.client_id}`;
+      });
+
+      // ===== SEARCH LOGIC =====
+      
+      // Search enquiries (ONLY when tab is 'all' or 'enquiries')
+      if (tab === 'all' || tab === 'enquiries') {
+        console.log("🔍 Searching enquiries...");
+        const enquiriesResponse = await fetch('http://127.0.0.1:8000/enquiries/');
+        if (enquiriesResponse.ok) {
+          const enquiriesData = await enquiriesResponse.json();
+          const enquiryMatches = enquiriesData.filter(item =>
+            item.enquiry_ref?.toLowerCase().includes(termLower) ||
+            item.enquiry_id?.toString().includes(term) ||
+            item.project_name?.toLowerCase().includes(termLower)
+          ).map(item => ({
+            type: 'enquiry',
+            id: item.enquiry_id,
+            reference: item.enquiry_ref,
+            name: item.project_name,
+            client_name: clientNameMap[item.client_id] || `Client ID: ${item.client_id}`,
+            client_id: item.client_id,
+            date: item.enquiry_date,
+            status: item.status,
+            entity: item
+          }));
+          console.log(`📋 Found ${enquiryMatches.length} enquiry matches`);
+          results.push(...enquiryMatches);
+        }
+      }
+
+      // Search quotations (ONLY when tab is 'all' or 'quotations')
+      if (tab === 'all' || tab === 'quotations') {
+        console.log("🔍 Searching quotations...");
+        const quotationsResponse = await fetch('http://127.0.0.1:8000/quotations/');
+        if (quotationsResponse.ok) {
+          const quotationsData = await quotationsResponse.json();
+          const quotationMatches = quotationsData.filter(item =>
+            item.quotation_no?.toLowerCase().includes(termLower) ||
+            item.quotation_id?.toString().includes(term) ||
+            item.enquiry_ref?.toLowerCase().includes(termLower) ||
+            clientNameMap[item.client_id]?.toLowerCase().includes(termLower)
+          ).map(item => {
+            let displayName = 'No name';
+            
+            if (item.project_name) {
+              displayName = item.project_name;
+            } else if (item.enquiry_ref) {
+              displayName = `Quotation for ${item.enquiry_ref}`;
+            } else if (item.quotation_no) {
+              displayName = `Quotation ${item.quotation_no}`;
+            }
+            
+            return {
+              type: 'quotation',
+              id: item.quotation_id,
+              reference: item.quotation_no,
+              name: displayName,
+              client_name: clientNameMap[item.client_id] || `Client ID: ${item.client_id}`,
+              client_id: item.client_id,
+              date: item.quotation_date,
+              status: item.status,
+              amount: item.total_amount,
+              entity: item
+            };
+          });
+          console.log(`💰 Found ${quotationMatches.length} quotation matches`);
+          results.push(...quotationMatches);
+        }
+      }
+      
+      // Search projects (ONLY when tab is 'all' or 'projects')
+      if (tab === 'all' || tab === 'projects') {
+        console.log("🔍 Searching projects...");
+        const projectsResponse = await fetch('http://127.0.0.1:8000/projects/projects');
+        if (projectsResponse.ok) {
+          const projectsData = await projectsResponse.json();
+          const projectMatches = projectsData.filter(item =>
+            item.project_no?.toLowerCase().includes(termLower) ||
+            item.project_id?.toString().includes(term) ||
+            item.project_name?.toLowerCase().includes(termLower) ||
+            item.client_name?.toLowerCase().includes(termLower)
+          ).map(item => ({
+            type: 'project',
+            id: item.project_id,
+            reference: item.project_no,
+            name: item.project_name,
+            client_name: item.client_name || `Client ID: ${item.client_id}`,
+            client_id: item.client_id,
+            date: item.created_date,
+            status: item.status,
+            entity: item
+          }));
+          console.log(`🏗️ Found ${projectMatches.length} project matches`);
+          results.push(...projectMatches);
+        }
+      }
+      
+      // Search Test Requests (ONLY when tab is 'all' or 'test-requests')
+      if (tab === 'all' || tab === 'test-requests') {
+        try {
+          console.log("🔍 Searching test requests...");
+          const testRequestsResponse = await fetch('http://127.0.0.1:8000/test-requests/');
+          if (testRequestsResponse.ok) {
+            const testRequestsData = await testRequestsResponse.json();
+            const testRequestMatches = testRequestsData.filter(item =>
+              item.request_no?.toLowerCase().includes(termLower) ||
+              item.test_request_id?.toString().includes(term) ||
+              item.requested_by?.toLowerCase().includes(termLower) ||
+              item.project_id?.toString().includes(term)
+            ).map(item => ({
+              type: 'test-request',
+              id: item.test_request_id,
+              reference: item.request_no,
+              name: `Test Request for Project ${item.project_id}`,
+              client_name: `Project ID: ${item.project_id}`,
+              client_id: item.project_id,
+              date: item.created_at,
+              requested_by: item.requested_by,
+              status: item.status,
+              entity: item
+            }));
+            console.log(`🔬 Found ${testRequestMatches.length} test request matches`);
+            results.push(...testRequestMatches);
+          }
+        } catch (error) {
+          console.warn('Error fetching test requests:', error);
+        }
+      }
+      
+      // Search Samples (ONLY when tab is 'all' or 'samples')
+      if (tab === 'all' || tab === 'samples') {
+        try {
+          console.log("🔍 Searching samples...");
+          const samplesResponse = await fetch('http://127.0.0.1:8000/samples-workflow/pending-samples');
+          
+          if (samplesResponse.ok) {
+            const samplesData = await samplesResponse.json();
+            
+            const normalize = (val) => {
+              if (!val) return '';
+              return val.toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+            };
+
+            const search = normalize(term);
+            
+            const sampleMatches = samplesData
+              .filter(item => {
+                const sampleNo = normalize(item.sample_no);
+                const barcode = normalize(item.barcode);
+                const location = normalize(item.storage_location);
+                const collectedBy = normalize(item.collected_by);
+                const sampleId = item.sample_id?.toString();
+                
+                return (
+                  sampleNo.includes(search) ||
+                  (sampleId && sampleId.includes(term)) ||
+                  barcode.includes(search) ||
+                  location.includes(search) ||
+                  collectedBy.includes(search)
+                );
+              })
+              .map(item => ({
+                type: 'sample',
+                id: item.sample_id,
+                reference: item.sample_no || `SMP-${item.sample_id}`,
+                name: `Sample from Request ${item.request_id}`,
+                date: item.received_date || item.created_at,
+                status: item.status,
+                storage_location: item.storage_location,
+                collected_by: item.collected_by,
+                barcode: item.barcode,
+                entity: item
+              }));
+            
+            console.log(`🧪 Found ${sampleMatches.length} sample matches`);
+            results.push(...sampleMatches);
+          } else {
+            console.error('Samples API error:', await samplesResponse.text());
+          }
+        } catch (error) {
+          console.warn('Error fetching samples:', error);
+        }
+      }
+      
+      // Search Reports (ONLY when tab is 'all' or 'reports')
+      if (tab === 'all' || tab === 'reports') {
+        try {
+          console.log("🔍 Searching reports...");
+          const reportsResponse = await fetch('http://127.0.0.1:8000/reports/');
+          if (reportsResponse.ok) {
+            const reportsData = await reportsResponse.json();
+            const reportMatches = reportsData.filter(item =>
+              item.report_no?.toLowerCase().includes(termLower) ||
+              item.report_id?.toString().includes(term) ||
+              item.uploaded_by?.toString().includes(term)
+            ).map(item => ({
+              type: 'report',
+              id: item.report_id,
+              reference: item.report_no,
+              name: `Report for Sample ${item.sample_id}`,
+              client_name: `Sample ID: ${item.sample_id}`,
+              client_id: item.sample_id,
+              date: item.created_at,
+              uploaded_by: item.uploaded_by,
+              status: item.status,
+              test_type: item.covers_test_type,
+              entity: item
+            }));
+            console.log(`📄 Found ${reportMatches.length} report matches`);
+            results.push(...reportMatches);
+          }
+        } catch (error) {
+          console.warn('Error fetching reports:', error);
+        }
+      }
+      
+    } catch (error) {
+      console.error('Search API error:', error);
+    }
+
+    console.log(`✅ Search completed. Total results for tab "${tab}": ${results.length}`);
+    
+    // Sort by relevance (exact matches first)
+    return results.sort((a, b) => {
+      const aRef = a.reference?.toLowerCase() || '';
+      const bRef = b.reference?.toLowerCase() || '';
+      
+      if (aRef === termLower && bRef !== termLower) return -1;
+      if (aRef !== termLower && bRef === termLower) return 1;
+      return 0;
+    });
+  };
+
+  const handleResultClick = async (result) => {
+    setShowResults(false);
+    setSearchTerm('');
+
+    if (result.type !== 'project') {
+      alert(`${result.type.toUpperCase()} selected: ${result.reference}`);
+      return;
+    }
+
+    try {
+      setDetailsLoading(true);
+      const res = await fetch(`http://127.0.0.1:8000/projects/${result.id}`);
+
+      if (!res.ok) throw new Error('Failed');
+
+      const data = await res.json();
+      setProjectDetails(data);
+      setSelectedResult(result);
+      setShowDetailsModal(true);
+    } catch (err) {
+      alert('Failed to load project details');
+    } finally {
+      setDetailsLoading(false);
+    }
+  };
+
+  const closeDetailsModal = () => {
+    setShowDetailsModal(false);
+    setProjectDetails(null);
+    setSelectedResult(null);
+  };
+
+  const getTypeIcon = (type) => {
+    switch (type) {
+      case 'enquiry': return '📋';
+      case 'quotation': return '💰';
+      case 'project': return '🏗️';
+      case 'test-request': return '🔬';
+      case 'sample': return '🧪';
+      case 'report': return '📄';
+      default: return '📄';
+    }
+  };
+
+  const getTypeColor = (type) => {
+    switch (type) {
+      case 'enquiry': return 'var(--enquiry-color)';
+      case 'quotation': return 'var(--quotation-color)';
+      case 'project': return 'var(--project-color)';
+      case 'test-request': return 'var(--test-request-color, #8b5cf6)';
+      case 'sample': return 'var(--sample-color, #10b981)';
+      case 'report': return 'var(--report-color, #3b82f6)';
+      default: return '#666';
+    }
+  };
+
+  return (
+    <div className="search-container-wrapper">
+      <div className="search-input-wrapper">
+        <input
+          type="text"
+          value={searchTerm}
+          onChange={(e) => {
+            setSearchTerm(e.target.value);
+            setShowResults(true);
+          }}
+          onFocus={() => setShowResults(true)}
+          placeholder="Search"
+          className="search-input"
+        />
+        <button className="search-btn">
+          {loading ? '⏳' : '🔍'}
+        </button>
+        
+        {showResults && searchTerm && (
+          <div className="search-results-dropdown">
+            <div className="search-results-header">
+              <div className="search-tabs">
+                <button
+                  className={`search-tab ${activeTab === 'all' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('all')}
+                >
+                  All
+                </button>
+                <button
+                  className={`search-tab ${activeTab === 'enquiries' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('enquiries')}
+                >
+                  📋 Enquiries
+                </button>
+                <button
+                  className={`search-tab ${activeTab === 'quotations' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('quotations')}
+                >
+                  💰 Quotations
+                </button>
+                <button
+                  className={`search-tab ${activeTab === 'projects' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('projects')}
+                >
+                  🏗️ Projects
+                </button>
+                {/* Add new tabs */}
+                <button
+                  className={`search-tab ${activeTab === 'test-requests' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('test-requests')}
+                >
+                  🔬 Test Requests
+                </button>
+                <button
+                  className={`search-tab ${activeTab === 'samples' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('samples')}
+                >
+                  🧪 Samples
+                </button>
+                <button
+                  className={`search-tab ${activeTab === 'reports' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('reports')}
+                >
+                  📄 Reports
+                </button>
+              </div>
+              <button
+                className="close-results-btn"
+                onClick={() => setShowResults(false)}
+              >
+                ✕
+              </button>
+            </div>
+
+            
+            <div className="search-results-list">
+              {loading ? (
+                <div className="search-loading">
+                  <div className="spinner"></div>
+                  <span>Searching...</span>
+                </div>
+              ) : searchResults.length === 0 ? (
+                <div className="no-search-results">
+                  <div className="no-results-icon">🔍</div>
+                  <div className="no-results-text">
+                    <h4>No results found</h4>
+                    <p>Try searching for a different term</p>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="results-count">
+                    Found {searchResults.length} result{searchResults.length !== 1 ? 's' : ''}
+                  </div>
+                  {searchResults.map((result) => (
+                    <div
+                      key={`${result.type}-${result.id}`}
+                      className="search-result-item"
+                      onClick={() => handleResultClick(result)}
+                    >
+                      <div className="result-type-badge" style={{ backgroundColor: getTypeColor(result.type) }}>
+                        {getTypeIcon(result.type)} {result.type.toUpperCase()}
+                      </div>
+                      
+                      <div className="result-content">
+                        <div className="result-main">
+                          <div className="result-reference">
+                            <strong>{result.reference || `ID: ${result.id}`}</strong>
+                          </div>
+                          <div className="result-name">
+                            {result.name || 'No name'}
+                          </div>
+                          {result.client_name && (
+                            <div className="result-client">
+                              <small>Client: {result.client_name}</small>
+                            </div>
+                          )}
+                          {result.client_id && !result.client_name && (
+                            <div className="result-client">
+                              <small>Client ID: {result.client_id}</small>
+                            </div>
+                          )}
+                        </div>
+                        <div className="result-meta">
+                          {result.date && (
+                            <div className="result-date">
+                              {new Date(result.date).toLocaleDateString()}
+                            </div>
+                          )}
+                          {result.status && (
+                            <div className={`result-status ${result.status.toLowerCase()}`}>
+                              {result.status}
+                            </div>
+                          )}
+                          {/* Show additional fields based on type */}
+                          {result.type === 'test-request' && result.requested_by && (
+                            <div className="result-meta-field">
+                              By: {result.requested_by}
+                            </div>
+                          )}
+                          {result.type === 'sample' && result.storage_location && (
+                            <div className="result-meta-field">
+                              📍 {result.storage_location}
+                            </div>
+                          )}
+                          {result.type === 'sample' && result.collected_by && (
+                            <div className="result-meta-field">
+                              👤 {result.collected_by}
+                            </div>
+                          )}
+                          {result.type === 'report' && result.uploaded_by && (
+                            <div className="result-meta-field">
+                              📤 Uploaded by: {result.uploaded_by}
+                            </div>
+                          )}
+                          {result.amount && (
+                            <div className="result-amount">
+                              AED {parseFloat(result.amount).toLocaleString()}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ================= PROJECT DETAILS MODAL ================= */}
+      {showDetailsModal && projectDetails && (
+        <div className="modal-overlay" onClick={closeDetailsModal}>
+          <div className="modal-content" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Project {projectDetails.project_no}</h3>
+              <button onClick={closeDetailsModal}>✕</button>
+            </div>
+
+            {detailsLoading ? (
+              <p>Loading project details...</p>
+            ) : (
+              <div className="project-details-content">
+                <p><b>Name:</b> {projectDetails.project_name}</p>
+                <p><b>Client:</b> {projectDetails.client_name}</p>
+                <p><b>Status:</b> {projectDetails.status}</p>
+                <p><b>Location:</b> {projectDetails.location}</p>
+                <p><b>Quotation:</b> {projectDetails.quotation_no || 'N/A'}</p>
+
+                {projectDetails.lpo_file && (
+                  <button
+                    onClick={() =>
+                      window.open(
+                        `http://127.0.0.1:8000/projects/${projectDetails.project_id}/download-lpo`,
+                        '_blank'
+                      )
+                    }
+                  >
+                    📥 Download LPO
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default SearchBar;
+santa tell me we don't really care, I'll tell you all about it when we meet again...I dont really want any of that hey,Hey Let me tell u all abt it when we see u again.. yeah when we see u again...yeah yeah..when we see u again,, we yeah see u again, sir is coming im scared wtf lol haha wtf lala lolo Ugh should I s=go show him 

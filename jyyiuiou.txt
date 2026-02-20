@@ -1,0 +1,63 @@
+# ----------------------------
+# ADD ITEM TO QUOTATION
+# ----------------------------
+@router.post("/{quotation_id}/items")
+def add_item(quotation_id: int, item: QuotationItemCreate):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT quotation_id FROM quotations WHERE quotation_id = %s", (quotation_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Quotation not found")
+
+        if item.unit_rate < 0 or item.quantity <= 0:
+            raise HTTPException(status_code=400, detail="Invalid unit_rate or quantity")
+
+        cur.execute(
+            """
+            INSERT INTO quotation_items (quotation_id, description, test_standard, unit_rate, quantity)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING item_id;
+            """,
+            (quotation_id, item.description, item.test_standard, item.unit_rate, item.quantity),
+        )
+        item_id = cur.fetchone()[0]
+
+        # Recalculate totals
+        cur.execute(
+            """
+            UPDATE quotations
+            SET total_amount = COALESCE(sub.total, 0),
+                vat = COALESCE(sub.total, 0) * %s,
+                grand_total = COALESCE(sub.total, 0) * (1 + %s)
+            FROM (
+                SELECT quotation_id, SUM(amount) AS total
+                FROM quotation_items
+                WHERE quotation_id = %s
+                GROUP BY quotation_id
+            ) sub
+            WHERE quotations.quotation_id = %s
+            RETURNING total_amount, vat, grand_total;
+            """,
+            (VAT_RATE, VAT_RATE, quotation_id, quotation_id),
+        )
+        totals = cur.fetchone()
+        conn.commit()
+
+        return {
+            "message": "Item added",
+            "item_id": item_id,
+            "quotation_id": quotation_id,
+            "totals": {
+                "total_amount": float(totals[0]),
+                "vat": float(totals[1]),
+                "grand_total": float(totals[2]),
+            },
+        }
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
