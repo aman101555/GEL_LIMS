@@ -6,12 +6,21 @@ from datetime import datetime
 from typing import Optional, List
 import os
 import shutil
+import supabase
+
+from supabase import create_client, Client
+
+SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
+SUPABASE_KEY = "sb_secret_-8uQCdQSiUgDFO_MUEsTWg_TPWtsyy3"
+
+# This 'supabase' object is what you'll use to upload files
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # FIXED: Remove duplicate prefix - just use prefix="/projects"
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
-UPLOAD_DIR = "uploads/projects"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# 4. Save 'public_url' in your PostgreSQL table instead of the local path
+# This way, ViewInvoices.jsx can just click the link!
 
 # ------------------------------
 # Pydantic Models
@@ -290,45 +299,56 @@ def update_project(project_id: int, payload: ProjectCreate):
 # UPLOAD LPO FILE
 # ------------------------------
 @router.post("/{project_id}/upload-lpo")
-def upload_lpo_file(project_id: int, file: UploadFile = File(...)):
+async def upload_lpo_file(project_id: int, file: UploadFile = File(...)):
     conn = get_connection()
     cur = conn.cursor()
 
     try:
+        # Check if project exists
         cur.execute("SELECT project_id FROM projects WHERE project_id = %s", (project_id,))
         if cur.fetchone() is None:
             raise HTTPException(404, "Project not found")
 
+        # 1. Prepare file info
+        file_content = await file.read()
         extension = file.filename.split(".")[-1]
-        filename = f"LPO_{project_id}.{extension}"
-        filepath = os.path.join(UPLOAD_DIR, filename)
+        # Store in a subfolder named 'lpos' inside the bucket
+        cloud_filename = f"lpos/LPO_{project_id}.{extension}"
 
-        with open(filepath, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # 2. Upload to Supabase Storage (Bucket name: "projects")
+        # Ensure you created a bucket named 'projects' in Supabase dashboard first!
+        upload_response = supabase.storage.from_("projects").upload(
+            path=cloud_filename,
+            file=file_content,
+            file_options={"content-type": file.content_type, "x-upsert": "true"}
+        )
 
+        # 3. Get the Public URL
+        public_url = supabase.storage.from_("projects").get_public_url(cloud_filename)
+
+        # 4. Update Database with the URL instead of just the filename
         cur.execute("""
             UPDATE projects 
             SET lpo_file = %s 
             WHERE project_id = %s
-        """, (filename, project_id))
+        """, (public_url, project_id))
 
         conn.commit()
 
         return {
-            "message": "LPO uploaded successfully",
-            "file_name": filename,
-            "path": filepath
+            "message": "LPO uploaded to cloud successfully",
+            "url": public_url
         }
 
     except Exception as e:
         conn.rollback()
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, f"Cloud Upload Error: {str(e)}")
     finally:
         cur.close()
         conn.close()
 
 # ------------------------------
-# DOWNLOAD LPO FILE
+# DOWNLOAD LPO FILE (FROM ANY DEVICE)
 # ------------------------------
 @router.get("/{project_id}/download-lpo")
 def download_lpo(project_id: int):
@@ -340,19 +360,10 @@ def download_lpo(project_id: int):
         row = cur.fetchone()
 
         if not row or not row[0]:
-            raise HTTPException(404, "LPO file not found")
+            raise HTTPException(404, "LPO file link not found in database")
 
-        filename = row[0]
-        filepath = os.path.join(UPLOAD_DIR, filename)
-
-        if not os.path.exists(filepath):
-            raise HTTPException(404, "LPO file not found on server")
-
-        return FileResponse(
-            path=filepath,
-            filename=filename,
-            media_type='application/octet-stream'
-        )
+        # row[0] is now the full Supabase URL (e.g., https://.../file.pdf)
+        return {"download_url": row[0]}
 
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -410,4 +421,6 @@ def update_project_status(project_id: int, payload: ProjectStatusUpdate):
     finally:
         cur.close()
         conn.close()
+
+
 
