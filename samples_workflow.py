@@ -16,6 +16,8 @@ import tempfile
 import secrets
 from decimal import Decimal
 from fastapi.responses import FileResponse
+# Add this with your other imports at the top
+from supabase import create_client, Client
 
 import openpyxl
 from openpyxl import load_workbook
@@ -32,6 +34,13 @@ if hasattr(sys, "_MEIPASS"):
 else:
     WORKSHEET_TEMPLATES_DIR = resource_path("templates/worksheets")
 os.makedirs(WORKSHEET_TEMPLATES_DIR, exist_ok=True)
+
+
+SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
+SUPABASE_KEY = "sb_secret_-8uQCdQSiUgDFO_MUEsTWg_TPWtsyy3"
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------------------
 # NEW: Function to download worksheet templates from Supabase
