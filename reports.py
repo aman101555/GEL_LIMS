@@ -1,6 +1,6 @@
-# reports.py - UPDATED VERSION FOR COMBINED REPORTS PER TEST TYPE EXCEL TEMPLATE SUPA
+# reports.py - UPDATED VERSION WITH SUPABASE STORAGE FOR REPORTS
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from db import get_connection
@@ -12,64 +12,31 @@ import sys
 import requests
 from utils import resource_path
 
-
 import openpyxl
 from openpyxl.styles import Font, Alignment
 import tempfile
 
+# Add Supabase imports
+from supabase import create_client, Client
+
+# Supabase configuration
+SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
+SUPABASE_KEY = "sb_secret_-8uQCdQSiUgDFO_MUEsTWg_TPWtsyy3"
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 router = APIRouter(tags=["Reports"])
 
-# Use system temp directory for uploads in EXE mode
-if hasattr(sys, "_MEIPASS"):
-    REPORTS_UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "lab_app_uploads", "reports")
-else:
-    REPORTS_UPLOAD_DIR = "uploads/reports"
-os.makedirs(REPORTS_UPLOAD_DIR, exist_ok=True)
-
+# Remove local file storage - we'll use Supabase only
+# REPORTS_UPLOAD_DIR is no longer needed for permanent storage
 
 SUPABASE_STORAGE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates"
-# ---------------------------
-# NEW: Helper to get test type distribution for a request
-# ---------------------------
-# ---------------------------
-# FIXED: Helper to get test type distribution for a request
-
-# reports.py
-
-# Add this endpoint to allow the SearchBar to fetch all reports
-@router.get("/")
-def get_all_reports():
-    """Get all reports for the search interface"""
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT r.report_id, r.report_no, r.sample_id, r.status, 
-                   r.created_at, r.uploaded_by, s.sample_no
-            FROM reports r
-            LEFT JOIN samples s ON r.sample_id = s.sample_id
-            ORDER BY r.created_at DESC
-        """)
-        reports = cur.fetchall()
-        return [
-            {
-                "report_id": r[0],
-                "report_no": r[1],
-                "sample_id": r[2],
-                "status": r[3],
-                "created_at": r[4],
-                "uploaded_by": r[5],
-                "sample_no": r[6]
-            } for r in reports
-        ]
-    finally:
-        cur.close()
-        conn.close()
-
 
 # ---------------------------
-# UPDATED: Helper function to get template from Supabase
+# Helper Functions
 # ---------------------------
+
 def get_template_from_supabase(item_code: str, test_name: str):
     """Get template from Supabase storage"""
     possible_filenames = [
@@ -95,9 +62,6 @@ def get_template_from_supabase(item_code: str, test_name: str):
     
     return None, None
 
-
-
-# ---------------------------
 def get_test_distribution_for_request(request_id: int, cur):
     """Get how samples are distributed across test types"""
     cur.execute("""
@@ -170,12 +134,6 @@ def get_test_distribution_for_request(request_id: int, cur):
     
     return sample_to_test_map, test_distribution
 
-# ---------------------------
-# UPDATED: Report number generator with better uniqueness
-# ---------------------------
-# ---------------------------
-# FIXED: Report number generator - simplified version
-# ---------------------------
 def generate_report_no(cur):
     """Generate unique report number: GR - DDMMYY - XXX"""
     today = datetime.now()
@@ -211,7 +169,7 @@ def generate_report_no(cur):
         return f"GR - {date_str} - {timestamp:06d}"
 
 # ---------------------------
-# 1. Search Sample by Sample No (GS format) - UPDATED
+# 1. Search Sample by Sample No (GS format)
 # ---------------------------
 @router.get("/samples/search")
 def search_sample_by_no(sample_no: str):
@@ -265,7 +223,7 @@ def search_sample_by_no(sample_no: str):
         conn.close()
 
 # ---------------------------
-# 2. Get Latest 10 Sample Numbers - UPDATED
+# 2. Get Latest 10 Sample Numbers
 # ---------------------------
 @router.get("/samples/latest")
 def get_latest_samples():
@@ -308,13 +266,11 @@ def get_latest_samples():
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
         cur.close()
-        if conn is not None:
-            conn.close()
+        conn.close()
 
 # ---------------------------
-# 3. Get Sample Test Info & Check for Existing Reports - COMPLETELY REWRITTEN
+# 3. Get Sample Test Info & Check for Existing Reports
 # ---------------------------
-
 @router.get("/samples/by-number/{sample_no}")
 def get_sample_template_info_by_no(sample_no: str):
     """
@@ -431,9 +387,8 @@ def get_sample_template_info_by_no(sample_no: str):
         cur.close()
         conn.close()
 
-
 # ---------------------------
-# 4. Download Report Template by Sample No - UPDATED
+# 4. Download Report Template by Sample No
 # ---------------------------
 @router.get("/samples/by-number/{sample_no}/download-template")
 def download_report_template_by_no(sample_no: str):
@@ -500,9 +455,8 @@ def download_report_template_by_no(sample_no: str):
         cur.close()
         conn.close()
 
-
 # ---------------------------
-# 5. Upload Completed Report - SIMPLIFIED WORKING VERSION
+# 5. Upload Completed Report to Supabase - UPDATED
 # ---------------------------
 @router.post("/upload-report")
 async def upload_report(
@@ -511,10 +465,9 @@ async def upload_report(
     file: UploadFile = File(...),
     notes: Optional[str] = Form(None)
 ):
-    """Upload a completed report file for a test type (covers all samples of same test)"""
+    """Upload a completed report file to Supabase Storage (covers all samples of same test)"""
     conn = get_connection()
     cur = conn.cursor()
-    file_path = None
     
     try:
         print(f"Starting report upload for sample: {sample_no}")
@@ -560,11 +513,12 @@ async def upload_report(
         
         # Check if report already exists for ANY of these samples
         existing_report_no = None
+        existing_report_id = None
         for test_sample_id in test_sample_ids:
-            cur.execute("SELECT report_no FROM reports WHERE sample_id = %s", (test_sample_id,))
+            cur.execute("SELECT report_id, report_no FROM reports WHERE sample_id = %s", (test_sample_id,))
             existing_report = cur.fetchone()
             if existing_report:
-                existing_report_no = existing_report[0]
+                existing_report_id, existing_report_no = existing_report
                 break
         
         if existing_report_no:
@@ -578,21 +532,33 @@ async def upload_report(
         report_no = generate_report_no(cur)
         print(f"Generated report number: {report_no}")
         
-        # Generate unique filename
+        # Read file content
+        file_content = await file.read()
+        
+        # Get file extension
         file_extension = os.path.splitext(file.filename)[1].lower()
         if not file_extension:
-            file_extension = ".docx"
+            file_extension = ".pdf"  # default extension
         
-        unique_filename = f"{report_no.replace(' ', '_')}_{item_code}_{secrets.token_hex(4)}{file_extension}"
-        file_path = os.path.join(REPORTS_UPLOAD_DIR, unique_filename)
+        # Create cloud filename in reports folder
+        clean_report_no = report_no.replace(' ', '_').replace('-', '_')
+        cloud_filename = f"reports/{clean_report_no}_{item_code}_{secrets.token_hex(4)}{file_extension}"
         
-        # Ensure upload directory exists
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        
-        # Save uploaded file
-        print(f"Saving file to: {file_path}")
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Upload to Supabase Storage (using "projects" bucket with reports subfolder)
+        try:
+            upload_response = supabase.storage.from_("projects").upload(
+                path=cloud_filename,
+                file=file_content,
+                file_options={"content-type": file.content_type}
+            )
+            print(f"✅ Uploaded to Supabase projects bucket: {cloud_filename}")
+            
+            # Get the public URL
+            public_url = supabase.storage.from_("projects").get_public_url(cloud_filename)
+            
+        except Exception as e:
+            print(f"❌ Error uploading to projects bucket: {e}")
+            raise HTTPException(500, f"Failed to upload to Supabase: {str(e)}")
         
         # Prepare test info with notes
         test_info_with_notes = test_name
@@ -600,7 +566,7 @@ async def upload_report(
             short_notes = notes[:100] + "..." if len(notes) > 100 else notes
             test_info_with_notes = f"{test_name}"
         
-        # Insert report record for the FIRST sample
+        # Insert report record for the FIRST sample with the Supabase URL
         print(f"Inserting report for sample {test_sample_ids[0]}")
         cur.execute("""
             INSERT INTO reports (
@@ -614,8 +580,8 @@ async def upload_report(
             report_no,
             test_sample_ids[0],
             file.filename,
-            unique_filename,
-            file_path,
+            cloud_filename,
+            public_url,  # Store the Supabase URL here
             file_extension[1:] if file_extension.startswith('.') else file_extension,
             uploaded_by,
             test_info_with_notes,
@@ -623,8 +589,8 @@ async def upload_report(
             notes
         ))
         
-        report_id = cur.fetchone()[0]
-        print(f"Created main report with ID: {report_id}")
+        main_report_id = cur.fetchone()[0]
+        print(f"Created main report with ID: {main_report_id}")
         
         # Link this report to other samples of the same test type
         for i, other_sample_id in enumerate(test_sample_ids[1:], 1):
@@ -641,13 +607,13 @@ async def upload_report(
                     report_no,
                     other_sample_id,
                     file.filename,
-                    unique_filename,
-                    file_path,
+                    cloud_filename,
+                    public_url,  # Same URL for all linked reports
                     file_extension[1:] if file_extension.startswith('.') else file_extension,
                     uploaded_by,
                     test_info_with_notes,
                     test_samples,
-                    report_id
+                    main_report_id
                 ))
             except Exception as link_error:
                 print(f"Warning: Failed to link to sample {other_sample_id}: {link_error}")
@@ -657,14 +623,15 @@ async def upload_report(
         print("Transaction committed successfully")
         
         return {
-            "message": f"Report uploaded successfully for {test_name}",
-            "report_id": report_id,
+            "message": f"Report uploaded successfully to cloud for {test_name}",
+            "report_id": main_report_id,
             "report_no": report_no,
             "test_name": test_name,
             "item_code": item_code,
             "covers_samples": test_samples,
             "sample_count": len(test_samples),
             "status": "DRAFT",
+            "file_url": public_url,
             "next_step": "Report is in DRAFT status. Submit for supervisor review."
         }
         
@@ -672,8 +639,6 @@ async def upload_report(
         print(f"HTTP Exception: {http_err.detail}")
         if conn:
             conn.rollback()
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
         raise
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
@@ -682,23 +647,69 @@ async def upload_report(
         
         if conn:
             conn.rollback()
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
         raise HTTPException(500, f"Error uploading report: {str(e)}")
     finally:
         if cur:
             cur.close()
         if conn:
             conn.close()
+
 # ---------------------------
-# 6. Get Reports with New Format - FIXED
+# 6. Download Report File - UPDATED for Supabase
 # ---------------------------
+@router.get("/reports/{report_id}/download")
+def download_report_file(report_id: int):
+    """Get the Supabase URL for the report file - redirects to cloud storage"""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get report file details
+        cur.execute("""
+            SELECT r.original_filename, r.file_path, r.file_type, r.report_no
+            FROM reports r
+            WHERE r.report_id = %s
+        """, (report_id,))
+        
+        report = cur.fetchone()
+        if not report:
+            raise HTTPException(404, "Report not found")
+        
+        original_filename, file_path, file_type, report_no = report
+        
+        # Check if it's a Supabase URL
+        if file_path and file_path.startswith('http'):
+            # Redirect to the Supabase URL
+            return {
+                "has_file": True,
+                "message": "Report file available",
+                "report_id": report_id,
+                "report_no": report_no,
+                "download_url": file_path  # Send URL to frontend
+            }
+        else:
+            # No file found or invalid path
+            return {
+                "has_file": False,
+                "message": "No report file found. Please upload the report first.",
+                "report_id": report_id,
+                "report_no": report_no
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error fetching report: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
 # ---------------------------
-# 6. Get Reports with New Format - FIXED
+# 7. Get Reports with Status Filter - UPDATED
 # ---------------------------
 @router.get("")
 def get_reports(status: Optional[str] = None):
-    """Get reports with optional status filter - shows which test type they cover - FIXED VERSION"""
+    """Get reports with optional status filter - shows which test type they cover"""
     print(f"\n" + "="*50)
     print(f"DEBUG: get_reports called with status={status}")
     print(f"="*50 + "\n")
@@ -708,14 +719,11 @@ def get_reports(status: Optional[str] = None):
     
     try:
         # IMPORTANT: Use DISTINCT to get unique report_no entries
-        # Use covers_test_type from reports table instead of joining with quotation_items
         query = """
             SELECT DISTINCT ON (r.report_no)
                 r.*, 
                 s.sample_no,
-                -- Use covers_test_type from reports table, not from quotation_items
                 r.covers_test_type as test_name,
-                -- Try to get item_code from the test distribution if possible
                 COALESCE(
                     (SELECT qi.item_code 
                      FROM test_request_items tri 
@@ -780,12 +788,7 @@ def get_reports(status: Optional[str] = None):
         
         print(f"\n" + "="*50)
         print(f"DEBUG: Returning {len(reports)} reports")
-        print(f"DEBUG: Reports: {reports}")
         print(f"="*50 + "\n")
-        
-        # If empty, return a test structure
-        if len(reports) == 0:
-            print("WARNING: No reports found! Returning test data structure")
         
         return reports
         
@@ -799,8 +802,9 @@ def get_reports(status: Optional[str] = None):
     finally:
         cur.close()
         conn.close()
+
 # ---------------------------
-# 7. Get Report by Sample No - UPDATED
+# 8. Get Report by Sample No - UPDATED
 # ---------------------------
 @router.get("/by-sample/{sample_no}")
 def get_report_by_sample_no(sample_no: str):
@@ -895,7 +899,7 @@ def get_report_by_sample_no(sample_no: str):
         conn.close()
 
 # ---------------------------
-# 8. Submit for Review - UPDATED (Single report)
+# 9. Submit for Review - UPDATED
 # ---------------------------
 @router.post("/reports/{report_id}/submit-for-review")
 def submit_for_review(
@@ -955,7 +959,7 @@ def submit_for_review(
         conn.close()
 
 # ---------------------------
-# 9. Approve Report - APPROVES ALL LINKED REPORTS
+# 10. Approve Report - APPROVES ALL LINKED REPORTS
 # ---------------------------
 @router.post("/reports/{report_id}/approve")
 def approve_report(
@@ -1007,7 +1011,7 @@ def approve_report(
         conn.close()
 
 # ---------------------------
-# 10. Get Report Details - UPDATED
+# 11. Get Report Details - UPDATED
 # ---------------------------
 @router.get("/{report_id}")
 def get_report(report_id: int):
@@ -1057,7 +1061,7 @@ def get_report(report_id: int):
             "uploaded_by": report[12],
             "checked_by": report[13],
             "approved_by": report[14],
-            "download_url": f"/reports/{report_id}/download",
+            "download_url": f"/reports/reports/{report_id}/download",
             "covered_samples": covered_samples,
             "sample_count": len(covered_samples),
             "can_edit": report[3] == "DRAFT" and not report[4],
@@ -1072,7 +1076,7 @@ def get_report(report_id: int):
         conn.close()
 
 # ---------------------------
-# 11. NEW: Get Test Type Distribution for a Request
+# 12. NEW: Get Test Type Distribution for a Request
 # ---------------------------
 @router.get("/request/{request_id}/test-distribution")
 def get_request_test_distribution(request_id: int):
@@ -1110,7 +1114,7 @@ def get_request_test_distribution(request_id: int):
         conn.close()
 
 # ---------------------------
-# 12. Replace Report File - UPDATES ALL LINKED REPORTS
+# 13. Replace Report File - UPDATED for Supabase
 # ---------------------------
 @router.post("/reports/{report_id}/replace-file")
 async def replace_report_file(
@@ -1126,7 +1130,7 @@ async def replace_report_file(
     try:
         # Check if main report can be modified
         cur.execute("""
-            SELECT r.file_path, r.status, r.is_locked, r.report_no
+            SELECT r.file_path, r.status, r.is_locked, r.report_no, r.stored_filename
             FROM reports r
             WHERE r.report_id = %s
         """, (report_id,))
@@ -1135,7 +1139,7 @@ async def replace_report_file(
         if not report:
             raise HTTPException(404, "Report not found")
         
-        old_file_path, status, is_locked, report_no = report
+        old_file_path, status, is_locked, report_no, old_stored_filename = report
         
         if is_locked:
             raise HTTPException(400, "Cannot replace locked report")
@@ -1143,13 +1147,33 @@ async def replace_report_file(
         if status != "DRAFT":
             raise HTTPException(400, "Can only replace DRAFT reports")
         
-        # Save new file
-        file_ext = os.path.splitext(file.filename)[1].lower()
-        unique_name = f"rev_{report_no.replace(' ', '_')}_{secrets.token_hex(8)}{file_ext}"
-        new_file_path = os.path.join(REPORTS_UPLOAD_DIR, unique_name)
+        # Read new file content
+        file_content = await file.read()
         
-        with open(new_file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Get file extension
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        if not file_extension:
+            file_extension = ".pdf"
+        
+        # Create new cloud filename
+        clean_report_no = report_no.replace(' ', '_').replace('-', '_')
+        new_cloud_filename = f"reports/{clean_report_no}_{secrets.token_hex(4)}{file_extension}"
+        
+        # Upload new file to Supabase
+        try:
+            upload_response = supabase.storage.from_("projects").upload(
+                path=new_cloud_filename,
+                file=file_content,
+                file_options={"content-type": file.content_type}
+            )
+            print(f"✅ Uploaded replacement to Supabase: {new_cloud_filename}")
+            
+            # Get the public URL
+            new_public_url = supabase.storage.from_("projects").get_public_url(new_cloud_filename)
+            
+        except Exception as e:
+            print(f"❌ Error uploading replacement: {e}")
+            raise HTTPException(500, f"Failed to upload replacement: {str(e)}")
         
         # Update ALL reports with this report_no
         cur.execute("""
@@ -1157,137 +1181,44 @@ async def replace_report_file(
             SET original_filename = %s, stored_filename = %s,
                 file_path = %s, file_type = %s, notes = %s
             WHERE report_no = %s
-        """, (file.filename, unique_name, new_file_path, file_ext[1:], notes, report_no))
+        """, (file.filename, new_cloud_filename, new_public_url, file_extension[1:], notes, report_no))
         
         updated_count = cur.rowcount
         
         conn.commit()
         
-        # Remove old file (only if it's not used by other reports)
-        if os.path.exists(old_file_path):
-            # Check if any other report still uses this file
-            cur.execute("SELECT COUNT(*) FROM reports WHERE file_path = %s", (old_file_path,))
-            if cur.fetchone()[0] == 0:
-                os.remove(old_file_path)
+        # Try to delete old file from Supabase (optional, might want to keep for history)
+        try:
+            if old_stored_filename:
+                supabase.storage.from_("projects").remove([old_stored_filename])
+                print(f"✅ Removed old file: {old_stored_filename}")
+        except Exception as e:
+            print(f"⚠️ Could not remove old file: {e}")
         
         return {
             "message": f"Report file updated for {updated_count} linked reports",
             "report_id": report_id,
             "report_no": report_no,
             "replaced_by": replaced_by,
-            "updated_count": updated_count
+            "updated_count": updated_count,
+            "new_file_url": new_public_url
         }
         
-    except HTTPException:
+    except HTTPException as http_err:
         conn.rollback()
-        if 'new_file_path' in locals() and os.path.exists(new_file_path):
-            os.remove(new_file_path)
         raise
     except Exception as e:
         conn.rollback()
-        if 'new_file_path' in locals() and os.path.exists(new_file_path):
-            os.remove(new_file_path)
         raise HTTPException(500, f"Error: {str(e)}")
     finally:
         cur.close()
         conn.close()
 
-
-
-
-
 # ---------------------------
-# 13. Download Report File - NEW ENDPOINT FOR VIEWREPORTS.JSX
+# 14. Download Populated Template - KEPT AS IS
 # ---------------------------
-@router.get("/reports/{report_id}/download")
-def download_report_file(report_id: int):
-    """Download the actual report file - for ViewReports.jsx"""
-    conn = get_connection()
-    cur = conn.cursor()
-    
-    try:
-        # Get report file details
-        cur.execute("""
-            SELECT r.original_filename, r.file_path, r.file_type, r.report_no
-            FROM reports r
-            WHERE r.report_id = %s
-        """, (report_id,))
-        
-        report = cur.fetchone()
-        if not report:
-            raise HTTPException(404, "Report not found")
-        
-        original_filename, file_path, file_type, report_no = report
-        
-        # Check if file exists
-        if not os.path.exists(file_path):
-            raise HTTPException(404, f"Report file not found at: {file_path}")
-        
-        # Determine content type
-        content_types = {
-            'pdf': 'application/pdf',
-            'doc': 'application/msword',
-            'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            'xls': 'application/vnd.ms-excel',
-            'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        }
-        
-        media_type = content_types.get(file_type.lower(), 'application/octet-stream')
-        
-        # Generate a clean filename
-        clean_report_no = report_no.replace(' ', '').replace('-', '_')  # FIXED LINE
-        if original_filename:
-            clean_original = original_filename.rstrip('_ ')  # REMOVE TRAILING UNDERSCORE
-            filename = f"{clean_report_no}_{clean_original}"
-        else:
-            ext = f".{file_type}" if file_type else ""
-            filename = f"{clean_report_no}_report{ext}"
-        
-        # Optional: final cleanup
-        filename = filename.rstrip('_ ')
-        
-        return FileResponse(
-            path=file_path,
-            filename=filename,
-            media_type=media_type
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Error downloading report: {str(e)}")
-    finally:
-        cur.close()
-        conn.close()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Add this function to your reports.py file, or create a new module for it
-
 def populate_report_template_from_url(template_url: str, report_data: dict) -> str:
-    """
-    Download Excel template from a URL and populate it with report data.
-    
-    Args:
-        template_url: URL to the Excel template (Supabase)
-        report_data: Dictionary containing report data to populate
-        
-    Returns:
-        Path to the populated Excel file
-    """
+    """Download Excel template from a URL and populate it with report data."""
     temp_template_path = None
     try:
         # Download the template from URL
@@ -1349,37 +1280,16 @@ def populate_report_template_from_url(template_url: str, report_data: dict) -> s
         if temp_template_path and os.path.exists(temp_template_path):
             os.remove(temp_template_path)
 
-# Add this endpoint to your reports.py router
-
-
-# You'll also need to add this import at the top of reports.py:
-# import openpyxl
-# import tempfile
-
-
-
-
-
-
-
-
-
-# Add this new endpoint to reports.py
-
 @router.get("/samples/by-number/{sample_no}/download-populated-template")
 async def download_populated_template_by_sample(
     sample_no: str,
     user_id: Optional[int] = None
 ):
-    """
-    Download populated template based on sample number
-    (Creates temporary data without saving to DB)
-    """
+    """Download populated template based on sample number"""
     conn = get_connection()
     cur = conn.cursor()
     
     try:
-        # First, check if a report already exists for this sample/test type
         # Get sample details
         cur.execute("""
             SELECT s.sample_id, s.sample_no, s.request_id,
@@ -1406,7 +1316,7 @@ async def download_populated_template_by_sample(
         item_code = test_info["item_code"]
         test_name = test_info["test_name"]
         
-        # Get all samples for THIS TEST TYPE ONLY (not all samples in the request)
+        # Get all samples for THIS TEST TYPE ONLY
         test_samples = []
         for sample_id_key, test_data in sample_to_test_map.items():
             if test_data.get("item_code") == item_code:
@@ -1415,7 +1325,7 @@ async def download_populated_template_by_sample(
                 if sample_row:
                     test_samples.append(sample_row[0])
         
-        # ✅ CHECK IF REPORT ALREADY EXISTS FOR THIS TEST TYPE
+        # Check if report already exists for this test type
         existing_report_no = None
         for sample_id_key in sample_to_test_map:
             if sample_to_test_map[sample_id_key]["item_code"] == item_code:
@@ -1485,7 +1395,7 @@ async def download_populated_template_by_sample(
                 print(f"Error fetching user details: {user_error}")
                 # Keep default value
         
-        # ✅ USE EXISTING REPORT NUMBER IF AVAILABLE, OTHERWISE GENERATE A PREVIEW
+        # Use existing report number if available, otherwise generate a preview
         if existing_report_no:
             report_no_for_template = existing_report_no
             print(f"Using existing report number: {report_no_for_template}")
@@ -1509,7 +1419,7 @@ async def download_populated_template_by_sample(
             report_no_for_template = f"GR - {date_str} - {report_seq}"
             print(f"Generated preview report number: {report_no_for_template}")
         
-        # ✅ NOW USE THE ACTUAL/EXISTING REPORT NUMBER
+        # Prepare template data
         template_data = {
             'report_no': report_no_for_template,
             'report_date': datetime.now().strftime("%d/%m/%Y"),
@@ -1531,14 +1441,9 @@ async def download_populated_template_by_sample(
         
         if not supabase_template_url:
             raise HTTPException(404, f"No template found for item code: {item_code}")
-
-        template_path = supabase_template_url
-        
-        if not template_path:
-            raise HTTPException(404, f"No template found for item code: {item_code}")
         
         # Populate the template with data
-        populated_path = populate_report_template_from_url(template_path, template_data)
+        populated_path = populate_report_template_from_url(supabase_template_url, template_data)
         
         # Create a nice filename for download
         if existing_report_no:
