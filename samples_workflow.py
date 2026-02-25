@@ -17,6 +17,16 @@ import secrets
 from decimal import Decimal
 from fastapi.responses import FileResponse
 
+# Add these imports at the top with your other imports
+from supabase import create_client, Client
+
+# Add your Supabase configuration (same as in projects.py)
+SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
+SUPABASE_KEY = "sb_secret_-8uQCdQSiUgDFO_MUEsTWg_TPWtsyy3"
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 import openpyxl
 from openpyxl import load_workbook
 
@@ -745,14 +755,14 @@ async def upload_worksheet_file(
     worksheet_id: int,
     worksheet_file: UploadFile = File(...)
 ):
-    """Upload a custom worksheet file"""
+    """Upload a custom worksheet file to Supabase Storage"""
     conn = get_connection()
     cur = conn.cursor()
     
     try:
         # Check if worksheet exists
         cur.execute("""
-            SELECT w.worksheet_id, w.test_name, qi.item_code
+            SELECT w.worksheet_id, w.worksheet_no, w.test_name, qi.item_code, w.sample_id
             FROM worksheets w
             LEFT JOIN quotation_items qi ON w.quotation_item_id = qi.item_id
             WHERE w.worksheet_id = %s
@@ -762,36 +772,60 @@ async def upload_worksheet_file(
         if not worksheet_info:
             raise HTTPException(404, f"Worksheet {worksheet_id} not found")
         
-        worksheet_id_db, test_name, item_code = worksheet_info
+        worksheet_id_db, worksheet_no, test_name, item_code, sample_id = worksheet_info
         
-        # Determine file extension
+        # Read file content
+        file_content = await worksheet_file.read()
+        
+        # Get file extension
         file_ext = os.path.splitext(worksheet_file.filename)[1]
         if not file_ext:
-            file_ext = ".pdf"  # default to pdf
+            file_ext = ".pdf"  # default extension
         
-        # Create filename
-        filename = f"{item_code or f'worksheet_{worksheet_id}'}{file_ext}"
-        file_path = os.path.join(WORKSHEET_TEMPLATES_DIR, filename)
+        # Create cloud filename with worksheet info
+        cloud_filename = f"worksheets/WS_{worksheet_no}_{item_code or 'worksheet'}_{worksheet_id}{file_ext}"
         
-        # Save the file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(worksheet_file.file, buffer)
+        # Upload to Supabase Storage (bucket name: "worksheets")
+        # You may need to create this bucket in Supabase dashboard first
+        try:
+            upload_response = supabase.storage.from_("worksheets").upload(
+                path=cloud_filename,
+                file=file_content,
+                file_options={"content-type": worksheet_file.content_type, "x-upsert": "true"}
+            )
+            print(f"✅ Uploaded to Supabase: {cloud_filename}")
+        except Exception as e:
+            # If "worksheets" bucket doesn't exist, try using "projects" bucket
+            print(f"⚠️ Error uploading to 'worksheets' bucket: {e}. Trying 'projects' bucket...")
+            cloud_filename = f"worksheets/WS_{worksheet_no}_{item_code or 'worksheet'}_{worksheet_id}{file_ext}"
+            upload_response = supabase.storage.from_("projects").upload(
+                path=cloud_filename,
+                file=file_content,
+                file_options={"content-type": worksheet_file.content_type, "x-upsert": "true"}
+            )
         
-        # Update worksheet record
+        # Get the Public URL
+        public_url_response = supabase.storage.from_("projects").get_public_url(cloud_filename)
+        public_url = public_url_response if isinstance(public_url_response, str) else public_url_response.get("data", {}).get("publicUrl", f"{SUPABASE_URL}/storage/v1/object/public/projects/{cloud_filename}")
+        
+        # Update database with the URL
         cur.execute("""
             UPDATE worksheets 
-            SET template_path = %s, updated_at = NOW()
+            SET template_path = %s, 
+                updated_at = NOW(),
+                status = 'UPLOADED'
             WHERE worksheet_id = %s
-        """, (file_path, worksheet_id))
+        """, (public_url, worksheet_id))
         
         conn.commit()
         
         return {
-            "message": "Worksheet file uploaded successfully",
+            "message": "Worksheet file uploaded successfully to cloud",
             "worksheet_id": worksheet_id,
-            "filename": filename,
-            "file_path": file_path,
-            "file_size": os.path.getsize(file_path),
+            "worksheet_no": worksheet_no,
+            "filename": cloud_filename,
+            "url": public_url,
+            "file_size": len(file_content),
             "test_name": test_name,
             "item_code": item_code
         }
@@ -803,17 +837,18 @@ async def upload_worksheet_file(
         cur.close()
         conn.close()
 
-
 @router.get("/worksheets/{worksheet_id}/download")
 def download_worksheet(worksheet_id: int):
-    """Download the worksheet file"""
+    """Get the Supabase URL for the worksheet file"""
     conn = get_connection()
     cur = conn.cursor()
     
     try:
-        # Get worksheet info with sample and test details
+        # Get worksheet info with stored URL
         cur.execute("""
-            SELECT w.worksheet_no, w.template_path, w.test_name, s.sample_no, w.status, qi.item_code
+            SELECT w.worksheet_id, w.worksheet_no, w.template_path, 
+                   w.test_name, s.sample_no, w.status, qi.item_code,
+                   w.sample_id
             FROM worksheets w
             JOIN samples s ON w.sample_id = s.sample_id
             LEFT JOIN quotation_items qi ON w.quotation_item_id = qi.item_id
@@ -824,20 +859,22 @@ def download_worksheet(worksheet_id: int):
         if not worksheet:
             raise HTTPException(404, "Worksheet not found")
         
-        worksheet_no, template_path, test_name, sample_no, status, item_code = worksheet
+        worksheet_id_db, worksheet_no, template_path, test_name, sample_no, status, item_code, sample_id = worksheet
         
-        # Check if file exists via template_path
-        if template_path and os.path.exists(template_path):
-            # Get original filename from template_path
-            original_filename = os.path.basename(template_path)
-            # Create a nice download filename
-            download_filename = f"{sample_no}_{worksheet_no}_{test_name.replace(' ', '_')}{os.path.splitext(original_filename)[1]}"
-            
-            return FileResponse(
-                path=template_path,
-                filename=download_filename,
-                media_type='application/octet-stream'
-            )
+        # Check if we have a URL stored
+        if template_path and template_path.startswith('http'):
+            # Return the URL - frontend will open it in new tab
+            return {
+                "has_file": True,
+                "message": "Worksheet file available",
+                "worksheet_id": worksheet_id,
+                "worksheet_no": worksheet_no,
+                "sample_no": sample_no,
+                "test_name": test_name,
+                "item_code": item_code,
+                "status": status,
+                "download_url": template_path  # Send URL to frontend
+            }
         
         # No file found
         return {
