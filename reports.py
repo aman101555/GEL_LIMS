@@ -271,190 +271,6 @@ def get_latest_samples():
 # ---------------------------
 # 3. Get Sample Test Info & Check for Existing Reports
 # ---------------------------
-@router.get("/samples/by-number/{sample_no}")
-def get_sample_template_info_by_no(sample_no: str):
-    """
-    Check which test this sample is for,
-    if template exists, and if report already created
-    """
-    conn = get_connection()
-    cur = conn.cursor()
-
-    try:
-        # First, get the sample by sample_no
-        cur.execute("""
-            SELECT sample_id, request_id
-            FROM samples
-            WHERE sample_no = %s
-        """, (sample_no,))
-
-        sample_info = cur.fetchone()
-        if not sample_info:
-            raise HTTPException(404, f"Sample not found: {sample_no}")
-
-        sample_id, request_id = sample_info
-
-        # Get test distribution for this request
-        sample_to_test_map, test_distribution = get_test_distribution_for_request(
-            request_id, cur
-        )
-
-        # Get which test this sample belongs to
-        test_info = sample_to_test_map.get(sample_id)
-        if not test_info:
-            raise HTTPException(
-                400, f"Cannot determine test type for sample {sample_no}"
-            )
-
-        item_code = test_info["item_code"]
-        test_name = test_info["test_name"]
-        tri_id = test_info["tri_id"]
-
-        # Get ALL samples for this test type
-        test_samples = []
-        for sample_id_key, test_data in sample_to_test_map.items():
-            if test_data["item_code"] == item_code:
-                cur.execute("""
-                    SELECT sample_no
-                    FROM samples
-                    WHERE sample_id = %s
-                """, (sample_id_key,))
-                sample_row = cur.fetchone()
-                if sample_row:
-                    test_samples.append(sample_row[0])
-
-        # Check if a report already exists for this test type
-        report_exists = False
-        existing_report = None
-
-        # Check if any sample of this test type already has a report
-        for sample_id_key in sample_to_test_map:
-            if sample_to_test_map[sample_id_key]["item_code"] == item_code:
-                cur.execute("""
-                    SELECT r.report_id, r.report_no, r.status, r.file_path
-                    FROM reports r
-                    WHERE r.sample_id = %s
-                """, (sample_id_key,))
-
-                report_row = cur.fetchone()
-                if report_row:
-                    report_exists = True
-                    existing_report = {
-                        "report_id": report_row[0],
-                        "report_no": report_row[1],
-                        "status": report_row[2],
-                        "file_path": report_row[3],
-                        "covers_samples": test_samples
-                    }
-                    break
-
-        # Check if template exists in Supabase
-        template_exists = False
-        template_path = None
-        template_type = None
-
-        supabase_template_url, template_ext = get_template_from_supabase(
-            item_code, test_name
-        )
-        if supabase_template_url:
-            template_exists = True
-            template_path = supabase_template_url
-            template_type = template_ext
-
-        return {
-            "sample_id": sample_id,
-            "sample_no": sample_no,
-            "test_name": test_name,
-            "item_code": item_code,
-            "tri_id": tri_id,
-            "template_available": template_exists,
-            "template_path": template_path,
-            "template_type": template_type,
-            "test_samples": test_samples,  # All samples for this test type
-            "sample_count": len(test_samples),
-            "report_exists": report_exists,
-            "existing_report": existing_report,
-            "message": (
-                f"This sample is for {test_name}. "
-                f"{len(test_samples)} samples share this test type."
-            )
-        }
-
-    except Exception as e:
-        raise HTTPException(500, f"Error: {str(e)}")
-
-    finally:
-        cur.close()
-        conn.close()
-
-# ---------------------------
-# 4. Download Report Template by Sample No
-# ---------------------------
-@router.get("/samples/by-number/{sample_no}/download-template")
-def download_report_template_by_no(sample_no: str):
-    """Download the Excel/Word report template for this test type"""
-    conn = get_connection()
-    cur = conn.cursor()
-    
-    try:
-        # Get sample info
-        cur.execute("""
-            SELECT sample_id, request_id 
-            FROM samples 
-            WHERE sample_no = %s
-        """, (sample_no,))
-        
-        sample_info = cur.fetchone()
-        if not sample_info:
-            raise HTTPException(404, f"Sample not found: {sample_no}")
-        
-        sample_id, request_id = sample_info
-        
-        # Get test distribution
-        sample_to_test_map, _ = get_test_distribution_for_request(request_id, cur)
-        
-        # Get which test this sample belongs to
-        test_info = sample_to_test_map.get(sample_id)
-        if not test_info:
-            raise HTTPException(400, f"Cannot determine test type for sample {sample_no}")
-        
-        item_code = test_info["item_code"]
-        test_name = test_info["test_name"]
-        
-        # Look for template in Supabase
-        supabase_template_url, _ = get_template_from_supabase(item_code, test_name)
-        if not supabase_template_url:
-            raise HTTPException(404, f"No report template found for {test_name} ({item_code})")
-
-        template_path = supabase_template_url
-        
-        if not template_path:
-            raise HTTPException(404, f"No report template found for {test_name} ({item_code})")
-        
-        # Download the template from Supabase
-        try:
-            response = requests.get(template_path)
-            if response.status_code != 200:
-                raise HTTPException(404, f"Template not found in storage: {template_path}")
-            
-            # Return the file content
-            filename = os.path.basename(template_path)
-            return Response(
-                content=response.content,
-                media_type='application/octet-stream',
-                headers={'Content-Disposition': f'attachment; filename="{filename}"'}
-            )
-        except Exception as e:
-            raise HTTPException(500, f"Error downloading template from storage: {str(e)}")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Error downloading template: {str(e)}")
-    finally:
-        cur.close()
-        conn.close()
-
 # ---------------------------
 # 5. Upload Completed Report to Supabase - UPDATED
 # ---------------------------
@@ -544,20 +360,20 @@ async def upload_report(
         clean_report_no = report_no.replace(' ', '_').replace('-', '_')
         cloud_filename = f"reports/{clean_report_no}_{item_code}_{secrets.token_hex(4)}{file_extension}"
         
-        # Upload to Supabase Storage (using "projects" bucket with reports subfolder)
+        # Upload to Supabase Storage (using "reports" bucket)
         try:
-            upload_response = supabase.storage.from_("projects").upload(
+            upload_response = supabase.storage.from_("reports").upload(
                 path=cloud_filename,
                 file=file_content,
                 file_options={"content-type": file.content_type}
             )
-            print(f"✅ Uploaded to Supabase projects bucket: {cloud_filename}")
+            print(f"✅ Uploaded to Supabase reports bucket: {cloud_filename}")
             
             # Get the public URL
-            public_url = supabase.storage.from_("projects").get_public_url(cloud_filename)
+            public_url = supabase.storage.from_("reports").get_public_url(cloud_filename)
             
         except Exception as e:
-            print(f"❌ Error uploading to projects bucket: {e}")
+            print(f"❌ Error uploading to reports bucket: {e}")
             raise HTTPException(500, f"Failed to upload to Supabase: {str(e)}")
         
         # Prepare test info with notes
@@ -704,6 +520,177 @@ def download_report_file(report_id: int):
         cur.close()
         conn.close()
 
+# ---------------------------
+# 13. Replace Report File - UPDATED for Supabase
+# ---------------------------
+@router.post("/reports/{report_id}/replace-file")
+async def replace_report_file(
+    report_id: int,
+    replaced_by: int = Form(...),
+    file: UploadFile = File(...),
+    notes: Optional[str] = Form(None)
+):
+    """Replace report file with corrected version - updates all linked reports"""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Check if main report can be modified
+        cur.execute("""
+            SELECT r.file_path, r.status, r.is_locked, r.report_no, r.stored_filename
+            FROM reports r
+            WHERE r.report_id = %s
+        """, (report_id,))
+        
+        report = cur.fetchone()
+        if not report:
+            raise HTTPException(404, "Report not found")
+        
+        old_file_path, status, is_locked, report_no, old_stored_filename = report
+        
+        if is_locked:
+            raise HTTPException(400, "Cannot replace locked report")
+        
+        if status != "DRAFT":
+            raise HTTPException(400, "Can only replace DRAFT reports")
+        
+        # Read new file content
+        file_content = await file.read()
+        
+        # Get file extension
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        if not file_extension:
+            file_extension = ".pdf"
+        
+        # Create new cloud filename
+        clean_report_no = report_no.replace(' ', '_').replace('-', '_')
+        new_cloud_filename = f"reports/{clean_report_no}_{secrets.token_hex(4)}{file_extension}"
+        
+        # Upload new file to Supabase (using "reports" bucket)
+        try:
+            upload_response = supabase.storage.from_("reports").upload(
+                path=new_cloud_filename,
+                file=file_content,
+                file_options={"content-type": file.content_type}
+            )
+            print(f"✅ Uploaded replacement to Supabase reports bucket: {new_cloud_filename}")
+            
+            # Get the public URL
+            new_public_url = supabase.storage.from_("reports").get_public_url(new_cloud_filename)
+            
+        except Exception as e:
+            print(f"❌ Error uploading replacement: {e}")
+            raise HTTPException(500, f"Failed to upload replacement: {str(e)}")
+        
+        # Update ALL reports with this report_no
+        cur.execute("""
+            UPDATE reports 
+            SET original_filename = %s, stored_filename = %s,
+                file_path = %s, file_type = %s, notes = %s
+            WHERE report_no = %s
+        """, (file.filename, new_cloud_filename, new_public_url, file_extension[1:], notes, report_no))
+        
+        updated_count = cur.rowcount
+        
+        conn.commit()
+        
+        # Try to delete old file from Supabase (optional, might want to keep for history)
+        try:
+            if old_stored_filename:
+                supabase.storage.from_("reports").remove([old_stored_filename])
+                print(f"✅ Removed old file: {old_stored_filename}")
+        except Exception as e:
+            print(f"⚠️ Could not remove old file: {e}")
+        
+        return {
+            "message": f"Report file updated for {updated_count} linked reports",
+            "report_id": report_id,
+            "report_no": report_no,
+            "replaced_by": replaced_by,
+            "updated_count": updated_count,
+            "new_file_url": new_public_url
+        }
+        
+    except HTTPException as http_err:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Error: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+# Add this new endpoint to serve the actual file
+@router.get("/files/{report_id}/download")
+async def download_report_file_direct(report_id: int):
+    """Directly download the report file from Supabase"""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get report file details
+        cur.execute("""
+            SELECT r.file_path, r.original_filename, r.file_type, r.report_no
+            FROM reports r
+            WHERE r.report_id = %s
+        """, (report_id,))
+        
+        report = cur.fetchone()
+        if not report:
+            raise HTTPException(404, "Report not found")
+        
+        file_path, original_filename, file_type, report_no = report
+        
+        if not file_path or not file_path.startswith('http'):
+            raise HTTPException(404, "Report file not found in cloud storage")
+        
+        # Download the file from Supabase
+        try:
+            # Extract the path from the URL
+            # URL format: https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/reports/reports/filename.pdf
+            path_parts = file_path.split('/public/reports/')
+            if len(path_parts) > 1:
+                storage_path = path_parts[1]
+            else:
+                # Try alternative URL format
+                storage_path = file_path.split('/object/public/reports/')[-1]
+            
+            # Download from Supabase (using "reports" bucket)
+            response = supabase.storage.from_("reports").download(storage_path)
+            
+            # Determine content type
+            content_types = {
+                'pdf': 'application/pdf',
+                'doc': 'application/msword',
+                'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                'xls': 'application/vnd.ms-excel',
+                'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            }
+            
+            media_type = content_types.get(file_type.lower(), 'application/octet-stream')
+            
+            # Create filename for download
+            clean_report_no = report_no.replace(' ', '_').replace('-', '_')
+            filename = f"{clean_report_no}_{original_filename or f'report.{file_type}'}"
+            
+            return Response(
+                content=response,
+                media_type=media_type,
+                headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+            )
+            
+        except Exception as e:
+            print(f"Error downloading from Supabase: {e}")
+            # Fallback: redirect to the URL
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=file_path)
+        
+    except Exception as e:
+        raise HTTPException(500, f"Error downloading report: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
 # ---------------------------
 # 7. Get Reports with Status Filter - UPDATED
 # ---------------------------
@@ -1161,7 +1148,7 @@ async def replace_report_file(
         
         # Upload new file to Supabase
         try:
-            upload_response = supabase.storage.from_("projects").upload(
+            upload_response = supabase.storage.from_("reports").upload(
                 path=new_cloud_filename,
                 file=file_content,
                 file_options={"content-type": file.content_type}
@@ -1169,7 +1156,7 @@ async def replace_report_file(
             print(f"✅ Uploaded replacement to Supabase: {new_cloud_filename}")
             
             # Get the public URL
-            new_public_url = supabase.storage.from_("projects").get_public_url(new_cloud_filename)
+            new_public_url = supabase.storage.from_("reports").get_public_url(new_cloud_filename)
             
         except Exception as e:
             print(f"❌ Error uploading replacement: {e}")
@@ -1190,7 +1177,7 @@ async def replace_report_file(
         # Try to delete old file from Supabase (optional, might want to keep for history)
         try:
             if old_stored_filename:
-                supabase.storage.from_("projects").remove([old_stored_filename])
+                supabase.storage.from_("reports").remove([old_stored_filename])
                 print(f"✅ Removed old file: {old_stored_filename}")
         except Exception as e:
             print(f"⚠️ Could not remove old file: {e}")
@@ -1458,10 +1445,103 @@ async def download_populated_template_by_sample(
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         
+    except Exception as e:
+        raise HTTPException(500, f"Error generating populated template: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.get("/files/{report_id}/download")
+async def download_report_file_direct(report_id: int):
+    """Directly download the report file from Supabase"""
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get report file details
+        cur.execute("""
+            SELECT r.file_path, r.original_filename, r.file_type, r.report_no
+            FROM reports r
+            WHERE r.report_id = %s
+        """, (report_id,))
+        
+        report = cur.fetchone()
+        if not report:
+            raise HTTPException(404, "Report not found")
+        
+        file_path, original_filename, file_type, report_no = report
+        
+        if not file_path or not file_path.startswith('http'):
+            raise HTTPException(404, "Report file not found in cloud storage")
+        
+        # Download the file from Supabase
+        try:
+            # Extract the path from the URL
+            # Handle different URL formats:
+            # Format 1: https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/reports/reports/filename.pdf
+            # Format 2: https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/reports/filename.pdf
+            
+            # Try to extract path for reports bucket
+            if '/public/reports/' in file_path:
+                storage_path = file_path.split('/public/reports/')[1]
+            elif '/object/public/reports/' in file_path:
+                storage_path = file_path.split('/object/public/reports/')[1]
+            else:
+                # If we can't parse the URL, fall back to redirect
+                print(f"Could not parse storage path from URL: {file_path}")
+                from fastapi.responses import RedirectResponse
+                return RedirectResponse(url=file_path)
+            
+            print(f"Extracted storage path: {storage_path}")
+            
+            # Download from Supabase using the reports bucket
+            response = supabase.storage.from_("reports").download(storage_path)
+            
+            # Determine content type
+            content_types = {
+                'pdf': 'application/pdf',
+                'doc': 'application/msword',
+                'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                'xls': 'application/vnd.ms-excel',
+                'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            }
+            
+            media_type = content_types.get(file_type.lower(), 'application/octet-stream')
+            
+            # Create filename for download
+            clean_report_no = report_no.replace(' ', '_').replace('-', '_')
+            # Use original filename if available, otherwise create one
+            if original_filename:
+                # Ensure we have a valid filename with extension
+                base_name = original_filename
+            else:
+                base_name = f"report.{file_type}"
+            
+            filename = f"{clean_report_no}_{base_name}"
+            
+            return Response(
+                content=response,
+                media_type=media_type,
+                headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+            )
+            
+        except Exception as e:
+            print(f"Error downloading from Supabase: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback: redirect to the URL
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=file_path)
+        
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Error generating populated template: {str(e)}")
+        print(f"Error in download_report_file_direct: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Error downloading report: {str(e)}")
     finally:
         cur.close()
         conn.close()
