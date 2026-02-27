@@ -13,14 +13,11 @@ from supabase import create_client, Client
 SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
 SUPABASE_KEY = "sb_secret_-8uQCdQSiUgDFO_MUEsTWg_TPWtsyy3"
 
-# This 'supabase' object is what you'll use to upload files
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# FIXED: Remove duplicate prefix - just use prefix="/projects"
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
-# 4. Save 'public_url' in your PostgreSQL table instead of the local path
-# This way, ViewInvoices.jsx can just click the link!
+BUCKET_NAME = "projects"  # Supabase bucket name
 
 # ------------------------------
 # Pydantic Models
@@ -44,7 +41,7 @@ class ProjectOut(BaseModel):
     lpo_date: Optional[str] = None
     quotation_no: Optional[str] = None
     client_name: Optional[str] = None
-
+    lpo_file: Optional[str] = None
 
 
 class ProjectStatusUpdate(BaseModel):
@@ -53,7 +50,41 @@ class ProjectStatusUpdate(BaseModel):
 
 
 # ------------------------------
-# LIST PROJECTS - FIXED
+# HELPER: Delete old LPO from Supabase
+# ------------------------------
+def delete_old_lpo_from_supabase(project_id: int):
+    """
+    Deletes ALL existing LPO files for this project_id from Supabase storage.
+    Files are stored as lpos/LPO_{project_id}.{ext} - we list and delete any match.
+    """
+    try:
+        # List all files in the lpos/ folder
+        files = supabase.storage.from_(BUCKET_NAME).list("lpos")
+        
+        if not files:
+            return  # Nothing to delete
+        
+        # Find files that belong to this project_id
+        prefix = f"LPO_{project_id}."
+        files_to_delete = [
+            f"lpos/{f['name']}"
+            for f in files
+            if f.get("name", "").startswith(prefix)
+        ]
+        
+        if files_to_delete:
+            supabase.storage.from_(BUCKET_NAME).remove(files_to_delete)
+            print(f"[LPO Replace] Deleted old files: {files_to_delete}")
+        else:
+            print(f"[LPO Replace] No existing LPO file found for project_id={project_id}")
+
+    except Exception as e:
+        # Log but don't crash — upload will still proceed with upsert
+        print(f"[LPO Replace] Warning: Could not delete old LPO files: {e}")
+
+
+# ------------------------------
+# LIST PROJECTS
 # ------------------------------
 @router.get("/projects", response_model=List[ProjectOut])
 def list_projects(limit: int = 100, offset: int = 0):
@@ -66,7 +97,7 @@ def list_projects(limit: int = 100, offset: int = 0):
             SELECT p.project_id, p.project_no, p.quotation_id, p.client_id,
                    p.project_name, p.location, p.lpo_no, p.lpo_date,
                    p.division, p.status, p.created_at,
-                   q.quotation_no, c.name as client_name
+                   q.quotation_no, c.name as client_name, p.lpo_file
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
@@ -86,12 +117,13 @@ def list_projects(limit: int = 100, offset: int = 0):
                 "project_name": r[4],
                 "location": r[5],
                 "lpo_no": r[6],
-                "lpo_date": str(r[7]) if r[7] else None,  # Convert date to string
+                "lpo_date": str(r[7]) if r[7] else None,
                 "division": r[8],
                 "status": r[9],
                 "created_at": str(r[10]) if r[10] else None,
                 "quotation_no": r[11],
-                "client_name": r[12]
+                "client_name": r[12],
+                "lpo_file": r[13]
             }
             for r in rows
         ]
@@ -103,8 +135,9 @@ def list_projects(limit: int = 100, offset: int = 0):
         conn.close()
 
 
-
-################Project Creation#############
+# ------------------------------
+# CREATE PROJECT
+# ------------------------------
 @router.post("/", response_model=ProjectOut)
 def create_project(payload: ProjectCreate):
     """Create a new project from approved quotation"""
@@ -112,7 +145,6 @@ def create_project(payload: ProjectCreate):
     cur = conn.cursor()
 
     try:
-        # Get quotation details
         cur.execute("""
             SELECT q.quotation_id, e.client_id, q.division,
                    e.project_name as enquiry_project_name, 
@@ -128,14 +160,11 @@ def create_project(payload: ProjectCreate):
 
         quotation_id, client_id, division, enquiry_project_name, enquiry_location = row
 
-        # Use provided project name/location or fall back to enquiry values
         project_name = payload.project_name if payload.project_name != "string" else enquiry_project_name
         location = payload.location if payload.location != "string" else enquiry_location
 
-        # Get current year's last two digits
         year_last_two = datetime.utcnow().strftime("%y")
         
-        # Find the latest project number to increment from 16732
         cur.execute("""
             SELECT project_no 
             FROM projects 
@@ -146,22 +175,17 @@ def create_project(payload: ProjectCreate):
         
         last_project = cur.fetchone()
         if last_project:
-            # Extract the middle number from format LP/16732/25/DXB
             last_number = int(last_project[0].split('/')[1])
             next_number = last_number + 1
         else:
-            # Start from 16732 if no projects exist yet
             next_number = 16732
         
-        # Format: LP/16732/25/DXB
         project_no = f"LP/{next_number}/{year_last_two}/DXB"
 
-        # Parse LPO date if provided
         lpo_date = None
         if payload.lpo_date and payload.lpo_date != "string":
             lpo_date = datetime.strptime(payload.lpo_date, "%Y-%m-%d").date()
 
-        # Insert the project
         cur.execute("""
             INSERT INTO projects (
                 project_no, quotation_id, client_id, project_name,
@@ -201,6 +225,8 @@ def create_project(payload: ProjectCreate):
     finally:
         cur.close()
         conn.close()
+
+
 # ------------------------------
 # GET PROJECT DETAILS
 # ------------------------------
@@ -249,6 +275,7 @@ def get_project_details(project_id: int):
         cur.close()
         conn.close()
 
+
 # ------------------------------
 # UPDATE PROJECT
 # ------------------------------
@@ -295,38 +322,64 @@ def update_project(project_id: int, payload: ProjectCreate):
         cur.close()
         conn.close()
 
+
 # ------------------------------
-# UPLOAD LPO FILE
+# UPLOAD / REPLACE LPO FILE
 # ------------------------------
 @router.post("/{project_id}/upload-lpo")
 async def upload_lpo_file(project_id: int, file: UploadFile = File(...)):
+    """
+    Upload or REPLACE the LPO file for a project.
+    - Deletes any existing LPO file(s) for this project from Supabase first.
+    - Uploads the new file.
+    - Updates the database with the new public URL.
+    """
     conn = get_connection()
     cur = conn.cursor()
 
     try:
-        # Check if project exists
-        cur.execute("SELECT project_id FROM projects WHERE project_id = %s", (project_id,))
-        if cur.fetchone() is None:
+        # 1. Verify project exists
+        cur.execute("SELECT project_id, lpo_file FROM projects WHERE project_id = %s", (project_id,))
+        row = cur.fetchone()
+        if row is None:
             raise HTTPException(404, "Project not found")
 
-        # 1. Prepare file info
-        file_content = await file.read()
-        extension = file.filename.split(".")[-1]
-        # Store in a subfolder named 'lpos' inside the bucket
-        cloud_filename = f"lpos/LPO_{project_id}.{extension}"
+        existing_lpo_url = row[1]  # May be None if no LPO uploaded yet
 
-        # 2. Upload to Supabase Storage (Bucket name: "projects")
-        # Ensure you created a bucket named 'projects' in Supabase dashboard first!
-        upload_response = supabase.storage.from_("projects").upload(
-            path=cloud_filename,
+        # 2. Read new file content
+        file_content = await file.read()
+        extension = file.filename.rsplit(".", 1)[-1].lower()
+        new_cloud_path = f"lpos/LPO_{project_id}.{extension}"
+
+        # 3. Delete ALL old LPO files for this project (handles different extensions)
+        #    This ensures a clean replace even if the extension changed (pdf -> docx etc.)
+        if existing_lpo_url:
+            delete_old_lpo_from_supabase(project_id)
+
+        # 4. Upload new file to Supabase Storage
+        #    x-upsert: true acts as a safety net if same extension is reused
+        upload_response = supabase.storage.from_(BUCKET_NAME).upload(
+            path=new_cloud_path,
             file=file_content,
-            file_options={"content-type": file.content_type, "x-upsert": "true"}
+            file_options={
+                "content-type": file.content_type,
+                "x-upsert": "true"
+            }
         )
 
-        # 3. Get the Public URL
-        public_url = supabase.storage.from_("projects").get_public_url(cloud_filename)
+        # 5. Get the public URL of the newly uploaded file
+        public_url_response = supabase.storage.from_(BUCKET_NAME).get_public_url(new_cloud_path)
 
-        # 4. Update Database with the URL instead of just the filename
+        # Handle both dict-style and attribute-style responses from supabase-py
+        if isinstance(public_url_response, dict):
+            public_url = public_url_response.get("publicUrl") or public_url_response.get("data", {}).get("publicUrl")
+        else:
+            public_url = getattr(public_url_response, "publicUrl", None)
+
+        if not public_url:
+            raise HTTPException(500, "Could not retrieve public URL after upload")
+
+        # 6. Save new URL to database
         cur.execute("""
             UPDATE projects 
             SET lpo_file = %s 
@@ -335,11 +388,17 @@ async def upload_lpo_file(project_id: int, file: UploadFile = File(...)):
 
         conn.commit()
 
+        action = "replaced" if existing_lpo_url else "uploaded"
+
         return {
-            "message": "LPO uploaded to cloud successfully",
-            "url": public_url
+            "message": f"LPO file {action} successfully in cloud storage",
+            "url": public_url,
+            "file_name": file.filename,
+            "action": action
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, f"Cloud Upload Error: {str(e)}")
@@ -347,8 +406,9 @@ async def upload_lpo_file(project_id: int, file: UploadFile = File(...)):
         cur.close()
         conn.close()
 
+
 # ------------------------------
-# DOWNLOAD LPO FILE (FROM ANY DEVICE)
+# DOWNLOAD LPO FILE
 # ------------------------------
 @router.get("/{project_id}/download-lpo")
 def download_lpo(project_id: int):
@@ -362,7 +422,6 @@ def download_lpo(project_id: int):
         if not row or not row[0]:
             raise HTTPException(404, "LPO file link not found in database")
 
-        # row[0] is now the full Supabase URL (e.g., https://.../file.pdf)
         return {"download_url": row[0]}
 
     except Exception as e:
@@ -372,8 +431,9 @@ def download_lpo(project_id: int):
         conn.close()
 
 
-
-# Add this endpoint after other endpoints
+# ------------------------------
+# UPDATE PROJECT STATUS
+# ------------------------------
 @router.patch("/{project_id}/status", summary="Update Project Status")
 def update_project_status(project_id: int, payload: ProjectStatusUpdate):
     """Update project status (ACTIVE/INACTIVE)"""
@@ -381,17 +441,14 @@ def update_project_status(project_id: int, payload: ProjectStatusUpdate):
     cur = conn.cursor()
 
     try:
-        # Check if project exists
         cur.execute("SELECT project_id FROM projects WHERE project_id = %s", (project_id,))
         if cur.fetchone() is None:
             raise HTTPException(404, "Project not found")
 
-        # Parse halted date if provided
         halted_date = None
         if payload.halted_date and payload.halted_date != "string":
             halted_date = datetime.strptime(payload.halted_date, "%Y-%m-%d").date()
 
-        # Update project status and halted date
         cur.execute("""
             UPDATE projects 
             SET status = %s, 
@@ -421,6 +478,3 @@ def update_project_status(project_id: int, payload: ProjectStatusUpdate):
     finally:
         cur.close()
         conn.close()
-
-
-
