@@ -89,19 +89,36 @@ async def health_check():
 
 # --- 8. REACT CATCH-ALL ROUTE (MUST BE LAST!) ---
 # This catches any routes not matched above and serves the React app
+# All known API prefixes — catch-all will skip these
+API_PREFIXES = (
+    "auth/", "enquiries/", "enquiries",
+    "quotations/", "quotations",
+    "projects/", "projects",
+    "test-requests/", "test-requests",
+    "samples-workflow/", "samples-workflow",
+    "invoices/", "invoices",
+    "reports/", "reports",
+    "search/", "search",
+    "payments/", "payments",
+    "api/", "docs", "redoc", "openapi.json",
+    "debug/",
+)
+
 @app.get("/{full_path:path}", include_in_schema=False)
 async def serve_frontend(full_path: str):
     """
     Serve React app for any non-API routes.
-    This only runs if no other route (API, docs, static files) matches.
+    Explicitly skips all known API prefixes so they are never intercepted.
     """
-    # Let FastAPI handle its own docs paths automatically
-    # This function only runs for paths not matched by any previous route
-    
+    # If the path looks like an API call, don't swallow it — raise 404
+    # so FastAPI returns a proper JSON error instead of HTML
+    if full_path.startswith(API_PREFIXES):
+        raise HTTPException(status_code=404, detail=f"API route not found: /{full_path}")
+
     index_path = os.path.join(DIST_PATH, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
-    
+
     return {
         "message": "GEL LIMS Backend is running",
         "frontend_status": f"Frontend not found at {index_path}",
