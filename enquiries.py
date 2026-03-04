@@ -1,4 +1,4 @@
-# enquiries.py - UPDATED VERSION
+# enquiries.py - UPDATED VERSION with date update endpoint
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from datetime import date, datetime
@@ -28,7 +28,10 @@ class EnquiryOut(BaseModel):
     status: str
     notes: Optional[str]
 
-############################################
+# NEW: Model for updating enquiry date
+class EnquiryDateUpdate(BaseModel):
+    enquiry_date: date
+
 # Client Models for BOTH GET and POST
 class ClientCreate(BaseModel):
     name: str
@@ -166,8 +169,6 @@ def get_client_by_id(client_id: int):
         cur.close()
         conn.close()
 
-
-# ... [REST OF YOUR CODE REMAINS THE SAME] ...
 
 #####################################
 
@@ -383,7 +384,7 @@ def search_enquiries(q: str):
         conn.close()
 
 # ----------------------------
-# UPDATE ENQUIRY STATUS (unchanged)
+# UPDATE ENQUIRY STATUS
 # ----------------------------
 @router.post("/{enquiry_id}/status")
 def update_enquiry_status(enquiry_id: int, status: str):
@@ -404,6 +405,118 @@ def update_enquiry_status(enquiry_id: int, status: str):
 
     except Exception as e:
         conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cur.close()
+        conn.close()
+
+# ----------------------------
+# NEW: UPDATE ENQUIRY DATE
+# ----------------------------
+@router.put("/{enquiry_id}")
+def update_enquiry_date(enquiry_id: int, date_update: EnquiryDateUpdate):
+    """
+    Update an enquiry's date
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        # Check if enquiry exists
+        cur.execute("SELECT enquiry_id FROM enquiries WHERE enquiry_id = %s", (enquiry_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Enquiry not found")
+
+        # Update the enquiry date
+        cur.execute("""
+            UPDATE enquiries 
+            SET enquiry_date = %s 
+            WHERE enquiry_id = %s
+            RETURNING enquiry_id, enquiry_ref, client_id, enquiry_date, project_name, location, status, notes
+        """, (date_update.enquiry_date, enquiry_id))
+
+        row = cur.fetchone()
+        conn.commit()
+
+        return {
+            "enquiry_id": row[0],
+            "enquiry_ref": row[1],
+            "client_id": row[2],
+            "enquiry_date": row[3],
+            "project_name": row[4],
+            "location": row[5],
+            "status": row[6],
+            "notes": row[7],
+        }
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error updating enquiry date: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cur.close()
+        conn.close()
+
+# ----------------------------
+# OPTIONAL: PATCH endpoint for partial updates (alternative to PUT)
+# ----------------------------
+@router.patch("/{enquiry_id}")
+def partial_update_enquiry(enquiry_id: int, date_update: EnquiryDateUpdate):
+    """
+    Partially update an enquiry (currently only date, but can be extended)
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        # Check if enquiry exists
+        cur.execute("SELECT enquiry_id FROM enquiries WHERE enquiry_id = %s", (enquiry_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Enquiry not found")
+
+        # Build dynamic update query
+        update_fields = []
+        values = []
+        
+        # Add fields to update (currently only date)
+        if date_update.enquiry_date:
+            update_fields.append("enquiry_date = %s")
+            values.append(date_update.enquiry_date)
+        
+        if not update_fields:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        # Add enquiry_id to values
+        values.append(enquiry_id)
+
+        # Execute update
+        query = f"""
+            UPDATE enquiries 
+            SET {', '.join(update_fields)}
+            WHERE enquiry_id = %s
+            RETURNING enquiry_id, enquiry_ref, client_id, enquiry_date, project_name, location, status, notes
+        """
+        
+        cur.execute(query, values)
+        row = cur.fetchone()
+        conn.commit()
+
+        return {
+            "enquiry_id": row[0],
+            "enquiry_ref": row[1],
+            "client_id": row[2],
+            "enquiry_date": row[3],
+            "project_name": row[4],
+            "location": row[5],
+            "status": row[6],
+            "notes": row[7],
+        }
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error partially updating enquiry: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:

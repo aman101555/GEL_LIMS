@@ -2609,8 +2609,9 @@ def generate_delivery_note_excel_template(payload: DeliveryNoteRequest):
         os.makedirs(output_dir, exist_ok=True)
         
         # Clean filename
-        clean_project_no = project_no.replace('/', '-').replace(' ', '_')
-        filename = f"DN-{delivery_note_no.replace('/', '-')}-{clean_project_no}.xlsx"
+        clean_project_no = project_no.strip().replace('/', '-').replace(' ', '_')
+        dn_clean = delivery_note_no.strip().replace('/', '-')
+        filename = f"DN-{dn_clean}-{clean_project_no}.xlsx".strip('_')
         filepath = os.path.join(output_dir, filename)
         
         wb.save(filepath)

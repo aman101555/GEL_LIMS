@@ -25,6 +25,7 @@ from samples_workflow import router as samples_workflow_router
 from invoices import router as invoice_router
 from reports import router as reports_router
 from search import router as search_router
+from payments import router as payments_router
 
 app = FastAPI(title="GEL LIMS API")
 
@@ -75,6 +76,7 @@ app.include_router(samples_workflow_router)  # Already has /samples-workflow in 
 app.include_router(invoice_router)  # Already has /invoices in its file
 app.include_router(reports_router, prefix="/reports")
 app.include_router(search_router, prefix="/search")
+app.include_router(payments_router)  # Already has /payments in its file
 
 # --- 6. SERVE STATIC ASSETS ---
 if os.path.exists(DIST_PATH) and os.path.exists(os.path.join(DIST_PATH, "assets")):
@@ -120,3 +122,8 @@ if __name__ == "__main__":
         ).start()
     
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# Add this temporarily to debug
+@app.get("/debug/routes")
+async def debug_routes():
+    return {"routes": [route.path for route in app.routes]}

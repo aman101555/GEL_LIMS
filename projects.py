@@ -357,7 +357,7 @@ async def upload_lpo_file(project_id: int, file: UploadFile = File(...)):
             delete_old_lpo_from_supabase(project_id)
 
         # 4. Upload new file to Supabase Storage
-        #    x-upsert: true acts as a safety net if same extension is reused
+        #    x-upsert: true overwrites if same path exists
         upload_response = supabase.storage.from_(BUCKET_NAME).upload(
             path=new_cloud_path,
             file=file_content,
@@ -367,17 +367,15 @@ async def upload_lpo_file(project_id: int, file: UploadFile = File(...)):
             }
         )
 
-        # 5. Get the public URL of the newly uploaded file
-        public_url_response = supabase.storage.from_(BUCKET_NAME).get_public_url(new_cloud_path)
+        # Check upload response for errors (supabase-py can return error dicts instead of raising)
+        if isinstance(upload_response, dict):
+            error = upload_response.get("error") or upload_response.get("message")
+            if error:
+                raise HTTPException(500, f"Supabase upload error: {error}")
 
-        # Handle both dict-style and attribute-style responses from supabase-py
-        if isinstance(public_url_response, dict):
-            public_url = public_url_response.get("publicUrl") or public_url_response.get("data", {}).get("publicUrl")
-        else:
-            public_url = getattr(public_url_response, "publicUrl", None)
-
-        if not public_url:
-            raise HTTPException(500, "Could not retrieve public URL after upload")
+        # 5. Build the public URL directly — most reliable across all supabase-py versions
+        #    Avoids get_public_url() version inconsistencies entirely
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{new_cloud_path}"
 
         # 6. Save new URL to database
         cur.execute("""
@@ -472,6 +470,41 @@ def update_project_status(project_id: int, payload: ProjectStatusUpdate):
             "halted_date": str(result[3]) if result[3] else None
         }
 
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+# ------------------------------
+# DELETE PROJECT
+# ------------------------------
+@router.delete("/{project_id}", summary="Delete Project")
+def delete_project(project_id: int):
+    """Permanently delete a project and its associated LPO file from storage."""
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT project_id, project_no, lpo_file FROM projects WHERE project_id = %s", (project_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(404, "Project not found")
+
+        project_no = row[1]
+        lpo_file = row[2]
+
+        if lpo_file:
+            delete_old_lpo_from_supabase(project_id)
+
+        cur.execute("DELETE FROM projects WHERE project_id = %s", (project_id,))
+        conn.commit()
+
+        return {"message": f"Project {project_no} deleted successfully", "project_id": project_id}
+
+    except HTTPException:
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))

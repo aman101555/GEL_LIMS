@@ -35,6 +35,7 @@ class QuotationItemCreate(BaseModel):
     test_standard: Optional[str] = None
     unit_rate: float
     quantity: int
+    net_unit: Optional[str] = None
 
 
 class QuotationItemFromCatalog(BaseModel):
@@ -47,12 +48,18 @@ class ItemQuantityUpdate(BaseModel):
 class UnitRateUpdate(BaseModel):
     unit_rate: float
 
+class ItemUpdate(BaseModel):
+    quantity: Optional[int] = None
+    unit_rate: Optional[float] = None
+    test_standard: Optional[str] = None
+    net_unit: Optional[str] = None
+
 # ============================================================
 # Generate Quotation Number with New Format (Thread-safe version)
 # ============================================================
 
 TEMPLATE_URLS = {
-    "GEO": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/quotations/GEO.docx",
+    "GEO": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/quotations/GEOT_fixed.docx",
     "SRV": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/quotations/SRV.docx",
     "DEFAULT": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/quotations/QT.docx"
 }
@@ -300,10 +307,10 @@ def add_item(quotation_id: int, item: QuotationItemCreate):
 
         # Insert manual item
         cur.execute("""
-            INSERT INTO quotation_items (quotation_id, description, test_standard, unit_rate, quantity)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO quotation_items (quotation_id, description, test_standard, unit_rate, quantity, net_unit)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING item_id
-        """, (quotation_id, item.description, item.test_standard, item.unit_rate, item.quantity))
+        """, (quotation_id, item.description, item.test_standard, item.unit_rate, item.quantity, item.net_unit))
 
         item_id = cur.fetchone()[0]
 
@@ -629,6 +636,61 @@ def list_quotations(limit: int = 100, offset: int = 0):
         conn.close()
 
 
+
+
+# ============================================================
+# GET /quotations/verified — For Create Project dropdown
+# Only returns APPROVED quotations that have been verified (receipt + verified_at)
+# ============================================================
+
+@router.get("/verified", summary="List Verified Quotations (ready to become projects)")
+def list_verified_quotations():
+    """
+    Returns only APPROVED quotations that have:
+    - A receipt uploaded (receipt_path IS NOT NULL)
+    - Been verified (verified_at IS NOT NULL)
+    These are the only quotations eligible to be converted into projects.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT q.quotation_id, q.quotation_no, q.division, q.revision,
+                   q.status, q.total_amount, q.grand_total,
+                   e.enquiry_ref, c.client_id, c.name,
+                   q.verified_at
+            FROM quotations q
+            LEFT JOIN enquiries e ON q.enquiry_id = e.enquiry_id
+            LEFT JOIN clients c ON e.client_id = c.client_id
+            WHERE q.status = 'APPROVED'
+              AND q.receipt_path IS NOT NULL
+              AND q.verified_at IS NOT NULL
+            ORDER BY q.verified_at DESC
+        """)
+
+        rows = cur.fetchall()
+        return [
+            {
+                "quotation_id": r[0],
+                "quotation_no": r[1],
+                "division": r[2],
+                "revision": r[3],
+                "status": r[4],
+                "total_amount": float(r[5] or 0),
+                "grand_total": float(r[6] or 0),
+                "enquiry_ref": r[7],
+                "client_id": r[8],
+                "client_name": r[9],
+                "verified_at": r[10].isoformat() if r[10] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
 # quotations.py - Update the download_quotation function
 
 # ============================================================
@@ -672,7 +734,8 @@ def download_quotation(quotation_id: int):
         cur.execute("""
             SELECT description, test_standard, unit_rate, quantity,
                    COALESCE(amount, unit_rate * quantity) as amount, 
-                   COALESCE(unit, 'No.') as unit
+                   COALESCE(unit, 'No.') as unit,
+                   net_unit
             FROM quotation_items
             WHERE quotation_id = %s
             ORDER BY item_id
@@ -680,7 +743,7 @@ def download_quotation(quotation_id: int):
 
         items = [
             {"description": r[0], "test_standard": r[1], "unit_rate": float(r[2]),
-             "quantity": r[3], "amount": float(r[4]), "unit": r[5]}
+             "quantity": r[3], "amount": float(r[4]), "unit": r[5], "net_unit": r[6]}
             for r in cur.fetchall()
         ]
 
@@ -758,7 +821,7 @@ def quotation_details(quotation_id: int):
 
         # Fetch items
         cur.execute("""
-            SELECT description, test_standard, unit_rate, quantity, amount
+            SELECT description, test_standard, unit_rate, quantity, amount, net_unit
             FROM quotation_items
             WHERE quotation_id = %s
             ORDER BY item_id
@@ -770,7 +833,8 @@ def quotation_details(quotation_id: int):
                 "test_standard": r[1],
                 "unit_rate": float(r[2]),
                 "quantity": r[3],
-                "amount": float(r[4])
+                "amount": float(r[4]),
+                "net_unit": r[5]
             }
             for r in cur.fetchall()
         ]
@@ -856,7 +920,7 @@ def get_price_catalog():
 # ============================================================
 # Update the UPDATE endpoint in quotations.py
 @router.put("/{quotation_id}/items/{item_index}", summary="Update Item Quantity, Unit Rate, or Test Standard")
-def update_item(quotation_id: int, item_index: int, payload: dict):
+def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
     """Update quantity, unit rate, or test standard of a specific item in a quotation"""
     conn = get_connection()
     cur = conn.cursor()
@@ -878,7 +942,7 @@ def update_item(quotation_id: int, item_index: int, payload: dict):
         
         # Get the item_id for the given index
         cur.execute("""
-            SELECT item_id, unit_rate, quantity, test_standard
+            SELECT item_id, unit_rate, quantity, test_standard, net_unit
             FROM quotation_items
             WHERE quotation_id = %s
             ORDER BY item_id
@@ -890,12 +954,13 @@ def update_item(quotation_id: int, item_index: int, payload: dict):
         if not item:
             raise HTTPException(404, "Item not found")
         
-        item_id, current_unit_rate, current_quantity, current_test_standard = item
+        item_id, current_unit_rate, current_quantity, current_test_standard, current_net_unit = item
         
         # Check what fields are being updated
-        quantity = payload.get('quantity')
-        unit_rate = payload.get('unit_rate')
-        test_standard = payload.get('test_standard')
+        quantity = payload.quantity
+        unit_rate = payload.unit_rate
+        test_standard = payload.test_standard
+        net_unit = payload.net_unit
         
         update_field = None
         new_value = None
@@ -917,8 +982,12 @@ def update_item(quotation_id: int, item_index: int, payload: dict):
             update_field = 'test_standard'
             new_value = test_standard
             current_value = current_test_standard
+        elif net_unit is not None:
+            update_field = 'net_unit'
+            new_value = net_unit
+            current_value = current_net_unit
         else:
-            raise HTTPException(400, "Must provide quantity, unit_rate, or test_standard")
+            raise HTTPException(400, "Must provide quantity, unit_rate, test_standard, or net_unit")
         
         # Update the item
         if update_field == 'quantity':
@@ -939,6 +1008,13 @@ def update_item(quotation_id: int, item_index: int, payload: dict):
             cur.execute("""
                 UPDATE quotation_items
                 SET test_standard = %s
+                WHERE item_id = %s
+                RETURNING amount
+            """, (new_value, item_id))
+        elif update_field == 'net_unit':
+            cur.execute("""
+                UPDATE quotation_items
+                SET net_unit = %s
                 WHERE item_id = %s
                 RETURNING amount
             """, (new_value, item_id))
@@ -983,8 +1059,8 @@ def update_item(quotation_id: int, item_index: int, payload: dict):
             "message": f"Item {update_field} updated",
             "item_id": item_id,
             "update_field": update_field,
-            "old_value": current_value if update_field != 'test_standard' else str(current_value),
-            "new_value": new_value if update_field != 'test_standard' else str(new_value),
+            "old_value": current_value if update_field not in ('test_standard', 'net_unit') else str(current_value or ''),
+            "new_value": new_value if update_field not in ('test_standard', 'net_unit') else str(new_value or ''),
             "new_amount": float(updated_amount) if update_field in ['quantity', 'unit_rate'] else None,
             "totals": {
                 "total_amount": total_amount,
