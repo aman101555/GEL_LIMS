@@ -1267,6 +1267,94 @@ def populate_report_template_from_url(template_url: str, report_data: dict) -> s
         if temp_template_path and os.path.exists(temp_template_path):
             os.remove(temp_template_path)
 
+
+@router.get("/samples/by-number/{sample_no}")
+def get_sample_by_number(sample_no: str):
+    """
+    Fetch sample info by sample number.
+    Returns test type, sample count, and whether a report already exists.
+    Used by CreateReport to populate the form before upload/download.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # 1. Get sample + request
+        cur.execute("""
+            SELECT s.sample_id, s.sample_no, s.request_id, s.status,
+                   tr.request_no, tr.project_id
+            FROM samples s
+            JOIN test_requests tr ON s.request_id = tr.test_request_id
+            WHERE s.sample_no = %s
+        """, (sample_no,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"Sample \"{sample_no}\" not found. Please check the sample number.")
+
+        sample_id, sample_no_db, request_id, status, request_no, project_id = row
+
+        # 2. Get test distribution to find which test this sample belongs to
+        sample_to_test_map, test_distribution = get_test_distribution_for_request(request_id, cur)
+
+        test_info = sample_to_test_map.get(sample_id)
+        if not test_info:
+            raise HTTPException(400, f"Cannot determine test type for sample {sample_no}")
+
+        item_code = test_info["item_code"]
+        test_name = test_info["test_name"]
+
+        # 3. Get all samples sharing this test type in the same request
+        test_samples = []
+        for sid, tdata in sample_to_test_map.items():
+            if tdata.get("item_code") == item_code:
+                cur.execute("SELECT sample_no FROM samples WHERE sample_id = %s", (sid,))
+                s_row = cur.fetchone()
+                if s_row:
+                    test_samples.append(s_row[0])
+
+        # 4. Check if a report already exists for this test type
+        existing_report = None
+        for sid in sample_to_test_map:
+            if sample_to_test_map[sid]["item_code"] == item_code:
+                cur.execute("""
+                    SELECT r.report_id, r.report_no, r.status, r.file_path
+                    FROM reports r
+                    WHERE r.sample_id = %s
+                    LIMIT 1
+                """, (sid,))
+                r_row = cur.fetchone()
+                if r_row:
+                    existing_report = {
+                        "report_id": r_row[0],
+                        "report_no": r_row[1],
+                        "status": r_row[2],
+                        "file_path": r_row[3],
+                    }
+                    break
+
+        return {
+            "sample_id": sample_id,
+            "sample_no": sample_no_db,
+            "request_id": request_id,
+            "request_no": request_no,
+            "project_id": project_id,
+            "status": status,
+            "item_code": item_code,
+            "test_name": test_name,
+            "sample_count": len(test_samples),
+            "test_samples": test_samples,
+            "report_exists": existing_report is not None,
+            "existing_report": existing_report,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error fetching sample info: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
 @router.get("/samples/by-number/{sample_no}/download-populated-template")
 async def download_populated_template_by_sample(
     sample_no: str,
