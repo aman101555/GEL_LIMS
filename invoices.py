@@ -2608,10 +2608,20 @@ def generate_delivery_note_excel_template(payload: DeliveryNoteRequest):
         output_dir = "generated_delivery_notes"
         os.makedirs(output_dir, exist_ok=True)
         
-        # Clean filename
-        clean_project_no = project_no.strip().replace('/', '-').replace(' ', '_')
+        # Clean filename — same approach as tax/proforma invoices
+        import re, urllib.parse
+        def clean_dn_filename(text):
+            if not text:
+                return ""
+            text = str(text).strip()
+            text = re.sub(r'[\\/*?:"<>|]', '-', text)
+            text = re.sub(r'\s+', '-', text)
+            text = text.strip('-')
+            return text
+
         dn_clean = delivery_note_no.strip().replace('/', '-')
-        filename = f"DN-{dn_clean}-{clean_project_no}.xlsx".strip('_')
+        clean_project_no = clean_dn_filename(project_no)
+        filename = f"DN-{dn_clean}-{clean_project_no}.xlsx"
         filepath = os.path.join(output_dir, filename)
         
         wb.save(filepath)
@@ -2665,12 +2675,13 @@ def generate_delivery_note_excel_template(payload: DeliveryNoteRequest):
         # =====================================================
         # 6. Return File for Download
         # =====================================================
+        encoded_filename = urllib.parse.quote(filename)
         return FileResponse(
             filepath,
             filename=filename,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}; filename=\"{filename}\""
             }
         )
         
