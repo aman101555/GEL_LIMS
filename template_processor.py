@@ -5,16 +5,16 @@ import os
 from decimal import Decimal, ROUND_DOWN
 from typing import List, Dict, Any
 from utils import resource_path
-import requests  # Add this import
+import requests
 
 
 def download_template_from_supabase(url: str):
     """
     Download template from Supabase storage and return as BytesIO.
-    
+
     Args:
-        url: Supabase URL (e.g., https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/quotations/...)
-    
+        url: Supabase URL (e.g., https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/...)
+
     Returns:
         BytesIO object containing the template
     """
@@ -22,13 +22,12 @@ def download_template_from_supabase(url: str):
         print(f"DEBUG: Downloading template from Supabase: {url}")
         response = requests.get(url, timeout=30)
         response.raise_for_status()
-        
-        # Return the template as BytesIO
+
         template_bytesio = BytesIO(response.content)
         print(f"DEBUG: Successfully downloaded template ({len(response.content)} bytes)")
-        
+
         return template_bytesio
-        
+
     except requests.exceptions.RequestException as e:
         print(f"ERROR: Failed to download template from {url}: {e}")
         raise ValueError(f"Failed to download template from Supabase: {e}")
@@ -37,37 +36,37 @@ def download_template_from_supabase(url: str):
         raise
 
 
+# ============================================================
+# QUOTATION TEMPLATE PROCESSOR
+# ============================================================
+
 class QuotationTemplateProcessor:
     def __init__(self, template_source=None, template_url=None):
         """
         Initialize template processor.
-        
+
         template_source can be:
         1. A string (local file path)
         2. A BytesIO object (file downloaded from Supabase)
         3. None if template_url is provided
-        
+
         template_url: Supabase URL to download template from
         """
-        # If template_url is provided, download from Supabase
         if template_url:
             print(f"DEBUG: Downloading template from URL: {template_url}")
             self.template_source = download_template_from_supabase(template_url)
         elif template_source is None:
             raise ValueError("Either template_source or template_url is required")
         elif isinstance(template_source, str):
-            # Local file path
             self.template_source = resource_path(template_source)
             if not os.path.exists(self.template_source):
                 raise FileNotFoundError(f"Template not found: {self.template_source}")
             print(f"DEBUG: Using local template: {self.template_source}")
         else:
-            # Already a BytesIO object or similar
             self.template_source = template_source
             print(f"DEBUG: Using provided template source (BytesIO)")
 
     def process_quotation(self, quotation_data, client_data, items):
-        # DocxTemplate can open both a file path and a memory stream
         doc = DocxTemplate(self.template_source)
         context = self._prepare_context(quotation_data, client_data, items)
         doc.render(context)
@@ -161,7 +160,6 @@ class QuotationTemplateProcessor:
                     if not category["subitems"]:
                         continue
 
-                    # Main category row
                     items_context.append({
                         "s_no": f"{cat_idx}.",
                         "description": category["main_title"],
@@ -173,7 +171,6 @@ class QuotationTemplateProcessor:
                         "amount": "",
                     })
 
-                    # Sub items
                     for sub_idx, sub in enumerate(category["subitems"], 1):
                         letter = chr(96 + sub_idx)
                         items_context.append({
@@ -259,74 +256,359 @@ class QuotationTemplateProcessor:
     def _amount_to_words(self, amount):
         """Convert amount to words (e.g., 250 → Two Hundred Fifty Only)"""
         def convert_to_words(num):
-            """Convert a number less than 1000 to words"""
             if num == 0:
                 return "Zero"
-            
-            ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", 
-                    "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", 
-                    "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", 
+
+            ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven",
+                    "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen",
+                    "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen",
                     "Nineteen"]
-            tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", 
+            tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty",
                     "Seventy", "Eighty", "Ninety"]
-            
+
             words = ""
-            
+
             if num >= 100:
                 words += ones[num // 100] + " Hundred"
                 num %= 100
                 if num > 0:
                     words += " "
-            
+
             if num >= 20:
                 words += tens[num // 10]
                 if num % 10 > 0:
                     words += " " + ones[num % 10]
             elif num > 0:
                 words += ones[num]
-            
+
             return words
-        
+
         try:
             if isinstance(amount, str):
                 amount = float(amount.replace(',', ''))
-            
+
             amount = Decimal(str(amount)).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-            
+
             int_part = int(amount)
             dec_part = int((amount - int_part) * 100)
-            
+
             if int_part == 0:
                 if dec_part > 0:
                     return f"{convert_to_words(dec_part)} Fils Only"
                 else:
                     return "Zero Dirhams Only"
-            
+
             words_parts = []
-            
+
             if int_part >= 1000000:
                 millions = int_part // 1000000
                 words_parts.append(convert_to_words(millions) + " Million")
                 int_part %= 1000000
-            
+
             if int_part >= 1000:
                 thousands = int_part // 1000
                 if thousands > 0:
                     words_parts.append(convert_to_words(thousands) + " Thousand")
                 int_part %= 1000
-            
+
             if int_part > 0:
                 words_parts.append(convert_to_words(int_part))
-            
+
             words = " ".join(words_parts)
-            
+
             result = f"{words} Dirhams"
             if dec_part > 0:
                 result += f" and {convert_to_words(dec_part)} Fils"
-            
+
             result += " Only"
             return result
-            
+
         except (ValueError, TypeError, AttributeError) as e:
             print(f"ERROR converting amount to words: {e}, amount={amount}")
             return "Zero Dirhams Only"
+
+
+
+
+
+# ============================================================
+# SAMPLE DESCRIPTION SHEET TEMPLATE PROCESSOR (GEO / GSL)
+#
+# Upload template to Supabase:
+# templates/sample_description/SAMPLE_DESCRIPTION.docx
+#
+# TEMPLATE VARIABLES (use in .docx):
+#
+#   {{ project_name }}
+#   {{ project_no }}
+#   {{ location }}
+#   {{ engineer }}
+#   {{ date }}
+#
+# ============================================================
+
+SAMPLE_DESCRIPTION_TEMPLATE_URL = (
+    "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/"
+    "templates/sample_description/SAMPLE_DESCRIPTION.docx"
+)
+
+
+class SampleDescriptionTemplateProcessor:
+    def __init__(self):
+        print("DEBUG: Initializing SampleDescriptionTemplateProcessor")
+        self.template_source = download_template_from_supabase(
+            SAMPLE_DESCRIPTION_TEMPLATE_URL
+        )
+
+    def process(self, project_data: dict) -> BytesIO:
+        doc = DocxTemplate(self.template_source)
+        context = self._prepare_context(project_data)
+        print(f"DEBUG: Sample Description context: {context}")
+        doc.render(context)
+
+        output = BytesIO()
+        doc.save(output)
+        output.seek(0)
+        return output
+
+    def _prepare_context(self, d: dict) -> dict:
+
+        def fmt_date(val):
+            if not val:
+                return datetime.now().strftime("%d %B, %Y")
+            try:
+                if isinstance(val, str):
+                    val = val.split(".")[0]
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                        try:
+                            val = datetime.strptime(val, fmt)
+                            break
+                        except ValueError:
+                            continue
+                if isinstance(val, datetime):
+                    return val.strftime("%d %B, %Y")
+                return str(val)
+            except Exception:
+                return str(val)
+
+        return {
+            "project_name": d.get("project_name", ""),
+            "project_no": d.get("project_no", ""),
+            "location": d.get("location", ""),
+            "engineer": d.get("engineer", ""),   # optional (you can map from DB later)
+            "date": fmt_date(d.get("created_at")),
+        }
+
+
+# ============================================================
+# COVER SHEET TEMPLATE PROCESSOR (GEO / GSL Division only)
+# ============================================================
+
+COVER_SHEET_TEMPLATE_URL = (
+    "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/"
+    "templates/cover_sheet/COVER_SHEET.docx"
+)
+
+
+class CoverSheetTemplateProcessor:
+    def __init__(self):
+        print(f"DEBUG: Initializing CoverSheetTemplateProcessor")
+        self.template_source = download_template_from_supabase(COVER_SHEET_TEMPLATE_URL)
+
+    def process(self, project_data: dict) -> BytesIO:
+        """Render and return the filled cover sheet as a BytesIO stream."""
+        doc = DocxTemplate(self.template_source)
+        context = self._prepare_context(project_data)
+        print(f"DEBUG: Cover sheet context: {context}")
+        doc.render(context)
+        output = BytesIO()
+        doc.save(output)
+        output.seek(0)
+        return output
+
+    def _prepare_context(self, d: dict) -> dict:
+        def fmt_date(val):
+            if not val:
+                return ""
+            try:
+                if isinstance(val, str):
+                    val = val.split(".")[0]
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                        try:
+                            val = datetime.strptime(val, fmt)
+                            break
+                        except ValueError:
+                            continue
+                if isinstance(val, datetime):
+                    return val.strftime("%d %B, %Y")
+                return str(val)
+            except Exception:
+                return str(val)
+
+        project_name = d.get("project_name", "")
+        location     = d.get("location", "")
+
+        if project_name and location:
+            project_location = f"{project_name} / {location}"
+        else:
+            project_location = project_name or location
+
+        return {
+            "project_no":       d.get("project_no", ""),
+            "date":             fmt_date(d.get("created_at")),
+            "client":           d.get("client_name", ""),
+            "project_location": project_location,
+            "address":          d.get("client_address", ""),
+            "contact_person":   d.get("client_contact_person", ""),
+        }
+
+
+# ============================================================
+# WORK INSTRUCTION SHEET TEMPLATE PROCESSOR (GEO / GSL Division only)
+#
+# Upload your template to Supabase at:
+#   templates/work_instruction/WORK_INSTRUCTION.docx
+#
+# Template variable reference (use these Jinja2 tags in your .docx):
+#
+#   HEADER FIELDS:
+#     {{ project_no }}         → Project No.
+#     {{ client }}             → Client name
+#     {{ project_name }}       → Project Name
+#     {{ contact_eng }}        → Contact: Eng.  (clients.contact_person)
+#     {{ project_location }}   → Project Location  (projects.location)
+#     {{ client_area }}        → Client Area  (clients.address)
+#     {{ client_mobile }}      → Client Mobile  (clients.phone)
+#     {{ confirmation_date }}  → Confirmation Date (Client)  (projects.lpo_date)
+#     {{ fieldwork_start }}    → Fieldwork Start  (left blank — filled manually)
+#
+#   TESTS TABLE (use a for-loop row in the docx table):
+#     {% for t in tests %}
+#       {{ t.s_no }}           → Serial number
+#       {{ t.description }}    → Test / service description
+#       {{ t.standard }}       → Test standard (e.g. ASTM D1586)
+#       {{ t.unit }}           → Unit (e.g. No., m, kg)
+#       {{ t.qty }}            → Quantity
+#       {{ t.notes }}          → Notes / remarks
+#     {% endfor %}
+# ============================================================
+
+WORK_INSTRUCTION_TEMPLATE_URL = (
+    "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/"
+    "templates/work_instruction/WORK_INSTRUCTION.docx"
+)
+
+
+class WorkInstructionTemplateProcessor:
+    def __init__(self):
+        print(f"DEBUG: Initializing WorkInstructionTemplateProcessor")
+        self.template_source = download_template_from_supabase(WORK_INSTRUCTION_TEMPLATE_URL)
+
+    def process(self, project_data: dict, items: list) -> BytesIO:
+        """Render and return the filled Work Instruction Sheet as a BytesIO stream."""
+        doc = DocxTemplate(self.template_source)
+        context = self._prepare_context(project_data, items)
+        print(f"DEBUG: Work instruction context (header): { {k: v for k, v in context.items() if k != 'tests'} }")
+        print(f"DEBUG: Work instruction tests count: {len(context.get('tests', []))}")
+        doc.render(context)
+        output = BytesIO()
+        doc.save(output)
+        output.seek(0)
+        return output
+
+    def _prepare_context(self, d: dict, items: list) -> dict:
+
+        def fmt_date(val):
+            """Safely format any date / datetime / string to dd Month, YYYY."""
+            if not val:
+                return ""
+            try:
+                if isinstance(val, str):
+                    val = val.split(".")[0]  # strip microseconds
+                    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                        try:
+                            val = datetime.strptime(val, fmt)
+                            break
+                        except ValueError:
+                            continue
+                if isinstance(val, datetime):
+                    return val.strftime("%d %B, %Y")
+                # datetime.date object
+                try:
+                    return val.strftime("%d %B, %Y")
+                except Exception:
+                    return str(val)
+            except Exception:
+                return str(val)
+
+        # ── Build tests list ──────────────────────────────────────
+        tests = []
+        for idx, item in enumerate(items or [], 1):
+            tests.append({
+                "s_no":        str(idx),
+                "description": item.get("description", ""),
+                "standard":    item.get("test_standard", "") or "",
+                "unit":        item.get("unit", "") or "",
+                "qty":         str(item.get("quantity", "")) if item.get("quantity") is not None else "",
+                "notes":       item.get("notes", "") or "",
+            })
+
+        return {
+            # ── Header fields ──────────────────────────────────────
+            "project_no":        d.get("project_no", ""),
+            "client":            d.get("client_name", ""),
+            "project_name":      d.get("project_name", ""),
+            "contact_eng":       d.get("client_contact_person", ""),
+            "project_location":  d.get("location", ""),
+            "client_area":       d.get("client_address", ""),
+            "client_mobile":     d.get("client_phone", ""),
+            "confirmation_date": fmt_date(d.get("lpo_date")),
+            # Left blank — engineer fills on site
+            "fieldwork_start":   "",
+            # ── Tests table ────────────────────────────────────────
+            "tests":             tests,
+        }
+
+
+# ============================================================
+# BOREHOLE LOG TEMPLATE PROCESSOR (GEO Division only)
+#
+# Upload your template to Supabase at:
+#   templates/borehole_log/BOREHOLE_LOG.docx
+#
+# Template variable reference (use these Jinja2 tags in your .docx):
+#   {{ client }}           → Client name
+#   {{ project_name }}     → Project name
+#   {{ project_location }} → Site/Location
+#   {{ project_no }}       → Project No.
+# ============================================================
+
+BOREHOLE_LOG_TEMPLATE_URL = (
+    "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/"
+    "templates/borehole_log/BOREHOLE_LOG.docx"
+)
+
+
+class BoreholeLogTemplateProcessor:
+    def __init__(self):
+        print("DEBUG: Initializing BoreholeLogTemplateProcessor")
+        self.template_source = download_template_from_supabase(BOREHOLE_LOG_TEMPLATE_URL)
+
+    def process(self, project_data: dict) -> BytesIO:
+        """Render and return the filled Borehole Log as a BytesIO stream."""
+        doc = DocxTemplate(self.template_source)
+        context = self._prepare_context(project_data)
+        print(f"DEBUG: Borehole log context: {context}")
+        doc.render(context)
+        output = BytesIO()
+        doc.save(output)
+        output.seek(0)
+        return output
+
+    def _prepare_context(self, d: dict) -> dict:
+        return {
+            "client":           d.get("client_name", ""),
+            "project_name":     d.get("project_name", ""),
+            "project_location": d.get("location", ""),
+            "project_no":       d.get("project_no", ""),
+        }
