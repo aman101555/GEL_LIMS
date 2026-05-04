@@ -279,7 +279,8 @@ async def upload_report(
     sample_no: str = Form(...),
     uploaded_by: int = Form(...),
     file: UploadFile = File(...),
-    notes: Optional[str] = Form(None)
+    notes: Optional[str] = Form(None),
+    user_role: Optional[str] = Form(None)
 ):
     """Upload a completed report file to Supabase Storage (covers all samples of same test)"""
     conn = get_connection()
@@ -338,11 +339,21 @@ async def upload_report(
                 break
         
         if existing_report_no:
-            raise HTTPException(400, 
-                f"A report already exists for {test_name}. "
-                f"Report No: {existing_report_no}. "
-                f"Please use the existing report instead of creating a new one."
-            )
+            is_super_admin = (user_role or "").lower() == "super_admin"
+            if not is_super_admin:
+                raise HTTPException(400, 
+                    f"A report already exists for {test_name}. "
+                    f"Report No: {existing_report_no}. "
+                    f"Please use the existing report instead of creating a new one."
+                )
+            else:
+                # super_admin is replacing the existing report — delete all rows for it
+                print(f"super_admin replacing existing report: {existing_report_no}")
+                cur.execute(
+                    "DELETE FROM reports WHERE report_no = %s",
+                    (existing_report_no,)
+                )
+                print(f"Deleted old report rows for {existing_report_no}")
         
         # Generate unique report number
         report_no = generate_report_no(cur)
