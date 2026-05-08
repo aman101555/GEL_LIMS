@@ -1,5 +1,10 @@
 # quotations.py exe ready
 import io
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
@@ -16,6 +21,9 @@ from io import BytesIO
 router = APIRouter(prefix="/quotations", tags=["3. Quotations"])
 
 VAT_RATE = 0.05
+
+RESEND_API_KEY = "re_NqwQ7LHE_5BRb671vNkFWpgcsoNVunSHX"
+SENDER_DOMAIN = "glabint.com"
 
 
 # ============================================================
@@ -36,6 +44,11 @@ class QuotationItemCreate(BaseModel):
     unit_rate: float
     quantity: int
     net_unit: Optional[str] = None
+
+
+class SendEmailPayload(BaseModel):
+    from_local: str   # just the part before @, e.g. "info" or "test"
+    to_email: str
 
 
 class QuotationItemFromCatalog(BaseModel):
@@ -597,21 +610,18 @@ def create_revision(quotation_id: int):
 def list_quotations(limit: int = 100, offset: int = 0):
     conn = get_connection()
     cur = conn.cursor()
-
     try:
         cur.execute("""
             SELECT q.quotation_id, q.quotation_no, q.division, q.revision,
                    q.status, q.total_amount, q.grand_total,
-                   e.enquiry_ref, c.client_id, c.name
+                   e.enquiry_ref, c.client_id, c.name, c.email
             FROM quotations q
             LEFT JOIN enquiries e ON q.enquiry_id = e.enquiry_id
             LEFT JOIN clients c ON e.client_id = c.client_id
             ORDER BY q.quotation_id DESC
             LIMIT %s OFFSET %s
         """, (limit, offset))
-
         rows = cur.fetchall()
-
         return [
             {
                 "quotation_id": r[0],
@@ -623,18 +633,16 @@ def list_quotations(limit: int = 100, offset: int = 0):
                 "grand_total": float(r[6] or 0),
                 "enquiry_ref": r[7],
                 "client_id": r[8],
-                "client_name": r[9]
+                "client_name": r[9],
+                "client_email": r[10],
             }
             for r in rows
         ]
-
     except Exception as e:
         raise HTTPException(500, str(e))
-
     finally:
         cur.close()
         conn.close()
-
 
 
 
@@ -1150,6 +1158,180 @@ def delete_item(quotation_id: int, item_index: int):
             }
         }
         
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+@router.post("/{quotation_id}/send-email", summary="Email Quotation as Attachment")
+def send_quotation_email(quotation_id: int, payload: SendEmailPayload):
+    import base64, httpx
+
+    if not payload.from_local.strip():
+        raise HTTPException(400, "From address is required")
+    if not payload.to_email.strip():
+        raise HTTPException(400, "To address is required")
+
+    from_email = f"{payload.from_local.strip().lower()}@{SENDER_DOMAIN}"
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT q.quotation_id, q.quotation_no, q.division, q.revision,
+                   q.status, q.total_amount, q.vat, q.grand_total,
+                   q.payment_terms, q.validity_days, q.created_at,
+                   e.enquiry_ref, e.project_name, e.location, e.enquiry_date,
+                   c.client_id, c.name, c.contact_person, c.email,
+                   c.phone, c.address
+            FROM quotations q
+            LEFT JOIN enquiries e ON q.enquiry_id = e.enquiry_id
+            LEFT JOIN clients c ON e.client_id = c.client_id
+            WHERE q.quotation_id = %s
+        """, (quotation_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Quotation not found")
+
+        division = row[2]
+        division_names = {
+            'GEO': 'Geotechnical', 'SRV': 'Services', 'MAT': 'Material Testing',
+            'NDT': 'NDT', 'CHM': 'Chemical', 'BIO': 'Biological',
+            'ENV': 'Environmental', 'SPJ': 'Special Jobs'
+        }
+
+        cur.execute("""
+            SELECT description, test_standard, unit_rate, quantity,
+                   COALESCE(amount, unit_rate * quantity) as amount,
+                   COALESCE(unit, 'No.') as unit, net_unit
+            FROM quotation_items
+            WHERE quotation_id = %s ORDER BY item_id
+        """, (quotation_id,))
+        items = [
+            {"description": r[0], "test_standard": r[1], "unit_rate": float(r[2]),
+             "quantity": r[3], "amount": float(r[4]), "unit": r[5], "net_unit": r[6]}
+            for r in cur.fetchall()
+        ]
+
+        quotation_data = {
+            "quotation_id": row[0], "quotation_no": row[1], "division": division,
+            "division_full_name": division_names.get(division, division),
+            "revision": row[3],
+            "total_amount": float(row[5] or 0), "vat": float(row[6] or 0),
+            "grand_total": float(row[7] or 0), "payment_terms": row[8],
+            "validity_days": row[9], "created_at": row[10],
+            "enquiry_ref": row[11],
+            "project_name": row[12] or "Proposed Project",
+            "location": row[13] or "Dubai, UAE"
+        }
+        client_data = {
+            "name": row[16] or "", "contact_person": row[17] or "",
+            "email": row[18] or "", "phone": row[19] or "", "address": row[20] or ""
+        }
+
+        # Generate DOCX using exact same logic as download endpoint
+        template_url = TEMPLATE_URLS.get(division, TEMPLATE_URLS["DEFAULT"])
+        tmpl_response = requests.get(template_url)
+        if tmpl_response.status_code != 200:
+            raise HTTPException(500, f"Template fetch failed for division {division}")
+
+        template_stream = BytesIO(tmpl_response.content)
+        template_processor = QuotationTemplateProcessor(template_stream)
+        doc_bytes = template_processor.process_quotation(quotation_data, client_data, items)
+
+        doc_b64 = base64.b64encode(doc_bytes.getvalue()).decode()
+        filename = f"Quotation_{quotation_data['quotation_no']}.docx"
+
+        contact_name = client_data['contact_person'] or client_data['name'] or "Sir/Madam"
+        created_date = quotation_data['created_at']
+        if hasattr(created_date, 'strftime'):
+            date_str = created_date.strftime("%d %B %Y")
+        else:
+            date_str = str(created_date)[:10]
+
+        email_html = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
+            <div style="background: #1a1a2e; padding: 24px 32px; border-radius: 8px 8px 0 0;">
+                <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 500;">
+                    Quotation {quotation_data['quotation_no']}
+                </h1>
+                <p style="color: #aaa; margin: 4px 0 0; font-size: 13px;">{date_str}</p>
+            </div>
+            <div style="background: #f9f9f9; padding: 28px 32px; border: 1px solid #e5e5e5; border-top: none;">
+                <p style="margin: 0 0 16px;">Dear {contact_name},</p>
+                <p style="margin: 0 0 16px; line-height: 1.6;">
+                    Please find attached our quotation <strong>{quotation_data['quotation_no']}</strong>
+                    for the project <strong>{quotation_data['project_name']}</strong>.
+                </p>
+                <div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 16px 20px; margin: 20px 0;">
+                    <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">Quotation No.</td>
+                            <td style="padding: 5px 0; text-align: right; font-weight: 500;">{quotation_data['quotation_no']}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">Project</td>
+                            <td style="padding: 5px 0; text-align: right;">{quotation_data['project_name']}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">Total Amount (excl. VAT)</td>
+                            <td style="padding: 5px 0; text-align: right;">AED {quotation_data['total_amount']:,.2f}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">VAT (5%)</td>
+                            <td style="padding: 5px 0; text-align: right;">AED {quotation_data['vat']:,.2f}</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #eee;">
+                            <td style="padding: 10px 0 5px; font-weight: 600; font-size: 15px;">Grand Total</td>
+                            <td style="padding: 10px 0 5px; text-align: right; font-weight: 600; font-size: 15px; color: #1a1a2e;">AED {quotation_data['grand_total']:,.2f}</td>
+                        </tr>
+                    </table>
+                </div>
+                <p style="margin: 16px 0; line-height: 1.6; font-size: 14px; color: #555;">
+                    This quotation is valid for <strong>{quotation_data['validity_days']} days</strong>
+                    from the date of issue. Please review the attached document and feel free
+                    to reach out if you have any questions or require clarification.
+                </p>
+                <p style="margin: 24px 0 0; font-size: 14px;">
+                    Best regards,<br>
+                    <strong>Global Engineering Laboratory</strong><br>
+                    <span style="color: #888; font-size: 13px;">{from_email}</span>
+                </p>
+            </div>
+            <div style="background: #f0f0f0; padding: 12px 32px; border-radius: 0 0 8px 8px; border: 1px solid #e5e5e5; border-top: none;">
+                <p style="margin: 0; font-size: 11px; color: #999; text-align: center;">
+                    Global Engineering · Dubai, UAE · www.glabint.com
+                </p>
+            </div>
+        </div>
+        """
+
+        resend_response = httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "from": f"Global Engineering Laboratory <{from_email}>",
+                "to": [payload.to_email.strip()],
+                "subject": f"Quotation {quotation_data['quotation_no']} – {quotation_data['project_name']}",
+                "html": email_html,
+                "attachments": [{"filename": filename, "content": doc_b64}]
+            },
+            timeout=30
+        )
+
+        if resend_response.status_code not in (200, 201):
+            raise HTTPException(500, f"Email send failed: {resend_response.text}")
+
+        return {"message": f"Quotation emailed successfully to {payload.to_email.strip()}"}
+
+    except HTTPException:
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))
