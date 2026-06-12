@@ -1,11 +1,10 @@
-# quotations.py exe ready
 import io
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -14,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from template_processor import QuotationTemplateProcessor
 from utils import resource_path
 
-import requests # Don't forget to 'pip install requests'
+import requests
 from io import BytesIO
 
 
@@ -25,6 +24,52 @@ VAT_RATE = 0.05
 RESEND_API_KEY = "re_NqwQ7LHE_5BRb671vNkFWpgcsoNVunSHX"
 SENDER_DOMAIN = "glabint.com"
 
+# ============================================================
+# Supabase Storage Config
+# ============================================================
+SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhxd2drbWJqbWN4cHhid2NjY2xvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkzNjA3MjcsImV4cCI6MjA4NDkzNjcyN30.lyvXvkNe5dYeXj6_zVGReHZDph-QZm35BFp6RcgB0Gk"   # ← paste anon key from Supabase → Settings → API
+EDITED_BUCKET = "quotation-edits"
+
+
+def _get_edited_file_url(quotation_id: int) -> str:
+    return f"{SUPABASE_URL}/storage/v1/object/public/{EDITED_BUCKET}/edited_{quotation_id}.docx"
+
+
+def _edited_file_exists(quotation_id: int) -> bool:
+    url = _get_edited_file_url(quotation_id)
+    try:
+        response = requests.head(url, timeout=10)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def _upload_to_supabase(quotation_id: int, file_bytes: bytes) -> tuple[bool, str]:
+    """
+    Upload edited DOCX to Supabase quotation-edits bucket.
+    Returns (success: bool, error_detail: str).
+    Supabase Storage requires Authorization header for writes even on public buckets.
+    """
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{EDITED_BUCKET}/edited_{quotation_id}.docx"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "x-upsert": "true",
+    }
+
+    try:
+        response = requests.put(upload_url, headers=headers, data=file_bytes, timeout=30)
+        print(f"DEBUG Supabase upload status: {response.status_code} | body: {response.text[:300]}")
+        if response.status_code in (200, 201):
+            return True, ""
+        else:
+            return False, f"Supabase returned {response.status_code}: {response.text[:200]}"
+    except Exception as e:
+        print(f"ERROR uploading to Supabase: {e}")
+        return False, str(e)
+
 
 # ============================================================
 # Pydantic Models
@@ -34,7 +79,7 @@ class QuotationCreate(BaseModel):
     enquiry_id: int
     division: str
     payment_terms: Optional[str] = None
-    prepared_under: Optional[str] = None  # Can be None or empty string
+    prepared_under: Optional[str] = None
     validity_days: Optional[int] = 30
 
 
@@ -47,7 +92,7 @@ class QuotationItemCreate(BaseModel):
 
 
 class SendEmailPayload(BaseModel):
-    from_local: str   # just the part before @, e.g. "info" or "test"
+    from_local: str
     to_email: str
 
 
@@ -68,7 +113,7 @@ class ItemUpdate(BaseModel):
     net_unit: Optional[str] = None
 
 # ============================================================
-# Generate Quotation Number with New Format (Thread-safe version)
+# Generate Quotation Number
 # ============================================================
 
 TEMPLATE_URLS = {
@@ -78,16 +123,6 @@ TEMPLATE_URLS = {
 }
 
 def _generate_quotation_no(cur, division, prepared_under):
-    """
-    Quotation numbering rules:
-    - GEO  -> QG  (separate series)
-    - SRV  -> QS  (separate series)
-    - ALL OTHER divisions -> QL (single running series)
-    - Sequence is based ONLY on prefix + year
-    - prepared_under (AR / AS / NONE) does NOT affect sequence
-    """
-
-    # Prefix mapping
     if division == 'GEO':
         prefix = 'QG'
     elif division == 'SRV':
@@ -98,15 +133,12 @@ def _generate_quotation_no(cur, division, prepared_under):
     year_short = datetime.now().strftime('%y')
     year_full = datetime.now().year
 
-    # Normalize prepared_under (used only for display, not counting)
     initials = None
     if prepared_under and prepared_under.strip().upper() not in ('', 'NONE'):
         initials = prepared_under.strip().upper()[:2]
 
-    # Prevent race conditions
     cur.execute("LOCK TABLE quotations IN EXCLUSIVE MODE")
 
-    # Get highest sequence for prefix + year ONLY
     cur.execute("""
         SELECT MAX(
             CAST(
@@ -125,7 +157,6 @@ def _generate_quotation_no(cur, division, prepared_under):
     max_seq = cur.fetchone()[0] or 0
     next_seq = max_seq + 1
 
-    # Build quotation number
     if initials:
         quotation_no = f"{prefix}-{initials}-{next_seq:03d}-{year_short}"
     else:
@@ -135,7 +166,7 @@ def _generate_quotation_no(cur, division, prepared_under):
 
 
 # ============================================================
-# 1️⃣ CREATE QUOTATION (Updated)
+# 1️⃣ CREATE QUOTATION
 # ============================================================
 
 @router.post("/", summary="Create Quotation")
@@ -144,25 +175,20 @@ def create_quotation(payload: QuotationCreate):
     cur = conn.cursor()
 
     try:
-        # Validate enquiry exists
         cur.execute("SELECT enquiry_id FROM enquiries WHERE enquiry_id = %s", (payload.enquiry_id,))
         if cur.fetchone() is None:
             raise HTTPException(404, "Enquiry not found")
-        
-        # Validate division exists (prepared_under can be empty)
+
         if not payload.division:
             raise HTTPException(400, "Division is required")
 
-        # Generate new quotation number (prepared_under can be None)
         quotation_no = _generate_quotation_no(cur, payload.division, payload.prepared_under)
         revision = 1
 
-        # Check if quotation number already exists
         cur.execute("SELECT quotation_id FROM quotations WHERE quotation_no = %s", (quotation_no,))
         if cur.fetchone():
             quotation_no = _increment_quotation_no(cur, quotation_no)
 
-        # Insert quotation with new format
         cur.execute("""
             INSERT INTO quotations (
                 quotation_no, enquiry_id, division, revision,
@@ -194,14 +220,9 @@ def create_quotation(payload: QuotationCreate):
         conn.close()
 
 
-# Helper function to increment if duplicate
 def _increment_quotation_no(cur, quotation_no):
-    """Increment the sequence number if quotation_no already exists"""
     parts = quotation_no.split('-')
-    
-    # Handle both formats: QG-AR-001-25 and QG-001-25
     if len(parts) == 4:
-        # Format with initials: QG-AR-001-25
         try:
             seq_num = int(parts[2])
             new_seq = seq_num + 1
@@ -209,19 +230,17 @@ def _increment_quotation_no(cur, quotation_no):
         except:
             pass
     elif len(parts) == 3:
-        # Format without initials: QG-001-25
         try:
             seq_num = int(parts[1])
             new_seq = seq_num + 1
             return f"{parts[0]}-{new_seq:03d}-{parts[2]}"
         except:
             pass
-    
     return quotation_no
 
 
 # ============================================================
-# 2️⃣ ADD ITEM FROM PRICE CATALOG (AUTO-FILL)
+# 2️⃣ ADD ITEM FROM PRICE CATALOG
 # ============================================================
 
 @router.post("/{quotation_id}/items/from-catalog", summary="Add Item From Price Catalog")
@@ -230,12 +249,10 @@ def add_item_from_catalog(quotation_id: int, payload: QuotationItemFromCatalog):
     cur = conn.cursor()
 
     try:
-        # Validate quotation exists
         cur.execute("SELECT quotation_id FROM quotations WHERE quotation_id = %s", (quotation_id,))
         if cur.fetchone() is None:
             raise HTTPException(404, "Quotation not found")
 
-        # Fetch catalog item
         cur.execute("""
             SELECT code, description, test_standard, unit_rate
             FROM price_catalog
@@ -251,7 +268,6 @@ def add_item_from_catalog(quotation_id: int, payload: QuotationItemFromCatalog):
         if payload.quantity <= 0:
             raise HTTPException(400, "Quantity must be greater than zero")
 
-        # Insert item
         cur.execute("""
             INSERT INTO quotation_items
                 (quotation_id, item_code, description, test_standard, unit_rate, quantity)
@@ -263,7 +279,6 @@ def add_item_from_catalog(quotation_id: int, payload: QuotationItemFromCatalog):
 
         item_id = cur.fetchone()[0]
 
-        # Recalculate totals
         cur.execute("""
             UPDATE quotations
             SET total_amount = COALESCE(sub.total, 0),
@@ -302,7 +317,7 @@ def add_item_from_catalog(quotation_id: int, payload: QuotationItemFromCatalog):
 
 
 # ============================================================
-# 3️⃣ ADD CUSTOM ITEM TO QUOTATION (MANUAL ENTRY)
+# 3️⃣ ADD CUSTOM ITEM
 # ============================================================
 
 @router.post("/{quotation_id}/items", summary="Add Custom Item to Quotation")
@@ -318,7 +333,6 @@ def add_item(quotation_id: int, item: QuotationItemCreate):
         if item.unit_rate < 0 or item.quantity <= 0:
             raise HTTPException(400, "Invalid unit_rate or quantity")
 
-        # Insert manual item
         cur.execute("""
             INSERT INTO quotation_items (quotation_id, description, test_standard, unit_rate, quantity, net_unit)
             VALUES (%s, %s, %s, %s, %s, %s)
@@ -327,7 +341,6 @@ def add_item(quotation_id: int, item: QuotationItemCreate):
 
         item_id = cur.fetchone()[0]
 
-        # Recalculate totals
         cur.execute("""
             UPDATE quotations
             SET total_amount = COALESCE(sub.total, 0),
@@ -503,7 +516,7 @@ def clarification_request(quotation_id: int):
 
 
 # ============================================================
-# 8️⃣ CREATE REVISION (Updated for new format)
+# 8️⃣ CREATE REVISION
 # ============================================================
 
 @router.post("/{quotation_id}/revision", summary="Create Revision of Quotation")
@@ -512,7 +525,6 @@ def create_revision(quotation_id: int):
     cur = conn.cursor()
 
     try:
-        # Get original quotation
         cur.execute("""
             SELECT quotation_no, enquiry_id, division, payment_terms,
                    prepared_under, validity_days, revision
@@ -525,23 +537,18 @@ def create_revision(quotation_id: int):
         if orig is None:
             raise HTTPException(404, "Quotation not found")
 
-        (orig_no, enquiry_id, division, payment_terms, 
+        (orig_no, enquiry_id, division, payment_terms,
          prepared_under, validity_days, orig_rev) = orig
-        
+
         new_rev = orig_rev + 1
-        
-        # Generate new quotation number for revision
-        # For revisions, we keep the same base but increment revision
+
         parts = orig_no.split('-')
         if len(parts) == 4:
-            # Format: QG-AR-001-25 -> QG-AR-001-25-V2
             new_q_no = f"{orig_no}-V{new_rev}"
         else:
-            # Handle existing revisions: QG-AR-001-25-V1 -> QG-AR-001-25-V2
             base = orig_no.rsplit('-V', 1)[0]
             new_q_no = f"{base}-V{new_rev}"
 
-        # Insert new revision
         cur.execute("""
             INSERT INTO quotations (
                 quotation_no, enquiry_id, division, revision,
@@ -551,13 +558,12 @@ def create_revision(quotation_id: int):
             VALUES (%s, %s, %s, %s, %s, %s, %s, 'DRAFT', 0, 0, 0, NOW())
             RETURNING quotation_id
         """, (
-            new_q_no, enquiry_id, division, new_rev, 
+            new_q_no, enquiry_id, division, new_rev,
             payment_terms, prepared_under, validity_days
         ))
 
         new_qid = cur.fetchone()[0]
 
-        # Copy items
         cur.execute("""
             INSERT INTO quotation_items (quotation_id, description, test_standard, unit_rate, quantity)
             SELECT %s, description, test_standard, unit_rate, quantity
@@ -565,7 +571,6 @@ def create_revision(quotation_id: int):
             WHERE quotation_id = %s
         """, (new_qid, quotation_id))
 
-        # Recalculate totals
         cur.execute("""
             UPDATE quotations
             SET total_amount = sub.total,
@@ -645,20 +650,12 @@ def list_quotations(limit: int = 100, offset: int = 0):
         conn.close()
 
 
-
 # ============================================================
-# GET /quotations/verified — For Create Project dropdown
-# Only returns APPROVED quotations that have been verified (receipt + verified_at)
+# GET /quotations/verified
 # ============================================================
 
 @router.get("/verified", summary="List Verified Quotations (ready to become projects)")
 def list_verified_quotations():
-    """
-    Returns only APPROVED quotations that have:
-    - A receipt uploaded (receipt_path IS NOT NULL)
-    - Been verified (verified_at IS NOT NULL)
-    These are the only quotations eligible to be converted into projects.
-    """
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -699,26 +696,59 @@ def list_verified_quotations():
         cur.close()
         conn.close()
 
-# quotations.py - Update the download_quotation function
 
 # ============================================================
-# DOWNLOAD QUOTATION (Updated with QT.docx as default for non-GEO/SRV)
+# DOWNLOAD QUOTATION
+# Smart download: returns edited file if uploaded, otherwise generates fresh
 # ============================================================
 
 @router.get("/{quotation_id}/download", summary="Download Quotation as Word Document")
 def download_quotation(quotation_id: int):
-    """Generate and download quotation from Supabase Cloud template"""
+    """
+    Smart download logic:
+    1. Check if an edited file exists in Supabase quotation-edits bucket
+    2. If yes → serve that exact file (preserves manual edits like changed text)
+    3. If no → generate fresh from template
+    """
     conn = get_connection()
     cur = conn.cursor()
 
     try:
-        # Fetch quotation details
+        # Fetch quotation number for filename (needed either way)
         cur.execute("""
-            SELECT 
+            SELECT q.quotation_no, q.division
+            FROM quotations q
+            WHERE q.quotation_id = %s
+        """, (quotation_id,))
+
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Quotation not found")
+
+        quotation_no, division = row
+        filename = f"Quotation_{quotation_no}_{division}.docx"
+
+        # ── Step 1: Check for edited version ──────────────────────
+        edited_url = _get_edited_file_url(quotation_id)
+        edited_exists = _edited_file_exists(quotation_id)
+
+        if edited_exists:
+            # Serve the user-uploaded edited file directly
+            edited_response = requests.get(edited_url, timeout=30)
+            if edited_response.status_code == 200:
+                return StreamingResponse(
+                    BytesIO(edited_response.content),
+                    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"}
+                )
+
+        # ── Step 2: No edited version → generate fresh ─────────────
+        cur.execute("""
+            SELECT
                 q.quotation_id, q.quotation_no, q.division, q.revision,
                 q.status, q.total_amount, q.vat, q.grand_total,
                 q.payment_terms, q.validity_days, q.created_at,
-                e.enquiry_ref, e.project_name, e.location, 
+                e.enquiry_ref, e.project_name, e.location,
                 e.enquiry_date,
                 c.client_id, c.name, c.contact_person, c.email,
                 c.phone, c.address
@@ -728,20 +758,18 @@ def download_quotation(quotation_id: int):
             WHERE q.quotation_id = %s
         """, (quotation_id,))
 
-        row = cur.fetchone()
-        if not row:
+        full_row = cur.fetchone()
+        if not full_row:
             raise HTTPException(404, "Quotation not found")
-        
-        division = row[2] 
-        
-        # Mapping for full names
+
+        division = full_row[2]
+
         division_names = {'GEO': 'Geotechnical', 'SRV': 'Services', 'MAT': 'Material Testing'}
         division_full_name = division_names.get(division, division)
 
-        # Fetch items
         cur.execute("""
             SELECT description, test_standard, unit_rate, quantity,
-                   COALESCE(amount, unit_rate * quantity) as amount, 
+                   COALESCE(amount, unit_rate * quantity) as amount,
                    COALESCE(unit, 'No.') as unit,
                    net_unit
             FROM quotation_items
@@ -755,39 +783,28 @@ def download_quotation(quotation_id: int):
             for r in cur.fetchall()
         ]
 
-        # Prepare data for Word processor
         quotation_data = {
-            "quotation_id": row[0], "quotation_no": row[1], "division": division,
-            "division_full_name": division_full_name, "revision": row[3],
-            "total_amount": float(row[5] or 0), "vat": float(row[6] or 0),
-            "grand_total": float(row[7] or 0), "payment_terms": row[8],
-            "validity_days": row[9], "created_at": row[10], "enquiry_ref": row[11],
-            "project_name": row[12] or "Proposed Project", "location": row[13] or "Dubai, UAE"
+            "quotation_id": full_row[0], "quotation_no": full_row[1], "division": division,
+            "division_full_name": division_full_name, "revision": full_row[3],
+            "total_amount": float(full_row[5] or 0), "vat": float(full_row[6] or 0),
+            "grand_total": float(full_row[7] or 0), "payment_terms": full_row[8],
+            "validity_days": full_row[9], "created_at": full_row[10], "enquiry_ref": full_row[11],
+            "project_name": full_row[12] or "Proposed Project", "location": full_row[13] or "Dubai, UAE"
         }
         client_data = {
-            "name": row[16] or "", "contact_person": row[17] or "",
-            "email": row[18] or "", "phone": row[19] or "", "address": row[20] or ""
+            "name": full_row[16] or "", "contact_person": full_row[17] or "",
+            "email": full_row[18] or "", "phone": full_row[19] or "", "address": full_row[20] or ""
         }
 
-        # --- SUPABASE CLOUD LOGIC START ---
-        # 1. Select the correct URL
         template_url = TEMPLATE_URLS.get(division, TEMPLATE_URLS["DEFAULT"])
-        
-        # 2. Download from Supabase
         response = requests.get(template_url)
         if response.status_code != 200:
             raise HTTPException(500, f"Cloud Template for {division} not found at {template_url}")
-        
-        # 3. Create a virtual file in memory
-        template_stream = BytesIO(response.content)
-        
-        # 4. Pass the stream to your processor
-        template_processor = QuotationTemplateProcessor(template_stream)
-        # --- SUPABASE CLOUD LOGIC END ---
 
+        template_stream = BytesIO(response.content)
+        template_processor = QuotationTemplateProcessor(template_stream)
         doc_bytes = template_processor.process_quotation(quotation_data, client_data, items)
-        filename = f"Quotation_{quotation_data['quotation_no']}_{division}.docx"
-        
+
         return StreamingResponse(
             io.BytesIO(doc_bytes.getvalue()),
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -799,6 +816,101 @@ def download_quotation(quotation_id: int):
     finally:
         cur.close()
         conn.close()
+
+
+# ============================================================
+# UPLOAD EDITED QUOTATION
+# User edits the DOCX manually and uploads it here.
+# Future downloads will serve this file instead of regenerating.
+# ============================================================
+
+@router.post("/{quotation_id}/upload-edited", summary="Upload Manually Edited Quotation DOCX")
+async def upload_edited_quotation(quotation_id: int, file: UploadFile = File(...)):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT quotation_id, quotation_no FROM quotations WHERE quotation_id = %s", (quotation_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Quotation not found")
+
+        quotation_no = row[1]
+
+        if not file.filename.endswith('.docx'):
+            raise HTTPException(400, "Only .docx files are accepted")
+
+        file_bytes = await file.read()
+
+        if len(file_bytes) == 0:
+            raise HTTPException(400, "Uploaded file is empty")
+
+        success, error_detail = _upload_to_supabase(quotation_id, file_bytes)
+
+        if not success:
+            raise HTTPException(500, f"Storage upload failed: {error_detail}")
+
+        return {
+            "message": "Edited quotation uploaded successfully",
+            "quotation_id": quotation_id,
+            "quotation_no": quotation_no,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ============================================================
+# CHECK IF EDITED FILE EXISTS
+# ============================================================
+
+@router.get("/{quotation_id}/edited-file-status", summary="Check if Edited File Exists")
+def check_edited_file_status(quotation_id: int):
+    """Check whether an edited file exists for this quotation."""
+    exists = _edited_file_exists(quotation_id)
+    return {
+        "quotation_id": quotation_id,
+        "has_edited_file": exists,
+        "edited_file_url": _get_edited_file_url(quotation_id) if exists else None
+    }
+
+
+# ============================================================
+# DELETE EDITED FILE (Revert to auto-generate)
+# ============================================================
+
+@router.delete("/{quotation_id}/edited-file", summary="Delete Edited File (Revert to Auto-Generated)")
+def delete_edited_file(quotation_id: int):
+    """
+    Deletes the stored edited DOCX from Supabase.
+    Future downloads will regenerate from template instead.
+    """
+    delete_url = f"{SUPABASE_URL}/storage/v1/object/{EDITED_BUCKET}/edited_{quotation_id}.docx"
+
+    headers = {}
+    if SUPABASE_SERVICE_KEY:
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
+
+    try:
+        response = requests.delete(delete_url, headers=headers, timeout=10)
+        if response.status_code in (200, 204):
+            return {
+                "message": "Edited file deleted. Downloads will now regenerate from template.",
+                "quotation_id": quotation_id
+            }
+        else:
+            raise HTTPException(500, f"Failed to delete from Supabase: {response.text}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 # ============================================================
 # 🔟 QUOTATION DETAILS
 # ============================================================
@@ -827,7 +939,6 @@ def quotation_details(quotation_id: int):
         if not row:
             raise HTTPException(404, "Quotation not found")
 
-        # Fetch items
         cur.execute("""
             SELECT description, test_standard, unit_rate, quantity, amount, net_unit
             FROM quotation_items
@@ -847,6 +958,9 @@ def quotation_details(quotation_id: int):
             for r in cur.fetchall()
         ]
 
+        # Also check if edited file exists
+        has_edited_file = _edited_file_exists(quotation_id)
+
         return {
             "quotation_id": row[0],
             "quotation_no": row[1],
@@ -865,7 +979,8 @@ def quotation_details(quotation_id: int):
             "client_email": row[14],
             "project_name": row[15],
             "location": row[16],
-            "items": items
+            "items": items,
+            "has_edited_file": has_edited_file,
         }
 
     except Exception as e:
@@ -877,25 +992,24 @@ def quotation_details(quotation_id: int):
 
 
 # ============================================================
-# PRICE CATALOG ENDPOINT (ADD THIS TO YOUR quotations.py)
+# PRICE CATALOG
 # ============================================================
 
 @router.get("/price-catalog/", summary="Get Active Price Catalog Items")
 def get_price_catalog():
-    """Get all active items from price catalog for dropdown selection"""
     conn = get_connection()
     cur = conn.cursor()
-    
+
     try:
         cur.execute("""
             SELECT catalog_id, code, description, test_standard, unit_rate, unit, active, group_name
-            FROM price_catalog 
+            FROM price_catalog
             WHERE active = true
             ORDER BY code
         """)
-        
+
         items = cur.fetchall()
-        
+
         return [
             {
                 "catalog_id": item[0],
@@ -909,7 +1023,7 @@ def get_price_catalog():
             }
             for item in items
         ]
-        
+
     except Exception as e:
         raise HTTPException(500, f"Failed to fetch price catalog: {str(e)}")
     finally:
@@ -917,38 +1031,29 @@ def get_price_catalog():
         conn.close()
 
 
-
-
-
-
-# Add to quotations.py after existing endpoints
-
 # ============================================================
-# UPDATE ITEM QUANTITY
+# UPDATE ITEM
 # ============================================================
-# Update the UPDATE endpoint in quotations.py
+
 @router.put("/{quotation_id}/items/{item_index}", summary="Update Item Quantity, Unit Rate, or Test Standard")
 def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
-    """Update quantity, unit rate, or test standard of a specific item in a quotation"""
     conn = get_connection()
     cur = conn.cursor()
 
     try:
-        # Validate quotation exists and is in DRAFT/APPROVED status
         cur.execute("""
-            SELECT status FROM quotations 
+            SELECT status FROM quotations
             WHERE quotation_id = %s
         """, (quotation_id,))
-        
+
         quote = cur.fetchone()
-        
+
         if not quote:
             raise HTTPException(404, "Quotation not found")
-        
+
         if quote[0] not in ['DRAFT', 'APPROVED']:
             raise HTTPException(400, "Only DRAFT or APPROVED quotations can be modified")
-        
-        # Get the item_id for the given index
+
         cur.execute("""
             SELECT item_id, unit_rate, quantity, test_standard, net_unit
             FROM quotation_items
@@ -956,24 +1061,23 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
             ORDER BY item_id
             OFFSET %s LIMIT 1
         """, (quotation_id, item_index))
-        
+
         item = cur.fetchone()
-        
+
         if not item:
             raise HTTPException(404, "Item not found")
-        
+
         item_id, current_unit_rate, current_quantity, current_test_standard, current_net_unit = item
-        
-        # Check what fields are being updated
+
         quantity = payload.quantity
         unit_rate = payload.unit_rate
         test_standard = payload.test_standard
         net_unit = payload.net_unit
-        
+
         update_field = None
         new_value = None
         current_value = None
-        
+
         if quantity is not None:
             if quantity <= 0:
                 raise HTTPException(400, "Quantity must be greater than zero")
@@ -996,40 +1100,26 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
             current_value = current_net_unit
         else:
             raise HTTPException(400, "Must provide quantity, unit_rate, test_standard, or net_unit")
-        
-        # Update the item
+
         if update_field == 'quantity':
             cur.execute("""
-                UPDATE quotation_items
-                SET quantity = %s
-                WHERE item_id = %s
-                RETURNING amount
+                UPDATE quotation_items SET quantity = %s WHERE item_id = %s RETURNING amount
             """, (new_value, item_id))
         elif update_field == 'unit_rate':
             cur.execute("""
-                UPDATE quotation_items
-                SET unit_rate = %s
-                WHERE item_id = %s
-                RETURNING amount
+                UPDATE quotation_items SET unit_rate = %s WHERE item_id = %s RETURNING amount
             """, (new_value, item_id))
         elif update_field == 'test_standard':
             cur.execute("""
-                UPDATE quotation_items
-                SET test_standard = %s
-                WHERE item_id = %s
-                RETURNING amount
+                UPDATE quotation_items SET test_standard = %s WHERE item_id = %s RETURNING amount
             """, (new_value, item_id))
         elif update_field == 'net_unit':
             cur.execute("""
-                UPDATE quotation_items
-                SET net_unit = %s
-                WHERE item_id = %s
-                RETURNING amount
+                UPDATE quotation_items SET net_unit = %s WHERE item_id = %s RETURNING amount
             """, (new_value, item_id))
-        
+
         updated_amount = cur.fetchone()[0]
-        
-        # Only recalculate totals if quantity or unit rate changed
+
         if update_field in ['quantity', 'unit_rate']:
             cur.execute("""
                 UPDATE quotations
@@ -1044,25 +1134,22 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
                 WHERE quotation_id = %s
                 RETURNING total_amount, vat, grand_total
             """, (VAT_RATE, VAT_RATE, quotation_id, quotation_id))
-            
+
             totals = cur.fetchone()
             total_amount = float(totals[0])
             vat = float(totals[1])
             grand_total = float(totals[2])
         else:
-            # For test_standard updates, fetch current totals
             cur.execute("""
-                SELECT total_amount, vat, grand_total
-                FROM quotations
-                WHERE quotation_id = %s
+                SELECT total_amount, vat, grand_total FROM quotations WHERE quotation_id = %s
             """, (quotation_id,))
             totals = cur.fetchone()
             total_amount = float(totals[0])
             vat = float(totals[1])
             grand_total = float(totals[2])
-        
+
         conn.commit()
-        
+
         return {
             "message": f"Item {update_field} updated",
             "item_id": item_id,
@@ -1076,39 +1163,37 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
                 "grand_total": grand_total,
             }
         }
-        
+
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))
     finally:
         cur.close()
         conn.close()
+
+
 # ============================================================
 # DELETE ITEM
 # ============================================================
 
 @router.delete("/{quotation_id}/items/{item_index}", summary="Delete Item from Quotation")
 def delete_item(quotation_id: int, item_index: int):
-    """Delete a specific item from a quotation"""
     conn = get_connection()
     cur = conn.cursor()
 
     try:
-        # Validate quotation exists and is in DRAFT status
         cur.execute("""
-            SELECT status FROM quotations 
-            WHERE quotation_id = %s
+            SELECT status FROM quotations WHERE quotation_id = %s
         """, (quotation_id,))
-        
+
         quote = cur.fetchone()
-        
+
         if not quote:
             raise HTTPException(404, "Quotation not found")
-        
+
         if quote[0] not in ['DRAFT', 'APPROVED']:
             raise HTTPException(400, "Only DRAFT quotations can be modified")
-        
-        # Get the item_id for the given index
+
         cur.execute("""
             SELECT item_id
             FROM quotation_items
@@ -1116,21 +1201,16 @@ def delete_item(quotation_id: int, item_index: int):
             ORDER BY item_id
             OFFSET %s LIMIT 1
         """, (quotation_id, item_index))
-        
+
         item = cur.fetchone()
-        
+
         if not item:
             raise HTTPException(404, "Item not found")
-        
+
         item_id = item[0]
-        
-        # Delete the item
-        cur.execute("""
-            DELETE FROM quotation_items
-            WHERE item_id = %s
-        """, (item_id,))
-        
-        # Recalculate quotation totals
+
+        cur.execute("DELETE FROM quotation_items WHERE item_id = %s", (item_id,))
+
         cur.execute("""
             UPDATE quotations
             SET total_amount = COALESCE(sub.total, 0),
@@ -1144,10 +1224,10 @@ def delete_item(quotation_id: int, item_index: int):
             WHERE quotation_id = %s
             RETURNING total_amount, vat, grand_total
         """, (VAT_RATE, VAT_RATE, quotation_id, quotation_id))
-        
+
         totals = cur.fetchone()
         conn.commit()
-        
+
         return {
             "message": "Item deleted",
             "item_id": item_id,
@@ -1157,13 +1237,18 @@ def delete_item(quotation_id: int, item_index: int):
                 "grand_total": float(totals[2]),
             }
         }
-        
+
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))
     finally:
         cur.close()
         conn.close()
+
+
+# ============================================================
+# SEND EMAIL
+# ============================================================
 
 @router.post("/{quotation_id}/send-email", summary="Email Quotation as Attachment")
 def send_quotation_email(quotation_id: int, payload: SendEmailPayload):
@@ -1203,19 +1288,6 @@ def send_quotation_email(quotation_id: int, payload: SendEmailPayload):
             'ENV': 'Environmental', 'SPJ': 'Special Jobs'
         }
 
-        cur.execute("""
-            SELECT description, test_standard, unit_rate, quantity,
-                   COALESCE(amount, unit_rate * quantity) as amount,
-                   COALESCE(unit, 'No.') as unit, net_unit
-            FROM quotation_items
-            WHERE quotation_id = %s ORDER BY item_id
-        """, (quotation_id,))
-        items = [
-            {"description": r[0], "test_standard": r[1], "unit_rate": float(r[2]),
-             "quantity": r[3], "amount": float(r[4]), "unit": r[5], "net_unit": r[6]}
-            for r in cur.fetchall()
-        ]
-
         quotation_data = {
             "quotation_id": row[0], "quotation_no": row[1], "division": division,
             "division_full_name": division_names.get(division, division),
@@ -1232,18 +1304,44 @@ def send_quotation_email(quotation_id: int, payload: SendEmailPayload):
             "email": row[18] or "", "phone": row[19] or "", "address": row[20] or ""
         }
 
-        # Generate DOCX using exact same logic as download endpoint
-        template_url = TEMPLATE_URLS.get(division, TEMPLATE_URLS["DEFAULT"])
-        tmpl_response = requests.get(template_url)
-        if tmpl_response.status_code != 200:
-            raise HTTPException(500, f"Template fetch failed for division {division}")
-
-        template_stream = BytesIO(tmpl_response.content)
-        template_processor = QuotationTemplateProcessor(template_stream)
-        doc_bytes = template_processor.process_quotation(quotation_data, client_data, items)
-
-        doc_b64 = base64.b64encode(doc_bytes.getvalue()).decode()
         filename = f"Quotation_{quotation_data['quotation_no']}.docx"
+
+        # ── Smart: use edited file if available ──────────────────
+        edited_url = _get_edited_file_url(quotation_id)
+        edited_exists = _edited_file_exists(quotation_id)
+
+        if edited_exists:
+            edited_response = requests.get(edited_url, timeout=30)
+            if edited_response.status_code == 200:
+                doc_content = edited_response.content
+            else:
+                edited_exists = False  # Fall through to generate
+
+        if not edited_exists:
+            cur.execute("""
+                SELECT description, test_standard, unit_rate, quantity,
+                       COALESCE(amount, unit_rate * quantity) as amount,
+                       COALESCE(unit, 'No.') as unit, net_unit
+                FROM quotation_items
+                WHERE quotation_id = %s ORDER BY item_id
+            """, (quotation_id,))
+            items = [
+                {"description": r[0], "test_standard": r[1], "unit_rate": float(r[2]),
+                 "quantity": r[3], "amount": float(r[4]), "unit": r[5], "net_unit": r[6]}
+                for r in cur.fetchall()
+            ]
+
+            template_url = TEMPLATE_URLS.get(division, TEMPLATE_URLS["DEFAULT"])
+            tmpl_response = requests.get(template_url)
+            if tmpl_response.status_code != 200:
+                raise HTTPException(500, f"Template fetch failed for division {division}")
+
+            template_stream = BytesIO(tmpl_response.content)
+            template_processor = QuotationTemplateProcessor(template_stream)
+            doc_bytes = template_processor.process_quotation(quotation_data, client_data, items)
+            doc_content = doc_bytes.getvalue()
+
+        doc_b64 = base64.b64encode(doc_content).decode()
 
         contact_name = client_data['contact_person'] or client_data['name'] or "Sir/Madam"
         created_date = quotation_data['created_at']
