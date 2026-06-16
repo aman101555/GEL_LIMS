@@ -24,7 +24,7 @@ BUCKET_NAME = "projects"  # Supabase bucket name
 # Pydantic Models
 # ------------------------------
 class ProjectCreate(BaseModel):
-    quotation_id: int
+    quotation_id: Optional[int] = None
     project_name: str
     location: str
     lpo_no: Optional[str] = None
@@ -33,7 +33,7 @@ class ProjectCreate(BaseModel):
 class ProjectOut(BaseModel):
     project_id: int
     project_no: str
-    quotation_id: int
+    quotation_id: Optional[int] = None
     client_id: Optional[int]
     project_name: str
     location: str
@@ -43,6 +43,10 @@ class ProjectOut(BaseModel):
     quotation_no: Optional[str] = None
     client_name: Optional[str] = None
     lpo_file: Optional[str] = None
+    is_walk_in: Optional[bool] = False
+    walk_in_client: Optional[str] = None
+    division: Optional[str] = None
+    halted_date: Optional[str] = None
 
 
 class ProjectStatusUpdate(BaseModel):
@@ -94,8 +98,12 @@ def list_projects(limit: int = 100, offset: int = 0):
             """
             SELECT p.project_id, p.project_no, p.quotation_id, p.client_id,
                    p.project_name, p.location, p.lpo_no, p.lpo_date,
-                   p.division, p.status, p.created_at,
-                   q.quotation_no, c.name as client_name, p.lpo_file
+                   p.division, p.status, p.created_at, p.halted_date,
+                   q.quotation_no, 
+                   COALESCE(c.name, p.walk_in_client) as client_name,
+                   p.lpo_file,
+                   COALESCE(p.is_walk_in, FALSE) as is_walk_in,
+                   p.walk_in_client
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
@@ -119,9 +127,12 @@ def list_projects(limit: int = 100, offset: int = 0):
                 "division": r[8],
                 "status": r[9],
                 "created_at": str(r[10]) if r[10] else None,
-                "quotation_no": r[11],
-                "client_name": r[12],
-                "lpo_file": r[13]
+                "halted_date": str(r[11]) if r[11] else None,
+                "quotation_no": r[12],
+                "client_name": r[13],
+                "lpo_file": r[14],
+                "is_walk_in": bool(r[15]) if r[15] is not None else False,
+                "walk_in_client": r[16],
             }
             for r in rows
         ]
@@ -131,7 +142,6 @@ def list_projects(limit: int = 100, offset: int = 0):
     finally:
         cur.close()
         conn.close()
-
 
 # ------------------------------
 # CREATE PROJECT
@@ -143,20 +153,28 @@ def create_project(payload: ProjectCreate):
     cur = conn.cursor()
 
     try:
-        cur.execute("""
-            SELECT q.quotation_id, e.client_id, q.division,
-                   e.project_name as enquiry_project_name,
-                   e.location as enquiry_location
-            FROM quotations q
-            JOIN enquiries e ON q.enquiry_id = e.enquiry_id
-            WHERE q.quotation_id = %s
-        """, (payload.quotation_id,))
-        row = cur.fetchone()
+        # Handle walk-in projects (no quotation_id)
+        if payload.quotation_id is None:
+            # Walk-in project
+            client_id = None
+            division = "GEO"  # Default division for walk-ins
+            enquiry_project_name = payload.project_name
+            enquiry_location = payload.location
+        else:
+            cur.execute("""
+                SELECT q.quotation_id, e.client_id, q.division,
+                       e.project_name as enquiry_project_name,
+                       e.location as enquiry_location
+                FROM quotations q
+                JOIN enquiries e ON q.enquiry_id = e.enquiry_id
+                WHERE q.quotation_id = %s
+            """, (payload.quotation_id,))
+            row = cur.fetchone()
 
-        if not row:
-            raise HTTPException(404, "Quotation not found")
+            if not row:
+                raise HTTPException(404, "Quotation not found")
 
-        quotation_id, client_id, division, enquiry_project_name, enquiry_location = row
+            quotation_id, client_id, division, enquiry_project_name, enquiry_location = row
 
         project_name = payload.project_name if payload.project_name != "string" else enquiry_project_name
         location = payload.location if payload.location != "string" else enquiry_location
@@ -184,22 +202,28 @@ def create_project(payload: ProjectCreate):
         if payload.lpo_date and payload.lpo_date != "string":
             lpo_date = datetime.strptime(payload.lpo_date, "%Y-%m-%d").date()
 
+        # For walk-in projects, set is_walk_in = TRUE
+        is_walk_in = payload.quotation_id is None
+
         cur.execute("""
             INSERT INTO projects (
                 project_no, quotation_id, client_id, project_name,
-                location, lpo_no, lpo_date, division, status
+                location, lpo_no, lpo_date, division, status,
+                is_walk_in, walk_in_client
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE', %s, %s)
             RETURNING project_id
         """, (
             project_no,
-            quotation_id,
+            payload.quotation_id,
             client_id,
             project_name,
             location,
             payload.lpo_no if payload.lpo_no != "string" else None,
             lpo_date,
-            division
+            division,
+            is_walk_in,
+            None  # walk_in_client - can be set separately
         ))
 
         project_id = cur.fetchone()[0]
@@ -208,13 +232,16 @@ def create_project(payload: ProjectCreate):
         return {
             "project_id": project_id,
             "project_no": project_no,
-            "quotation_id": quotation_id,
+            "quotation_id": payload.quotation_id,
             "client_id": client_id,
             "project_name": project_name,
             "location": location,
             "status": "ACTIVE",
-            "lpo_no": payload.lpo_no,
-            "lpo_date": payload.lpo_date
+            "lpo_no": payload.lpo_no if payload.lpo_no != "string" else None,
+            "lpo_date": payload.lpo_date if payload.lpo_date != "string" else None,
+            "is_walk_in": is_walk_in,
+            "walk_in_client": None,
+            "division": division,
         }
 
     except Exception as e:
@@ -238,7 +265,9 @@ def get_project_details(project_id: int):
             SELECT p.project_id, p.project_no, p.quotation_id, p.client_id,
                    p.project_name, p.location, p.lpo_no, p.lpo_date,
                    p.lpo_file, p.division, p.status, p.created_at,
-                   q.quotation_no, c.name as client_name,
+                   p.halted_date, p.is_walk_in, p.walk_in_client,
+                   q.quotation_no, 
+                   COALESCE(c.name, p.walk_in_client) as client_name,
                    c.address as client_address,
                    c.contact_person as client_contact_person
             FROM projects p
@@ -265,10 +294,13 @@ def get_project_details(project_id: int):
             "division":              row[9],
             "status":                row[10],
             "created_at":            str(row[11]) if row[11] else None,
-            "quotation_no":          row[12],
-            "client_name":           row[13],
-            "client_address":        row[14],
-            "client_contact_person": row[15],
+            "halted_date":           str(row[12]) if row[12] else None,
+            "is_walk_in":            bool(row[13]) if row[13] is not None else False,
+            "walk_in_client":        row[14],
+            "quotation_no":          row[15],
+            "client_name":           row[16],
+            "client_address":        row[17],
+            "client_contact_person": row[18],
         }
 
     except Exception as e:
@@ -297,7 +329,8 @@ def update_project(project_id: int, payload: ProjectCreate):
 
         cur.execute("""
             UPDATE projects
-            SET project_name = %s, location = %s, lpo_no = %s, lpo_date = %s
+            SET project_name = %s, location = %s, lpo_no = %s, lpo_date = %s,
+                quotation_id = %s
             WHERE project_id = %s
             RETURNING project_id, project_no
         """, (
@@ -305,6 +338,7 @@ def update_project(project_id: int, payload: ProjectCreate):
             payload.location,
             payload.lpo_no if payload.lpo_no != "string" else None,
             lpo_date,
+            payload.quotation_id,
             project_id
         ))
 
@@ -522,7 +556,7 @@ def generate_cover_sheet(project_id: int):
         cur.execute("""
             SELECT p.project_id, p.project_no, p.project_name, p.location,
                    p.division, p.status, p.created_at,
-                   c.name            AS client_name,
+                   COALESCE(c.name, p.walk_in_client) AS client_name,
                    c.address         AS client_address,
                    c.contact_person  AS client_contact_person
             FROM projects p
@@ -595,7 +629,7 @@ def generate_work_instruction(project_id: int):
         cur.execute("""
             SELECT p.project_id, p.project_no, p.project_name, p.location,
                    p.division,   p.lpo_date,   p.quotation_id,
-                   c.name            AS client_name,
+                   COALESCE(c.name, p.walk_in_client) AS client_name,
                    c.address         AS client_address,
                    c.phone           AS client_phone,
                    c.contact_person  AS client_contact_person
@@ -620,7 +654,7 @@ def generate_work_instruction(project_id: int):
             "project_name":          row[2],
             "location":              row[3],
             "division":              row[4],
-            "lpo_date":              row[5],   # raw date object — processor will format it
+            "lpo_date":              row[5],
             "client_name":           row[7],
             "client_address":        row[8],
             "client_phone":          row[9],
@@ -672,6 +706,10 @@ def generate_work_instruction(project_id: int):
         cur.close()
         conn.close()
 
+
+# ------------------------------
+# GENERATE SAMPLE DESCRIPTION
+# ------------------------------
 @router.get("/{project_id}/sample-description")
 def download_sample_description(project_id: int):
     """Generate and download a Sample Description sheet."""
@@ -682,7 +720,7 @@ def download_sample_description(project_id: int):
         cur.execute("""
             SELECT p.project_id, p.project_no, p.project_name, p.location,
                    p.division, p.status, p.created_at,
-                   c.name AS client_name
+                   COALESCE(c.name, p.walk_in_client) AS client_name
             FROM projects p
             LEFT JOIN clients c ON p.client_id = c.client_id
             WHERE p.project_id = %s
@@ -722,6 +760,8 @@ def download_sample_description(project_id: int):
     finally:
         cur.close()
         conn.close()
+
+
 # ------------------------------
 # GENERATE BOREHOLE LOG (GEO only)
 # ------------------------------
@@ -744,7 +784,7 @@ def generate_borehole_log(project_id: int):
         cur.execute("""
             SELECT p.project_id, p.project_no, p.project_name, p.location,
                    p.division, p.status, p.created_at,
-                   c.name AS client_name
+                   COALESCE(c.name, p.walk_in_client) AS client_name
             FROM projects p
             LEFT JOIN clients c ON p.client_id = c.client_id
             WHERE p.project_id = %s
