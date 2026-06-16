@@ -26,7 +26,6 @@ from invoices import router as invoice_router
 from reports import router as reports_router
 from search import router as search_router
 from payments import router as payments_router
-from walkin import router as walkin_router
 
 app = FastAPI(title="GEL LIMS API")
 
@@ -78,8 +77,6 @@ app.include_router(invoice_router)  # Already has /invoices in its file
 app.include_router(reports_router, prefix="/reports")
 app.include_router(search_router, prefix="/search")
 app.include_router(payments_router)  # Already has /payments in its file
-app.include_router(walkin_router)
-
 
 # --- 6. SERVE STATIC ASSETS ---
 if os.path.exists(DIST_PATH) and os.path.exists(os.path.join(DIST_PATH, "assets")):
