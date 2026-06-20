@@ -12,7 +12,25 @@ DB additions required (run once):
         ADD COLUMN IF NOT EXISTS is_walk_in       BOOLEAN DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS walk_in_client    TEXT,
         ADD COLUMN IF NOT EXISTS walk_in_phone     TEXT,
-        ADD COLUMN IF NOT EXISTS walk_in_email     TEXT;
+        ADD COLUMN IF NOT EXISTS walk_in_email     TEXT,
+        ADD COLUMN IF NOT EXISTS consultant        TEXT,
+        ADD COLUMN IF NOT EXISTS plot_no           TEXT,
+        ADD COLUMN IF NOT EXISTS client_name       TEXT;
+
+    -- consultant / plot_no / client_name live on `projects` (not on a
+    -- PA-only table) on purpose: they're general project attributes
+    -- Payment Advice, Invoice, Cover Sheet, etc. can all read from the
+    -- same place. `project_name` already existed on `projects` and is
+    -- reused here as the LP's actual project name (previously it was
+    -- always set equal to the client name for walk-ins — see
+    -- create_walk_in() below, now decoupled).
+    --
+    -- `client_name` is the actual project Client/Owner — distinct from
+    -- `walk_in_client` (labelled "Contractor" in the UI, the counter
+    -- party who actually walks in with the samples). For regular
+    -- (non-walk-in) projects, `client_name` falls back via COALESCE to
+    -- the linked `clients.name` in projects.py, so ViewProjects keeps
+    -- working unchanged for those.
 
     CREATE TABLE IF NOT EXISTS walk_in_items (
         item_id        SERIAL PRIMARY KEY,
@@ -41,10 +59,26 @@ VAT_RATE = 0.05
 # ─── Pydantic models ──────────────────────────────────────────────────────────
 
 class WalkInCreate(BaseModel):
-    client_name: str
+    client_name: str   # Contractor — the walk-in counter party (kept as `client_name` for backward compatibility)
     phone: Optional[str] = None
     email: Optional[str] = None
     division: Optional[str] = "MAT"   # default division for walk-ins
+    project_name: Optional[str] = None  # the LP's own project name; falls back to client_name if blank
+    consultant: Optional[str] = None
+    plot_no: Optional[str] = None
+    client: Optional[str] = None        # NEW: the actual project Client/Owner — distinct from client_name (Contractor) above
+
+
+class WalkInDetailsUpdate(BaseModel):
+    """Used to edit project-level details after the walk-in already exists
+    (consultant / plot no are often only known after the customer is created,
+    and project_name may need correcting later)."""
+    project_name: Optional[str] = None
+    consultant: Optional[str] = None
+    plot_no: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    client: Optional[str] = None        # the actual project Client/Owner
 
 
 class WalkInItemCreate(BaseModel):
@@ -75,24 +109,37 @@ class LPNumberUpdate(BaseModel):
 # ─── Helper: generate LP number (identical logic to projects.py) ──────────────
 
 def _generate_lp_number(cur) -> str:
+    """
+    Picks the next LP number as (highest LP number ever issued) + 1.
+
+    Previously this looked at the LATEST-CREATED row that happened to have
+    an LP-style project_no (ORDER BY project_id DESC LIMIT 1). That breaks
+    the moment a walk-in is deleted: its `projects` row disappears, but the
+    `quotations` row it created (quotation_no = 'WALKIN-LP/xxxx/yy/DXB')
+    does NOT — nothing ever deleted it. The next call would then see a
+    lower "last" number and reissue one that's still sitting in
+    `quotations`, causing:
+        duplicate key value violates unique constraint "quotations_quotation_no_key"
+
+    Fix: take the MAX numeric LP value across BOTH `projects.project_no`
+    AND `quotations.quotation_no` (the latter never gets deleted), so a
+    number can never be reissued once it's been used anywhere.
+    """
     year_last_two = datetime.utcnow().strftime("%y")
 
-    cur.execute("""
-        SELECT project_no
-        FROM projects
-        WHERE project_no LIKE 'LP/%'
-        ORDER BY project_id DESC
-        LIMIT 1
+    cur.execute(r"""
+        SELECT MAX(num) FROM (
+            SELECT (regexp_match(project_no, '^LP/(\d+)/'))[1]::int AS num
+            FROM projects
+            WHERE project_no ~ '^LP/\d+/'
+            UNION ALL
+            SELECT (regexp_match(quotation_no, '^WALKIN-LP/(\d+)/'))[1]::int AS num
+            FROM quotations
+            WHERE quotation_no ~ '^WALKIN-LP/\d+/'
+        ) all_numbers
     """)
-    last = cur.fetchone()
-    if last:
-        try:
-            last_number = int(last[0].split('/')[1])
-            next_number = last_number + 1
-        except (IndexError, ValueError):
-            next_number = 16732
-    else:
-        next_number = 16732
+    max_existing = cur.fetchone()[0]
+    next_number = (max_existing + 1) if max_existing else 16732
 
     return f"LP/{next_number}/{year_last_two}/DXB"
 
@@ -144,23 +191,31 @@ def create_walk_in(payload: WalkInCreate):
             INSERT INTO projects (
                 project_no, quotation_id, client_id,
                 project_name, location, division, status,
-                is_walk_in, walk_in_client, walk_in_phone, walk_in_email
+                is_walk_in, walk_in_client, walk_in_phone, walk_in_email,
+                consultant, plot_no, client_name
             )
             VALUES ('PENDING', NULL, NULL, %s, 'Walk-In', %s, 'PENDING',
-                    TRUE, %s, %s, %s)
+                    TRUE, %s, %s, %s, %s, %s, %s)
             RETURNING project_id
         """, (
-            payload.client_name,
+            payload.project_name or payload.client_name,
             payload.division,
             payload.client_name,
             payload.phone,
             payload.email,
+            payload.consultant,
+            payload.plot_no,
+            payload.client,
         ))
         project_id = cur.fetchone()[0]
         conn.commit()
         return {
             "project_id": project_id,
             "client_name": payload.client_name,
+            "project_name": payload.project_name or payload.client_name,
+            "consultant": payload.consultant,
+            "plot_no": payload.plot_no,
+            "client": payload.client,
             "division": payload.division,
             "message": "Walk-in customer created. Add tests and then generate LPO.",
         }
@@ -182,7 +237,8 @@ def get_walk_in(project_id: int):
         cur.execute("""
             SELECT project_id, project_no, project_name, division, status,
                    walk_in_client, walk_in_phone, walk_in_email,
-                   is_walk_in, created_at, lpo_no, lpo_date
+                   is_walk_in, created_at, lpo_no, lpo_date,
+                   consultant, plot_no, client_name
             FROM projects
             WHERE project_id = %s AND is_walk_in = TRUE
         """, (project_id,))
@@ -212,7 +268,8 @@ def get_walk_in(project_id: int):
         return {
             "project_id":   row[0],
             "project_no":   row[1],   # will be 'PENDING' until LPO created
-            "client_name":  row[2],
+            "project_name": row[2],
+            "client_name":  row[5],   # walk_in_client (Contractor) — kept under this key for backward compatibility
             "division":     row[3],
             "status":       row[4],
             "walk_in_client": row[5],
@@ -222,6 +279,9 @@ def get_walk_in(project_id: int):
             "created_at":   str(row[9]) if row[9] else None,
             "lpo_no":       row[10],
             "lpo_date":     str(row[11]) if row[11] else None,
+            "consultant":   row[12],
+            "plot_no":      row[13],
+            "client":       row[14],  # NEW: the actual Client/Owner name (distinct from Contractor above)
             "items":        items,
             "total_amount": total,
             "vat":          vat,
@@ -245,9 +305,10 @@ def list_walk_ins(limit: int = 100, offset: int = 0):
     try:
         cur.execute("""
             SELECT project_id, project_no, 
-                   COALESCE(walk_in_client, project_name) as client_name,
+                   COALESCE(walk_in_client, project_name) as contractor_display,
                    division, status,
-                   walk_in_client, walk_in_phone, walk_in_email, created_at
+                   walk_in_client, walk_in_phone, walk_in_email, created_at,
+                   project_name, consultant, plot_no, client_name
             FROM projects
             WHERE is_walk_in = TRUE
             ORDER BY project_id DESC
@@ -258,13 +319,17 @@ def list_walk_ins(limit: int = 100, offset: int = 0):
             {
                 "project_id":    r[0],
                 "project_no":    r[1],
-                "client_name":   r[2],
+                "client_name":   r[2],   # Contractor (kept under this key for backward compatibility)
                 "division":      r[3],
                 "status":        r[4],
                 "walk_in_client": r[5],
                 "walk_in_phone":  r[6],
                 "walk_in_email":  r[7],
                 "created_at":    str(r[8]) if r[8] else None,
+                "project_name":  r[9],
+                "consultant":    r[10],
+                "plot_no":       r[11],
+                "client":        r[12],  # NEW: the actual Client/Owner name
             }
             for r in rows
         ]
@@ -463,13 +528,27 @@ def create_lpo(project_id: int):
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT project_id, project_no, is_walk_in, division
+            SELECT project_id, project_no, is_walk_in, division, quotation_id
             FROM projects
             WHERE project_id = %s AND is_walk_in = TRUE
         """, (project_id,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "Walk-in not found")
+
+        # Idempotency guard: if this walk-in already has an LP number, don't
+        # generate a second one. Without this, clicking "Create LPO" again
+        # (e.g. because the UI didn't visibly update the first time) burns
+        # a brand new LP number and quotation row for the same walk-in.
+        existing_lp, existing_quotation_id = row[1], row[4]
+        if existing_lp and existing_lp != "PENDING":
+            return {
+                "message": "LPO already exists for this walk-in — returning the existing one.",
+                "project_id": project_id,
+                "lp_number": existing_lp,
+                "quotation_id": existing_quotation_id,
+                "already_existed": True,
+            }
 
         division = row[3] or "MAT"
 
@@ -563,6 +642,69 @@ def update_lp_number(project_id: int, payload: LPNumberUpdate):
         conn.close()
 
 
+# ─── 9b. UPDATE PROJECT DETAILS (consultant, plot no, project name, contact) ─
+
+@router.patch("/{project_id}/details", summary="Update walk-in project details")
+def update_walk_in_details(project_id: int, payload: WalkInDetailsUpdate):
+    """
+    Edits the general project-level fields that live on `projects` (not on
+    any PA-only table), so they stay available to Payment Advice, Invoice,
+    Cover Sheet, etc. — anything that already reads from `projects`.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT project_id FROM projects WHERE project_id = %s AND is_walk_in = TRUE", (project_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Walk-in not found")
+
+        fields, values = [], []
+        if payload.project_name is not None:
+            fields.append("project_name = %s"); values.append(payload.project_name)
+        if payload.consultant is not None:
+            fields.append("consultant = %s"); values.append(payload.consultant)
+        if payload.plot_no is not None:
+            fields.append("plot_no = %s"); values.append(payload.plot_no)
+        if payload.phone is not None:
+            fields.append("walk_in_phone = %s"); values.append(payload.phone)
+        if payload.email is not None:
+            fields.append("walk_in_email = %s"); values.append(payload.email)
+        if payload.client is not None:
+            fields.append("client_name = %s"); values.append(payload.client)
+
+        if not fields:
+            raise HTTPException(400, "Nothing to update")
+
+        values.append(project_id)
+        cur.execute(f"""
+            UPDATE projects
+            SET {", ".join(fields)}
+            WHERE project_id = %s
+            RETURNING project_id, project_name, consultant, plot_no, walk_in_phone, walk_in_email, client_name
+        """, values)
+        row = cur.fetchone()
+        conn.commit()
+
+        return {
+            "message":      "Details updated",
+            "project_id":   row[0],
+            "project_name": row[1],
+            "consultant":   row[2],
+            "plot_no":      row[3],
+            "walk_in_phone": row[4],
+            "walk_in_email": row[5],
+            "client":       row[6],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ─── 10. PRICE CATALOG (proxy — same source as quotations) ──────────────────
 # NOTE: This route MUST be defined before /{project_id} to avoid FastAPI
 # treating "catalog" as a project_id integer path parameter.
@@ -604,6 +746,15 @@ def delete_walk_in(project_id: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("""
+            SELECT quotation_id FROM projects
+            WHERE project_id = %s AND is_walk_in = TRUE
+        """, (project_id,))
+        existing = cur.fetchone()
+        if not existing:
+            raise HTTPException(404, "Walk-in not found")
+        quotation_id = existing[0]
+
         # walk_in_items will cascade due to ON DELETE CASCADE on project_id FK
         cur.execute("""
             DELETE FROM projects
@@ -613,6 +764,19 @@ def delete_walk_in(project_id: int):
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "Walk-in not found")
+
+        # Clean up the dedicated quotation create-lpo made for this walk-in.
+        # Without this, the quotation_no ('WALKIN-LP/xxxx/yy/DXB') stays in
+        # `quotations` forever as an orphan, and a future walk-in can be
+        # issued that exact same LP number and crash on the unique
+        # constraint when it tries to insert its own quotation.
+        if quotation_id:
+            cur.execute("DELETE FROM quotation_items WHERE quotation_id = %s", (quotation_id,))
+            cur.execute(
+                "DELETE FROM quotations WHERE quotation_id = %s AND quotation_no LIKE 'WALKIN-%%'",
+                (quotation_id,)
+            )
+
         conn.commit()
         return {
             "message":    f"Walk-in #{row[0]} ({row[1]}) deleted",
