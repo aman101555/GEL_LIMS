@@ -144,7 +144,8 @@ def get_items_for_payment_advice(project_id: int):
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT project_id, project_no, walk_in_client, project_name
+            SELECT project_id, project_no, walk_in_client, project_name,
+                   consultant, plot_no, walk_in_phone, client_name
             FROM projects
             WHERE project_id = %s AND is_walk_in = TRUE
         """, (project_id,))
@@ -182,7 +183,12 @@ def get_items_for_payment_advice(project_id: int):
         return {
             "project_id": proj[0],
             "lp_number": proj[1],
-            "client_name": proj[2] or proj[3],
+            "client_name": proj[2] or proj[3],   # Contractor (kept under this key — see GeneratePaymentAdvice.jsx)
+            "project_name": proj[3],
+            "consultant": proj[4],
+            "plot_no": proj[5],
+            "phone": proj[6],
+            "client": proj[7],                    # NEW: the actual Client/Owner name (distinct from Contractor)
             "items": items,
             "advisable_count": len([i for i in items if not i["already_advised"]]),
             "advised_count": len([i for i in items if i["already_advised"]]),
@@ -208,7 +214,8 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
         # 1. Validate walk-in / LP
         # ----------------------------------------------------
         cur.execute("""
-            SELECT project_id, project_no, walk_in_client, project_name
+            SELECT project_id, project_no, walk_in_client, project_name,
+                   consultant, plot_no, walk_in_phone, client_name
             FROM projects
             WHERE project_id = %s AND is_walk_in = TRUE
         """, (payload.project_id,))
@@ -217,7 +224,12 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
             raise HTTPException(404, "Walk-in not found")
 
         lp_number = proj[1]
-        client_name = proj[2] or proj[3] or " - "
+        contractor = proj[2] or proj[3] or " - "   # walk_in_client — labelled "Contractor" in the UI
+        project_name = proj[3] or contractor
+        consultant = proj[4] or ""
+        plot_no = proj[5] or ""
+        phone = proj[6] or ""
+        client_field = proj[7] or ""                 # NEW: the actual Client/Owner name → goes to C12
 
         if not lp_number or lp_number == "PENDING":
             raise HTTPException(400, "LP number has not been generated for this walk-in yet")
@@ -286,10 +298,17 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
         ws = wb.active
 
         # Header fields
-        _safe_set(ws, "A5", client_name)
+        _safe_set(ws, "A5", contractor)
         _safe_set(ws, "I4", pa_no)
         _safe_set(ws, "I5", pa_date.strftime("%d-%b-%Y"))
         _safe_set(ws, "I7", lp_number)
+
+        # Additional header fields (per template v2 spec)
+        _safe_set(ws, "B7", phone)          # Tel
+        _safe_set(ws, "C11", consultant)    # Consultant
+        _safe_set(ws, "C12", client_field)  # Cl Name — the dedicated Client/Owner field, NOT the Contractor
+        _safe_set(ws, "C13", plot_no)       # Plot No
+        _safe_set(ws, "C15", project_name)  # Project Name
 
         # Clear existing item rows first (defensive, in case template has stray data)
         for row in range(FIRST_ITEM_ROW, LAST_TEMPLATE_ITEM_ROW + 1):
@@ -323,7 +342,7 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
         os.makedirs(output_dir, exist_ok=True)
 
         pa_no_hyphen = pa_no.replace('/', '-')
-        clean_client = _clean_filename(client_name)
+        clean_client = _clean_filename(contractor)
         download_filename = f"PA-{pa_no_hyphen}-{clean_client}.xlsx"
         output_path = os.path.join(output_dir, f"{pa_no_hyphen}.xlsx")
         wb.save(output_path)
@@ -336,7 +355,7 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
                 (pa_no, project_id, lp_number, client_name, subtotal, vat, grand_total, pa_date)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING pa_id
-        """, (pa_no, payload.project_id, lp_number, client_name, subtotal, vat, grand_total, pa_date))
+        """, (pa_no, payload.project_id, lp_number, contractor, subtotal, vat, grand_total, pa_date))
         pa_id = cur.fetchone()[0]
 
         for item in items:
