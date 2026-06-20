@@ -29,6 +29,9 @@ class ProjectCreate(BaseModel):
     location: str
     lpo_no: Optional[str] = None
     lpo_date: Optional[str] = None
+    consultant: Optional[str] = None
+    plot_no: Optional[str] = None
+    client_name: Optional[str] = None  # only meaningful for walk-ins (no linked client_id); ignored otherwise via COALESCE
 
 class ProjectOut(BaseModel):
     project_id: int
@@ -43,6 +46,8 @@ class ProjectOut(BaseModel):
     quotation_no: Optional[str] = None
     client_name: Optional[str] = None
     lpo_file: Optional[str] = None
+    consultant: Optional[str] = None
+    plot_no: Optional[str] = None
 
 
 class ProjectStatusUpdate(BaseModel):
@@ -95,7 +100,8 @@ def list_projects(limit: int = 100, offset: int = 0):
             SELECT p.project_id, p.project_no, p.quotation_id, p.client_id,
                    p.project_name, p.location, p.lpo_no, p.lpo_date,
                    p.division, p.status, p.created_at,
-                   q.quotation_no, c.name as client_name, p.lpo_file
+                   q.quotation_no, COALESCE(c.name, p.client_name) as client_name, p.lpo_file,
+                   p.consultant, p.plot_no
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
@@ -121,7 +127,9 @@ def list_projects(limit: int = 100, offset: int = 0):
                 "created_at": str(r[10]) if r[10] else None,
                 "quotation_no": r[11],
                 "client_name": r[12],
-                "lpo_file": r[13]
+                "lpo_file": r[13],
+                "consultant": r[14],
+                "plot_no": r[15],
             }
             for r in rows
         ]
@@ -161,22 +169,26 @@ def create_project(payload: ProjectCreate):
         project_name = payload.project_name if payload.project_name != "string" else enquiry_project_name
         location = payload.location if payload.location != "string" else enquiry_location
 
+        # Picks (highest LP number ever issued) + 1, checking both
+        # `projects.project_no` and walk-in `quotations.quotation_no`
+        # ('WALKIN-LP/...') — the two share the same LP/xxxx/yy/DXB number
+        # space, and a deleted walk-in's orphaned quotation row can still
+        # be holding a number that "ORDER BY project_id DESC" would miss.
         year_last_two = datetime.utcnow().strftime("%y")
 
-        cur.execute("""
-            SELECT project_no
-            FROM projects
-            WHERE project_no LIKE 'LP/%'
-            ORDER BY project_id DESC
-            LIMIT 1
+        cur.execute(r"""
+            SELECT MAX(num) FROM (
+                SELECT (regexp_match(project_no, '^LP/(\d+)/'))[1]::int AS num
+                FROM projects
+                WHERE project_no ~ '^LP/\d+/'
+                UNION ALL
+                SELECT (regexp_match(quotation_no, '^WALKIN-LP/(\d+)/'))[1]::int AS num
+                FROM quotations
+                WHERE quotation_no ~ '^WALKIN-LP/\d+/'
+            ) all_numbers
         """)
-
-        last_project = cur.fetchone()
-        if last_project:
-            last_number = int(last_project[0].split('/')[1])
-            next_number = last_number + 1
-        else:
-            next_number = 16732
+        max_existing = cur.fetchone()[0]
+        next_number = (max_existing + 1) if max_existing else 16732
 
         project_no = f"LP/{next_number}/{year_last_two}/DXB"
 
@@ -187,9 +199,10 @@ def create_project(payload: ProjectCreate):
         cur.execute("""
             INSERT INTO projects (
                 project_no, quotation_id, client_id, project_name,
-                location, lpo_no, lpo_date, division, status
+                location, lpo_no, lpo_date, division, status,
+                consultant, plot_no
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE', %s, %s)
             RETURNING project_id
         """, (
             project_no,
@@ -199,7 +212,9 @@ def create_project(payload: ProjectCreate):
             location,
             payload.lpo_no if payload.lpo_no != "string" else None,
             lpo_date,
-            division
+            division,
+            payload.consultant if payload.consultant != "string" else None,
+            payload.plot_no if payload.plot_no != "string" else None,
         ))
 
         project_id = cur.fetchone()[0]
@@ -214,7 +229,9 @@ def create_project(payload: ProjectCreate):
             "location": location,
             "status": "ACTIVE",
             "lpo_no": payload.lpo_no,
-            "lpo_date": payload.lpo_date
+            "lpo_date": payload.lpo_date,
+            "consultant": payload.consultant,
+            "plot_no": payload.plot_no,
         }
 
     except Exception as e:
@@ -238,9 +255,10 @@ def get_project_details(project_id: int):
             SELECT p.project_id, p.project_no, p.quotation_id, p.client_id,
                    p.project_name, p.location, p.lpo_no, p.lpo_date,
                    p.lpo_file, p.division, p.status, p.created_at,
-                   q.quotation_no, c.name as client_name,
+                   q.quotation_no, COALESCE(c.name, p.client_name) as client_name,
                    c.address as client_address,
-                   c.contact_person as client_contact_person
+                   c.contact_person as client_contact_person,
+                   p.consultant, p.plot_no
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
@@ -269,6 +287,8 @@ def get_project_details(project_id: int):
             "client_name":           row[13],
             "client_address":        row[14],
             "client_contact_person": row[15],
+            "consultant":            row[16],
+            "plot_no":               row[17],
         }
 
     except Exception as e:
@@ -297,7 +317,9 @@ def update_project(project_id: int, payload: ProjectCreate):
 
         cur.execute("""
             UPDATE projects
-            SET project_name = %s, location = %s, lpo_no = %s, lpo_date = %s
+            SET project_name = %s, location = %s, lpo_no = %s, lpo_date = %s,
+                consultant = COALESCE(%s, consultant), plot_no = COALESCE(%s, plot_no),
+                client_name = COALESCE(%s, client_name)
             WHERE project_id = %s
             RETURNING project_id, project_no
         """, (
@@ -305,6 +327,9 @@ def update_project(project_id: int, payload: ProjectCreate):
             payload.location,
             payload.lpo_no if payload.lpo_no != "string" else None,
             lpo_date,
+            payload.consultant if payload.consultant != "string" else None,
+            payload.plot_no if payload.plot_no != "string" else None,
+            payload.client_name if payload.client_name != "string" else None,
             project_id
         ))
 
