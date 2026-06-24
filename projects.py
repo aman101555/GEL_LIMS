@@ -18,6 +18,11 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
+# DB migration (run once):
+# ALTER TABLE projects
+#     ADD COLUMN IF NOT EXISTS contractor TEXT,
+#     ADD COLUMN IF NOT EXISTS phone_no   TEXT;
+
 BUCKET_NAME = "projects"  # Supabase bucket name
 
 # ------------------------------
@@ -31,7 +36,9 @@ class ProjectCreate(BaseModel):
     lpo_date: Optional[str] = None
     consultant: Optional[str] = None
     plot_no: Optional[str] = None
-    client_name: Optional[str] = None  # only meaningful for walk-ins (no linked client_id); ignored otherwise via COALESCE
+    client_name: Optional[str] = None
+    contractor: Optional[str] = None   # Non Walk-In: contractor name
+    phone_no: Optional[str] = None     # Non Walk-In: phone number
 
 class ProjectOut(BaseModel):
     project_id: int
@@ -48,6 +55,8 @@ class ProjectOut(BaseModel):
     lpo_file: Optional[str] = None
     consultant: Optional[str] = None
     plot_no: Optional[str] = None
+    contractor: Optional[str] = None
+    phone_no: Optional[str] = None
 
 
 class ProjectStatusUpdate(BaseModel):
@@ -101,7 +110,7 @@ def list_projects(limit: int = 100, offset: int = 0):
                    p.project_name, p.location, p.lpo_no, p.lpo_date,
                    p.division, p.status, p.created_at,
                    q.quotation_no, COALESCE(c.name, p.client_name) as client_name, p.lpo_file,
-                   p.consultant, p.plot_no
+                   p.consultant, p.plot_no, p.contractor, p.phone_no
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
@@ -130,6 +139,8 @@ def list_projects(limit: int = 100, offset: int = 0):
                 "lpo_file": r[13],
                 "consultant": r[14],
                 "plot_no": r[15],
+                "contractor": r[16],
+                "phone_no": r[17],
             }
             for r in rows
         ]
@@ -171,9 +182,6 @@ def create_project(payload: ProjectCreate):
 
         # Picks (highest LP number ever issued) + 1, checking both
         # `projects.project_no` and walk-in `quotations.quotation_no`
-        # ('WALKIN-LP/...') — the two share the same LP/xxxx/yy/DXB number
-        # space, and a deleted walk-in's orphaned quotation row can still
-        # be holding a number that "ORDER BY project_id DESC" would miss.
         year_last_two = datetime.utcnow().strftime("%y")
 
         cur.execute(r"""
@@ -200,9 +208,9 @@ def create_project(payload: ProjectCreate):
             INSERT INTO projects (
                 project_no, quotation_id, client_id, project_name,
                 location, lpo_no, lpo_date, division, status,
-                consultant, plot_no
+                consultant, plot_no, contractor, phone_no
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE', %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE', %s, %s, %s, %s)
             RETURNING project_id
         """, (
             project_no,
@@ -215,6 +223,8 @@ def create_project(payload: ProjectCreate):
             division,
             payload.consultant if payload.consultant != "string" else None,
             payload.plot_no if payload.plot_no != "string" else None,
+            payload.contractor if payload.contractor != "string" else None,
+            payload.phone_no if payload.phone_no != "string" else None,
         ))
 
         project_id = cur.fetchone()[0]
@@ -232,6 +242,8 @@ def create_project(payload: ProjectCreate):
             "lpo_date": payload.lpo_date,
             "consultant": payload.consultant,
             "plot_no": payload.plot_no,
+            "contractor": payload.contractor,
+            "phone_no": payload.phone_no,
         }
 
     except Exception as e:
@@ -242,6 +254,9 @@ def create_project(payload: ProjectCreate):
         conn.close()
 
 
+# ------------------------------
+# GET PROJECT DETAILS
+# ------------------------------
 # ------------------------------
 # GET PROJECT DETAILS
 # ------------------------------
@@ -258,7 +273,8 @@ def get_project_details(project_id: int):
                    q.quotation_no, COALESCE(c.name, p.client_name) as client_name,
                    c.address as client_address,
                    c.contact_person as client_contact_person,
-                   p.consultant, p.plot_no
+                   p.consultant, p.plot_no, p.contractor, p.phone_no,
+                   p.is_walk_in, p.walk_in_client, p.walk_in_phone, p.walk_in_email
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
@@ -269,6 +285,18 @@ def get_project_details(project_id: int):
 
         if not row:
             raise HTTPException(404, "Project not found")
+
+        # Determine if this is a walk-in project
+        is_walk_in = row[20] if row[20] is not None else False
+        
+        # For walk-in projects: use walk_in_client as contractor, walk_in_phone as phone_no
+        # For non-walk-in: use the contractor and phone_no fields directly
+        if is_walk_in:
+            contractor_value = row[21] or row[18]  # walk_in_client first, fallback to contractor
+            phone_value = row[22] or row[19]       # walk_in_phone first, fallback to phone_no
+        else:
+            contractor_value = row[18]  # contractor field
+            phone_value = row[19]       # phone_no field
 
         return {
             "project_id":            row[0],
@@ -289,6 +317,12 @@ def get_project_details(project_id: int):
             "client_contact_person": row[15],
             "consultant":            row[16],
             "plot_no":               row[17],
+            "contractor":            contractor_value,  # Mapped from walk_in_client for walk-ins
+            "phone_no":              phone_value,       # Mapped from walk_in_phone for walk-ins
+            "is_walk_in":            is_walk_in,
+            "walk_in_client":        row[21],
+            "walk_in_phone":         row[22],
+            "walk_in_email":         row[23],
         }
 
     except Exception as e:
@@ -296,7 +330,6 @@ def get_project_details(project_id: int):
     finally:
         cur.close()
         conn.close()
-
 
 # ------------------------------
 # UPDATE PROJECT
@@ -319,7 +352,9 @@ def update_project(project_id: int, payload: ProjectCreate):
             UPDATE projects
             SET project_name = %s, location = %s, lpo_no = %s, lpo_date = %s,
                 consultant = COALESCE(%s, consultant), plot_no = COALESCE(%s, plot_no),
-                client_name = COALESCE(%s, client_name)
+                client_name = COALESCE(%s, client_name),
+                contractor = COALESCE(%s, contractor),
+                phone_no = COALESCE(%s, phone_no)
             WHERE project_id = %s
             RETURNING project_id, project_no
         """, (
@@ -330,6 +365,8 @@ def update_project(project_id: int, payload: ProjectCreate):
             payload.consultant if payload.consultant != "string" else None,
             payload.plot_no if payload.plot_no != "string" else None,
             payload.client_name if payload.client_name != "string" else None,
+            payload.contractor if payload.contractor != "string" else None,
+            payload.phone_no if payload.phone_no != "string" else None,
             project_id
         ))
 
