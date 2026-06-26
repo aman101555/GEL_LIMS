@@ -69,6 +69,7 @@ def list_payment_quotations(filter: Optional[str] = Query(None)):
             LEFT JOIN enquiries e ON q.enquiry_id = e.enquiry_id
             LEFT JOIN clients c ON e.client_id = c.client_id
             WHERE q.status = 'APPROVED'
+              AND q.quotation_no NOT LIKE 'WALKIN-%%'
         """
 
         params = []
