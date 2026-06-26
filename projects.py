@@ -153,6 +153,44 @@ def list_projects(limit: int = 100, offset: int = 0):
 
 
 # ------------------------------
+# SUMMARY (dashboard only — no JOINs, minimal columns, fast)
+# ------------------------------
+@router.get("/summary")
+def list_projects_summary():
+    """Minimal project list for the dashboard. No JOINs — returns only what the
+    dashboard home needs: counts, latest project, activity rate."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT project_id, project_no, project_name, status,
+                   COALESCE(client_name, walk_in_client) AS client_name,
+                   created_at, client_id
+            FROM projects
+            ORDER BY project_id DESC
+            LIMIT 500
+        """)
+        rows = cur.fetchall()
+        return [
+            {
+                "project_id":   r[0],
+                "project_no":   r[1],
+                "project_name": r[2],
+                "status":       r[3],
+                "client_name":  r[4],
+                "created_at":   str(r[5]) if r[5] else None,
+                "client_id":    r[6],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ------------------------------
 # CREATE PROJECT
 # ------------------------------
 @router.post("/", response_model=ProjectOut)
