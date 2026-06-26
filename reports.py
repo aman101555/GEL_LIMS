@@ -176,44 +176,44 @@ def search_sample_by_no(sample_no: str):
     """Search for sample by sample number (GS format)"""
     conn = get_connection()
     cur = conn.cursor()
-    
+
     try:
         cur.execute("""
-            SELECT s.sample_id, s.sample_no, s.request_id, s.status,
-                   tr.request_no
+            SELECT
+                s.sample_id,
+                s.sample_no,
+                s.request_id,
+                s.status,
+                tr.request_no,
+                COALESCE(qi.description, 'Unknown') AS test_name,
+                COALESCE(qi.item_code,   'Unknown') AS item_code
             FROM samples s
             JOIN test_requests tr ON s.request_id = tr.test_request_id
+            LEFT JOIN test_request_items tri ON tri.test_request_id = s.request_id
+            LEFT JOIN quotation_items qi     ON qi.item_id = tri.quotation_item_id
             WHERE LOWER(s.sample_no) LIKE LOWER(%s)
             ORDER BY s.created_at DESC
             LIMIT 10
         """, (f"%{sample_no}%",))
-        
-        samples = cur.fetchall()
-        if not samples:
+
+        rows = cur.fetchall()
+        if not rows:
             raise HTTPException(404, "No samples found with that sample number")
-        
-        result = []
-        for sample in samples:
-            sample_id, sample_no, request_id, status, request_no = sample
-            
-            # Get test distribution for this request
-            sample_to_test_map, test_distribution = get_test_distribution_for_request(request_id, cur)
-            
-            # Get which test this sample belongs to
-            test_info = sample_to_test_map.get(sample_id, {})
-            
-            result.append({
-                "sample_id": sample_id,
-                "sample_no": sample_no,
-                "request_id": request_id,
-                "status": status,
-                "request_no": request_no,
-                "test_name": test_info.get("test_name", "Unknown"),
-                "item_code": test_info.get("item_code", "Unknown")
-            })
-        
+
+        result = [
+            {
+                "sample_id":  r[0],
+                "sample_no":  r[1],
+                "request_id": r[2],
+                "status":     r[3],
+                "request_no": r[4],
+                "test_name":  r[5],
+                "item_code":  r[6],
+            }
+            for r in rows
+        ]
         return result
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -231,42 +231,46 @@ def get_latest_samples():
     conn = get_connection()
     cur = conn.cursor()
     try:
+        # Single query — join test info directly, no per-sample loop
         cur.execute("""
-            SELECT s.sample_id, s.sample_no, s.request_id, s.status,
-                   tr.request_no
+            SELECT
+                s.sample_id,
+                s.sample_no,
+                s.request_id,
+                s.status,
+                tr.request_no,
+                COALESCE(qi.description, 'Unknown')  AS test_name,
+                COALESCE(qi.item_code,   'Unknown')  AS item_code
             FROM samples s
             JOIN test_requests tr ON s.request_id = tr.test_request_id
-            WHERE s.sample_no LIKE 'GS%'
+            LEFT JOIN test_request_items tri ON tri.test_request_id = s.request_id
+            LEFT JOIN quotation_items qi     ON qi.item_id = tri.quotation_item_id
+            WHERE s.sample_no LIKE 'GS%%'
             ORDER BY s.sample_id DESC
             LIMIT 10
         """)
-        
-        samples = cur.fetchall()
-        result = []
-        
-        for sample in samples:
-            sample_id, sample_no, request_id, status, request_no = sample
-            
-            # Get test distribution
-            sample_to_test_map, _ = get_test_distribution_for_request(request_id, cur)
-            test_info = sample_to_test_map.get(sample_id, {})
-            
-            result.append({
-                "sample_id": sample_id,
-                "sample_no": sample_no,
-                "request_no": request_no,
-                "test_name": test_info.get("test_name", "Unknown"),
-                "item_code": test_info.get("item_code", "Unknown"),
-                "status": status
-            })
-        
+
+        rows = cur.fetchall()
+        result = [
+            {
+                "sample_id":   r[0],
+                "sample_no":   r[1],
+                "request_id":  r[2],
+                "status":      r[3],
+                "request_no":  r[4],
+                "test_name":   r[5],
+                "item_code":   r[6],
+            }
+            for r in rows
+        ]
         return result
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
         cur.close()
         conn.close()
+
 
 # ---------------------------
 # 3. Get Sample Test Info & Check for Existing Reports
@@ -703,103 +707,81 @@ async def download_report_file_direct(report_id: int):
         cur.close()
         conn.close()
 # ---------------------------
-# 7. Get Reports with Status Filter - UPDATED
+# 7. Get Reports with Status Filter - OPTIMISED
 # ---------------------------
 @router.get("")
 def get_reports(status: Optional[str] = None):
     """Get reports with optional status filter - shows which test type they cover"""
-    print(f"\n" + "="*50)
-    print(f"DEBUG: get_reports called with status={status}")
-    print(f"="*50 + "\n")
-    
     conn = get_connection()
     cur = conn.cursor()
-    
+
     try:
-        # IMPORTANT: Use DISTINCT to get unique report_no entries
+        # Single query: DISTINCT ON deduplicates by report_no, and a lateral
+        # aggregate pulls all covered sample numbers in one pass — no per-row loop.
         query = """
             SELECT DISTINCT ON (r.report_no)
-                r.*, 
+                r.*,
                 s.sample_no,
-                r.covers_test_type as test_name,
+                r.covers_test_type                      AS test_name,
                 COALESCE(
-                    (SELECT qi.item_code 
-                     FROM test_request_items tri 
+                    (SELECT qi.item_code
+                     FROM test_request_items tri
                      JOIN quotation_items qi ON tri.quotation_item_id = qi.item_id
                      JOIN samples s2 ON tri.test_request_id = s2.request_id
-                     WHERE s2.sample_id = r.sample_id 
+                     WHERE s2.sample_id = r.sample_id
                      LIMIT 1),
                     'N/A'
-                ) as item_code,
-                u.username as uploaded_by_username,
-                uc.username as checked_by_username,
-                ua.username as approved_by_username
+                )                                       AS item_code,
+                u.username                              AS uploaded_by_username,
+                uc.username                             AS checked_by_username,
+                ua.username                             AS approved_by_username,
+                -- All sample_nos that share this report_no, as a comma-separated string
+                (
+                    SELECT STRING_AGG(s3.sample_no, ',' ORDER BY s3.sample_no)
+                    FROM reports r3
+                    JOIN samples s3 ON r3.sample_id = s3.sample_id
+                    WHERE r3.report_no = r.report_no
+                )                                       AS covered_samples_csv
             FROM reports r
-            LEFT JOIN samples s ON r.sample_id = s.sample_id
-            LEFT JOIN users u ON r.uploaded_by = u.user_id
-            LEFT JOIN users uc ON r.checked_by = uc.user_id
-            LEFT JOIN users ua ON r.approved_by = ua.user_id
+            LEFT JOIN samples s  ON r.sample_id  = s.sample_id
+            LEFT JOIN users u    ON r.uploaded_by = u.user_id
+            LEFT JOIN users uc   ON r.checked_by  = uc.user_id
+            LEFT JOIN users ua   ON r.approved_by  = ua.user_id
             WHERE 1=1
         """
         params = []
-        
+
         if status and status != "ALL":
             query += " AND r.status = %s"
             params.append(status)
-        
+
         query += " ORDER BY r.report_no, r.created_at DESC"
-        
-        print(f"DEBUG: Executing query:\n{query}")
-        print(f"DEBUG: Query params: {params}")
-        
+
         cur.execute(query, tuple(params))
-        
+
         columns = [desc[0] for desc in cur.description]
-        print(f"DEBUG: Query columns: {columns}")
-        
         all_rows = cur.fetchall()
-        print(f"DEBUG: Fetched {len(all_rows)} rows from database")
-        
+
         reports = []
-        
-        for i, row in enumerate(all_rows):
-            print(f"\nDEBUG: Row {i}: {row}")
+        for row in all_rows:
             report_dict = dict(zip(columns, row))
-            print(f"DEBUG: Report dict: {report_dict.get('report_no')}")
-            
-            # Get all samples covered by this report (same report_no)
-            cur.execute("""
-                SELECT s.sample_no
-                FROM reports r2
-                JOIN samples s ON r2.sample_id = s.sample_id
-                WHERE r2.report_no = %s
-                ORDER BY s.sample_no
-            """, (report_dict["report_no"],))
-            
-            covered_samples = [row[0] for row in cur.fetchall()]
-            print(f"DEBUG: Covered samples for {report_dict.get('report_no')}: {covered_samples}")
-            
-            report_dict["covered_samples"] = covered_samples
-            report_dict["sample_count"] = len(covered_samples)
-            
+            # Convert the CSV string back to a list (or empty list if NULL)
+            csv = report_dict.pop("covered_samples_csv", None)
+            covered = csv.split(",") if csv else []
+            report_dict["covered_samples"] = covered
+            report_dict["sample_count"] = len(covered)
             reports.append(report_dict)
-        
-        print(f"\n" + "="*50)
-        print(f"DEBUG: Returning {len(reports)} reports")
-        print(f"="*50 + "\n")
-        
+
         return reports
-        
+
     except Exception as e:
-        print(f"\n" + "!"*50)
-        print(f"ERROR in get_reports: {str(e)}")
         import traceback
         traceback.print_exc()
-        print(f"!"*50 + "\n")
         raise HTTPException(500, f"Error fetching reports: {str(e)}")
     finally:
         cur.close()
         conn.close()
+
 
 # ---------------------------
 # 8. Get Report by Sample No - UPDATED
