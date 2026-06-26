@@ -105,8 +105,26 @@ class TestRequestExcelGenerator:
             ws['C6'] = project_data.get('lpo_no', '')  # LPO No
             ws['C7'] = test_request_data.get('project_name', '')  # Project Name
             ws['C9'] = client_data.get('address', '') if client_data else ''  # Address
-            ws['C10'] = client_data.get('name', '') if client_data else ''  # Client Name
             ws['C14'] = project_data.get('location', '')  # Location
+
+            # Walk-in vs Non-Walk-in cell mappings
+            is_walk_in = project_data.get('is_walk_in', False)
+            if is_walk_in:
+                # Walk-in LP
+                ws['C8'] = project_data.get('walk_in_client', '')   # Walk-in client name
+                ws['C10'] = project_data.get('client_name', '')     # Client name (project field)
+            else:
+                # Non-walk-in LP
+                ws['C8'] = project_data.get('contractor', '')       # Contractor
+                ws['C10'] = (
+                    project_data.get('client_name', '')             # project.client_name first
+                    or (client_data.get('name', '') if client_data else '')  # fallback to clients.name
+                )
+
+            # Common fields for both project types
+            ws['C11'] = project_data.get('consultant', '')          # Consultant
+            ws['C16'] = test_request_data.get('requested_by', '')   # Requested by
+            ws['F13'] = project_data.get('plot_no', '')             # Plot No
             
             ws['F5'] = test_request_data.get('created_at', '')  # Date
             ws['F6'] = datetime.now().strftime("%H:%M")  # Current Time
@@ -878,7 +896,9 @@ def download_test_request_doc(test_request_id: int):
             SELECT tr.test_request_id, tr.request_no, tr.status, tr.project_id,
                    tr.requested_by, tr.created_at,
                    p.project_no, p.project_name, p.location, p.lpo_no,
-                   p.client_id, p.lpo_date
+                   p.client_id, p.lpo_date,
+                   p.is_walk_in, p.walk_in_client, p.contractor,
+                   p.client_name, p.consultant, p.plot_no
             FROM test_requests tr
             JOIN projects p ON tr.project_id = p.project_id
             WHERE tr.test_request_id = %s
@@ -946,7 +966,13 @@ def download_test_request_doc(test_request_id: int):
             "location": header[8],
             "lpo_no": header[9],
             "client_id": header[10],
-            "lpo_date": header[11].strftime("%d-%m-%Y") if header[11] else ""
+            "lpo_date": header[11].strftime("%d-%m-%Y") if header[11] else "",
+            "is_walk_in": header[12] or False,
+            "walk_in_client": header[13] or "",
+            "contractor": header[14] or "",
+            "client_name": header[15] or "",
+            "consultant": header[16] or "",
+            "plot_no": header[17] or "",
         }
         
         # Generate Excel file using Supabase template
