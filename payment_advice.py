@@ -431,3 +431,142 @@ def get_payment_advice_history(project_id: int):
     finally:
         cur.close()
         conn.close()
+
+
+
+@router.get("/{project_id}/redownload", summary="Redownload the most recent Payment Advice Excel")
+def redownload_payment_advice(project_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # 1. Fetch the most recent PA for this project
+        cur.execute("""
+            SELECT pa_id, pa_no, lp_number, client_name, subtotal, vat, grand_total, pa_date
+            FROM payment_advices
+            WHERE project_id = %s
+            ORDER BY pa_id DESC
+            LIMIT 1
+        """, (project_id,))
+        pa = cur.fetchone()
+        if not pa:
+            raise HTTPException(404, "No Payment Advice found for this project")
+
+        pa_id, pa_no, lp_number, client_name, subtotal, vat, grand_total, pa_date = pa
+
+        # 2. Fetch the items that were on that PA
+        cur.execute("""
+            SELECT item_id, description, test_standard, unit_rate, quantity, amount
+            FROM payment_advice_items
+            WHERE pa_id = %s
+            ORDER BY pa_item_id
+        """, (pa_id,))
+        rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(404, "No items found for this Payment Advice")
+
+        items = [
+            {
+                "item_id": r[0],
+                "description": r[1] or " - ",
+                "test_standard": r[2] or "",
+                "unit_rate": float(r[3]) if r[3] is not None else 0.0,
+                "quantity": r[4] or 0,
+                "amount": float(r[5]) if r[5] is not None else 0.0,
+            }
+            for r in rows
+        ]
+
+        # 3. Fetch project details (for header fields)
+        cur.execute("""
+            SELECT project_no, walk_in_client, project_name, consultant, plot_no, walk_in_phone, client_name
+            FROM projects
+            WHERE project_id = %s AND is_walk_in = TRUE
+        """, (project_id,))
+        proj = cur.fetchone()
+        if not proj:
+            raise HTTPException(404, "Walk-in project not found")
+
+        lp_number_from_db = proj[0]
+        contractor = proj[1] or proj[2] or " - "
+        project_name = proj[2] or contractor
+        consultant = proj[3] or ""
+        plot_no = proj[4] or ""
+        phone = proj[5] or ""
+        client_field = proj[6] or ""
+
+        # 4. Fill the Excel template (copy-paste the same logic as in generate)
+        template_path = _download_template()
+        if not os.path.exists(template_path):
+            raise HTTPException(404, "Payment Advice template not found")
+
+        wb = openpyxl.load_workbook(template_path, data_only=False)
+        ws = wb.active
+
+        # Header fields – use the stored pa_no and pa_date
+        _safe_set(ws, "A5", contractor)
+        _safe_set(ws, "I4", pa_no)                     # use the existing PA number
+        _safe_set(ws, "I5", pa_date.strftime("%d-%b-%Y") if pa_date else datetime.now().strftime("%d-%b-%Y"))
+        _safe_set(ws, "I7", lp_number)                 # use stored LP number
+
+        _safe_set(ws, "B7", phone)
+        _safe_set(ws, "C11", consultant)
+        _safe_set(ws, "C12", client_field)
+        _safe_set(ws, "C13", plot_no)
+        _safe_set(ws, "C15", project_name)
+
+        # Clear existing item rows
+        for row in range(FIRST_ITEM_ROW, LAST_TEMPLATE_ITEM_ROW + 1):
+            for col in ['D', 'I', 'J', 'K']:
+                _safe_set(ws, f"{col}{row}", None)
+
+        # Fill item rows with stored data – use the exact amounts
+        for index, item in enumerate(items):
+            row = FIRST_ITEM_ROW + index
+            _safe_set(ws, f"D{row}", item["description"])
+            _safe_set(ws, f"I{row}", item["quantity"])
+            _safe_set(ws, f"J{row}", item["unit_rate"])
+            _safe_set(ws, f"K{row}", f'=IF(I{row}="","",(I{row}*J{row}))')
+
+        # Fill unused rows with formula
+        for row in range(FIRST_ITEM_ROW, SUM_RANGE_END_ROW + 1):
+            if row > FIRST_ITEM_ROW + len(items) - 1:
+                _safe_set(ws, f"K{row}", f'=IF(I{row}="","",(I{row}*J{row}))')
+
+        # Totals
+        _safe_set(ws, f"K{SUBTOTAL_ROW}", f"=SUM(K{FIRST_ITEM_ROW}:K{SUM_RANGE_END_ROW})")
+        _safe_set(ws, f"K{VAT_ROW}", f"=K{SUBTOTAL_ROW}*5%")
+        _safe_set(ws, f"K{GRAND_TOTAL_ROW}", f"=K{SUBTOTAL_ROW}+K{VAT_ROW}")
+        _safe_set(ws, f"C{WORDS_ROW}", number_to_words(grand_total))
+
+        # 5. Save the file
+        output_dir = "generated_payment_advices"
+        os.makedirs(output_dir, exist_ok=True)
+
+        pa_no_hyphen = pa_no.replace('/', '-')
+        clean_client = _clean_filename(contractor)
+        download_filename = f"PA-{pa_no_hyphen}-{clean_client}.xlsx"
+        output_path = os.path.join(output_dir, f"{pa_no_hyphen}.xlsx")
+        wb.save(output_path)
+
+        # 6. Return the file
+        import urllib.parse
+        encoded_filename = urllib.parse.quote(download_filename)
+
+        return FileResponse(
+            output_path,
+            filename=download_filename,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}; filename=\"{download_filename}\""
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR in redownload_payment_advice: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error regenerating Payment Advice: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
