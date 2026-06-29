@@ -893,27 +893,15 @@ def delete_invoice(invoice_id: int):
 @router.get("/projects/latest/")
 def get_latest_projects():
     """
-    Get the latest 10 projects with complete info for invoice creation
-    Returns: Array of project objects with details
+    Get the latest 10 projects with complete info for invoice creation.
+    Returns: Array of project objects with details.
     """
     conn = get_connection()
     cur = conn.cursor()
-    
+
     try:
-        # Enhanced query with more details.
-        #
-        # NOTE: walk-in projects (is_walk_in = TRUE) have client_id = NULL and
-        # only get a quotation_id once an LPO has been generated (see
-        # walkin.py / create_lpo). The previous version of this query used
-        # INNER JOINs on both `clients` and `quotations`, which silently
-        # dropped every walk-in row from the result — that's why walk-in LPs
-        # never showed up in Generate Invoices. Switched to LEFT JOINs and
-        # fall back to the walk-in columns (client_name / walk_in_client)
-        # for display info. Walk-ins still need an LPO (quotation_id set)
-        # before they're invoiceable, so those are filtered separately
-        # instead of relying on the join to do it implicitly.
         cur.execute("""
-            SELECT 
+            SELECT
                 p.project_id,
                 p.project_name,
                 p.project_no,
@@ -929,30 +917,91 @@ def get_latest_projects():
             ORDER BY p.project_id DESC
             LIMIT 10
         """)
-        
-        # Format response
+
         projects = []
         for row in cur.fetchall():
             project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in = row
-            
-            # Create display label for dropdown
             display_label = f"{project_no} - {project_name} ({client_name})"
-            
             projects.append({
                 "project_id": project_id,
-                "project_name": display_label,  # Combined display text
+                "project_name": display_label,
                 "project_no": project_no,
-                "project_name_raw": project_name,  # Original project name
+                "project_name_raw": project_name,
                 "client_name": client_name,
                 "location": location,
                 "quotation_no": quotation_no,
                 "is_walk_in": bool(is_walk_in),
-                "value": project_id,  # For dropdown value
-                "label": display_label  # For dropdown label
+                "value": project_id,
+                "label": display_label,
             })
-        
+
         return projects
-        
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.get("/projects/search/")
+def search_projects(q: str = ""):
+    """
+    Search projects by Plot Number (project_no) or LP number.
+    Supports partial, case-insensitive matching.
+    Returns up to 20 matching projects.
+    Used by the Generate Invoices search feature.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        term = f"%{q.strip()}%"
+        limit_clause = "LIMIT 20" if q.strip() else ""
+        cur.execute(f"""
+            SELECT
+                p.project_id,
+                p.project_name,
+                p.project_no,
+                COALESCE(c.name, p.client_name, p.walk_in_client) as client_name,
+                p.location,
+                q.quotation_no,
+                p.is_walk_in
+            FROM projects p
+            LEFT JOIN clients c ON p.client_id = c.client_id
+            LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
+            WHERE (
+                p.is_walk_in IS NOT TRUE
+                OR (p.is_walk_in = TRUE AND p.quotation_id IS NOT NULL AND p.project_no != 'PENDING')
+            )
+            AND (
+                p.project_no ILIKE %s
+                OR p.project_name ILIKE %s
+                OR COALESCE(c.name, p.client_name, p.walk_in_client) ILIKE %s
+            )
+            ORDER BY p.project_id DESC
+            {limit_clause}
+        """, (term, term, term))
+
+        projects = []
+        for row in cur.fetchall():
+            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in = row
+            display_label = f"{project_no} - {project_name} ({client_name})"
+            projects.append({
+                "project_id": project_id,
+                "project_name": display_label,
+                "project_no": project_no,
+                "project_name_raw": project_name,
+                "client_name": client_name,
+                "location": location,
+                "quotation_no": quotation_no,
+                "is_walk_in": bool(is_walk_in),
+                "value": project_id,
+                "label": display_label,
+            })
+
+        return projects
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -4189,6 +4238,135 @@ def regenerate_invoice_excel(invoice_id: int):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, f"Error regenerating invoice: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD THIS ENDPOINT to invoices.py, right after the /projects/latest/ endpoint
+# (around line 961 in the original file).
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/projects/{project_id}/reports-invoiced-status")
+def get_project_reports_invoiced_status(project_id: int):
+    """
+    Returns all reports for a project (Approved + Pending), each with an
+    is_invoiced flag.  Walk-in projects are detected early and a dedicated
+    response is returned so the frontend can display the correct notice.
+
+    Used by ViewReports > "Reports by LP" section.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+
+    try:
+        # ── 1. Fetch project basics ───────────────────────────────────────────
+        cur.execute("""
+            SELECT p.project_id, p.project_no, p.project_name,
+                   p.is_walk_in,
+                   COALESCE(c.name, p.client_name, p.walk_in_client) AS client_name,
+                   p.location
+            FROM   projects p
+            LEFT JOIN clients c ON p.client_id = c.client_id
+            WHERE  p.project_id = %s
+        """, (project_id,))
+
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        (proj_id, project_no, project_name,
+         is_walk_in, client_name, location) = row
+
+        # ── 2. Walk-in early-return ───────────────────────────────────────────
+        if is_walk_in:
+            return {
+                "project_id":   proj_id,
+                "project_no":   project_no,
+                "project_name": project_name,
+                "client_name":  client_name,
+                "location":     location,
+                "is_walk_in":   True,
+                "reports":      [],
+                "total_reports": 0,
+            }
+
+        # ── 3. All reports (Approved + Pending) ──────────────────────────────
+        cur.execute("""
+            SELECT DISTINCT ON (r.report_no)
+                r.report_id,
+                r.report_no,
+                r.status,
+                r.created_at,
+                r.covers_test_type   AS test_name,
+                r.covers_samples,
+                COALESCE(array_length(r.covers_samples, 1), 1) AS sample_count,
+                EXISTS (
+                    SELECT 1
+                    FROM   invoice_report_links irl
+                    WHERE  irl.report_no   = r.report_no
+                    AND    irl.invoice_type = 'PROFORMA'
+                ) AS is_invoiced
+            FROM   reports r
+            JOIN   samples      s  ON r.sample_id   = s.sample_id
+            JOIN   test_requests tr ON s.request_id  = tr.test_request_id
+            WHERE  tr.project_id = %s
+            AND    r.status IN ('APPROVED', 'UNDER_REVIEW', 'DRAFT')
+            ORDER  BY r.report_no, r.created_at DESC
+        """, (project_id,))
+
+        rows = cur.fetchall()
+
+        reports = []
+        for row in rows:
+            (report_id, report_no, status, created_at,
+             test_name, covers_samples, sample_count, is_invoiced) = row
+
+            # Resolve sample list
+            if covers_samples:
+                sample_nos = list(covers_samples)
+            else:
+                cur.execute(
+                    "SELECT sample_no FROM samples WHERE sample_id = "
+                    "(SELECT sample_id FROM reports WHERE report_id = %s LIMIT 1)",
+                    (report_id,)
+                )
+                srow = cur.fetchone()
+                sample_nos   = [srow[0]] if srow else []
+                sample_count = len(sample_nos)
+
+            reports.append({
+                "report_id":     report_id,
+                "report_no":     report_no,
+                "status":        status,
+                "created_date":  created_at.strftime("%Y-%m-%d") if created_at else None,
+                "test_name":     test_name or "Test Report",
+                "sample_count":  sample_count,
+                "covers_samples": sample_nos,
+                "is_invoiced":   bool(is_invoiced),
+            })
+
+        return {
+            "project_id":    proj_id,
+            "project_no":    project_no,
+            "project_name":  project_name,
+            "client_name":   client_name,
+            "location":      location,
+            "is_walk_in":    False,
+            "total_reports": len(reports),
+            "reports":       reports,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to fetch project reports: {str(e)}")
     finally:
         cur.close()
         conn.close()
