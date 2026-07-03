@@ -434,6 +434,53 @@ def get_payment_advice_history(project_id: int):
 
 
 
+# ─── 3b. Dashboard widget: latest PAs that have not been invoiced yet ─────────
+#
+# A PA is considered "pending" when its project has no row in `invoices` at
+# all yet. This matches the walk-in workflow: PA -> Generate Invoice (once).
+# NOTE: if a project can legitimately receive a second PA + a second, separate
+# invoice later on (e.g. additional tests added after the first invoice was
+# already generated), this simple NOT EXISTS check will stop flagging that
+# project as pending after the first invoice — so a second, genuinely-pending
+# PA on the same project wouldn't show up here. Flag this to Aman if that
+# scenario comes up; it would need per-item/PA invoice linkage to handle.
+@router.get("/pending-invoices", summary="List latest Payment Advices that have not yet been invoiced")
+def list_pending_pa_invoices(limit: int = 5):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT pa.pa_id, pa.pa_no, pa.lp_number, pa.project_id,
+                   pa.client_name, pa.grand_total, pa.created_at, p.is_walk_in
+            FROM payment_advices pa
+            JOIN projects p ON p.project_id = pa.project_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM invoices i WHERE i.project_id = pa.project_id
+            )
+            ORDER BY pa.created_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        return [
+            {
+                "pa_id": r[0],
+                "pa_no": r[1],
+                "lp_number": r[2],
+                "project_id": r[3],
+                "client_name": r[4],
+                "grand_total": float(r[5]) if r[5] is not None else 0.0,
+                "created_at": str(r[6]) if r[6] else None,
+                "is_walk_in": bool(r[7]),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
 @router.get("/{project_id}/redownload", summary="Redownload the most recent Payment Advice Excel")
 def redownload_payment_advice(project_id: int):
     conn = get_connection()
