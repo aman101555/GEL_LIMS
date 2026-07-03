@@ -108,9 +108,9 @@ class LPNumberUpdate(BaseModel):
 
 # ─── Helper: generate LP number (identical logic to projects.py) ──────────────
 
-def _generate_lp_number(cur) -> str:
+def _generate_lp_number(cur, division: str = None) -> str:
     """
-    Picks the next LP number as (highest LP number ever issued) + 1.
+    Picks the next LP/GSL number as (highest LP/GSL number ever issued) + 1.
 
     Previously this looked at the LATEST-CREATED row that happened to have
     an LP-style project_no (ORDER BY project_id DESC LIMIT 1). That breaks
@@ -121,27 +121,31 @@ def _generate_lp_number(cur) -> str:
     `quotations`, causing:
         duplicate key value violates unique constraint "quotations_quotation_no_key"
 
-    Fix: take the MAX numeric LP value across BOTH `projects.project_no`
+    Fix: take the MAX numeric LP/GSL value across BOTH `projects.project_no`
     AND `quotations.quotation_no` (the latter never gets deleted), so a
     number can never be reissued once it's been used anywhere.
+
+    GEO division walk-ins get the "GSL" prefix instead of "LP", but they
+    share the SAME running counter as LP (e.g. ...LP/16732, GSL/16733...).
     """
     year_last_two = datetime.utcnow().strftime("%y")
 
     cur.execute(r"""
         SELECT MAX(num) FROM (
-            SELECT (regexp_match(project_no, '^LP/(\d+)/'))[1]::int AS num
+            SELECT (regexp_match(project_no, '^(?:LP|GSL)/(\d+)/'))[1]::int AS num
             FROM projects
-            WHERE project_no ~ '^LP/\d+/'
+            WHERE project_no ~ '^(?:LP|GSL)/\d+/'
             UNION ALL
-            SELECT (regexp_match(quotation_no, '^WALKIN-LP/(\d+)/'))[1]::int AS num
+            SELECT (regexp_match(quotation_no, '^WALKIN-(?:LP|GSL)/(\d+)/'))[1]::int AS num
             FROM quotations
-            WHERE quotation_no ~ '^WALKIN-LP/\d+/'
+            WHERE quotation_no ~ '^WALKIN-(?:LP|GSL)/\d+/'
         ) all_numbers
     """)
     max_existing = cur.fetchone()[0]
     next_number = (max_existing + 1) if max_existing else 16732
 
-    return f"LP/{next_number}/{year_last_two}/DXB"
+    prefix = "GSL" if division == "GEO" else "LP"
+    return f"{prefix}/{next_number}/{year_last_two}/DXB"
 
 
 # ─── Helper: recalculate totals on the project row ────────────────────────────
@@ -558,8 +562,8 @@ def create_lpo(project_id: int):
         if item_count == 0:
             raise HTTPException(400, "No tests added. Add at least one test before generating LPO.")
 
-        # Generate LP number
-        lp_number = _generate_lp_number(cur)
+        # Generate LP/GSL number (GEO division walk-ins get "GSL" instead of "LP")
+        lp_number = _generate_lp_number(cur, division)
         
         # Create quotation
         cur.execute("""
@@ -572,13 +576,19 @@ def create_lpo(project_id: int):
         # Copy items from walk_in_items to quotation_items (amount is generated)
         _copy_walkin_items_to_quotation(cur, project_id, quotation_id)
 
-        # Update project with LP number and quotation_id
+        # Update project with LP number and quotation_id.
+        # Walk-ins are auto-verified: there's no separate LPO document to
+        # review (the walk-in itself IS the confirmed order), so this skips
+        # the manual "Verify LPO" gate and lets the LP go straight to Test
+        # Requests, same as if someone had clicked Verify.
         cur.execute("""
             UPDATE projects
             SET project_no = %s,
                 status = 'ACTIVE',
                 lpo_date = CURRENT_DATE,
-                quotation_id = %s
+                quotation_id = %s,
+                lpo_verified = TRUE,
+                lpo_verified_at = NOW()
             WHERE project_id = %s
         """, (lp_number, quotation_id, project_id))
         
