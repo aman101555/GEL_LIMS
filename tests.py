@@ -50,6 +50,48 @@ def download_test_request_template_from_supabase(template_url: str = None):
         raise
 
 
+# ---------------------------
+# Template Type Config
+# ---------------------------
+TEMPLATE_TYPES = {
+    "soil": {
+        "label": "Soil",
+        "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/ST_Test_Request.xlsx",
+        "generator": "soil",
+    },
+    "concrete": {
+        "label": "Concrete (General)",
+        "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/ConcreteG_Test_Request.xlsx",
+        "generator": "concrete",
+    },
+    "concrete_cube": {
+        "label": "Concrete Cube",
+        "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/ConcreteCube_Test_Request.xlsx",
+        "generator": "concrete",  # Same layout as concrete
+    },
+    "in_situ": {
+        "label": "In-Situ",
+        "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/InSitu_Test_Request.xlsx",
+        "generator": "concrete",  # Same layout as concrete
+    },
+    "steel": {
+        "label": "Steel",
+        "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/Steel_Test_Request.xlsx",
+        "generator": "concrete",  # Same layout as concrete
+    },
+    "water": {
+        "label": "Water",
+        "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/Water_Test_Request.xlsx",
+        "generator": "concrete",  # Same layout as concrete
+    },
+    "aggregates": {
+        "label": "Aggregates",
+        "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/Aggregates_Test_Request.xlsx",
+        "generator": "concrete",  # Same layout as concrete
+    },
+}
+
+
 class TestRequestExcelGenerator:
     def __init__(self, template_source=None, template_url=None):
         """
@@ -160,12 +202,130 @@ class TestRequestExcelGenerator:
             raise Exception(f"Error generating Excel: {str(e)}")
 
 
+class ConcreteTestRequestExcelGenerator:
+    """
+    Excel generator for Concrete (General), Concrete Cube, In-Situ, Steel, Water, Aggregates templates.
+    All share the same cell layout — only the template file differs.
+    """
+    def __init__(self, template_url: str):
+        print(f"DEBUG: Downloading concrete-layout template from: {template_url}")
+        self.template_source = download_test_request_template_from_supabase(template_url)
+
+    def generate_excel(self, test_request_data, project_data, client_data, items):
+        """
+        Fill the concrete-layout Excel template with test request data.
+
+        Common cells (both walk-in and non-walk-in):
+          C5  → request_no
+          C6  → lpo_no
+          C11 → project_name
+          C8  → client address
+          C10 → consultant
+          C44 → requested_by
+          C13 → plot_no + ", " + location
+          H7  → created_at + " " + HH:MM
+          C12 → project_no
+
+        Walk-in specifics:
+          C7  → walk_in_client
+          C9  → client_name (project field)
+
+        Non-walk-in specifics:
+          C7  → contractor
+          C9  → client_name (project) or client_data name
+
+        Item table starts at row 23:
+          A{row} → serial index
+          B{row} → description
+          D{row} → test_standard
+          G{row} → sample name (description reused as sample ref)
+          I{row} → quantity
+        """
+        try:
+            self.template_source.seek(0)
+            wb = load_workbook(self.template_source)
+            ws = wb.active
+
+            # ── Common header cells ──────────────────────────────────────────
+            ws['C5'] = test_request_data.get('request_no', '')
+            ws['C6'] = project_data.get('lpo_no', '')
+            ws['C11'] = test_request_data.get('project_name', '')
+            ws['C8'] = client_data.get('address', '') if client_data else ''
+            ws['C10'] = project_data.get('consultant', '')
+            ws['C44'] = test_request_data.get('requested_by', '')
+
+            plot_no = project_data.get('plot_no', '')
+            location = project_data.get('location', '')
+            ws['C13'] = f"{plot_no}, {location}".strip(', ') if (plot_no or location) else ''
+
+            created_at = test_request_data.get('created_at', '')
+            ws['H7'] = f"{created_at} {datetime.now().strftime('%H:%M')}".strip()
+            ws['C12'] = test_request_data.get('project_no', '')
+
+            # ── Walk-in / Non-walk-in ────────────────────────────────────────
+            is_walk_in = project_data.get('is_walk_in', False)
+            if is_walk_in:
+                ws['C7'] = project_data.get('walk_in_client', '')
+                ws['C9'] = project_data.get('client_name', '')
+            else:
+                ws['C7'] = project_data.get('contractor', '')
+                ws['C9'] = (
+                    project_data.get('client_name', '')
+                    or (client_data.get('name', '') if client_data else '')
+                )
+
+            # ── Test items table (starts at row 23) ─────────────────────────
+            start_row = 23
+            for index, item in enumerate(items, 1):
+                row = start_row + index - 1
+                ws[f'A{row}'] = index
+                ws[f'B{row}'] = item.get('description', '')
+                ws[f'D{row}'] = item.get('test_standard', '')
+                ws[f'G{row}'] = item.get('description', '')   # sample name/number
+                ws[f'I{row}'] = item.get('quantity', 1)
+
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                temp_file_path = tmp.name
+                wb.save(temp_file_path)
+
+            return temp_file_path
+
+        except Exception as e:
+            raise Exception(f"Error generating Concrete Excel: {str(e)}")
+
+
+def get_excel_generator(template_type: str):
+    """
+    Return the correct generator instance for the given template_type key.
+    Falls back to soil (default) if the key is unknown.
+    """
+    config = TEMPLATE_TYPES.get(template_type, TEMPLATE_TYPES["soil"])
+    url = config["url"]
+    generator_kind = config["generator"]
+
+    if generator_kind == "concrete":
+        return ConcreteTestRequestExcelGenerator(template_url=url)
+    else:
+        # soil (default)
+        return TestRequestExcelGenerator(template_url=url)
+
+
 # ---------------------------
 # Pydantic Models
 # ---------------------------
+# ---------------------------
+# REQUIRED ONE-TIME DB MIGRATION
+# ---------------------------
+# This fix stores the selected template on the test request itself so the
+# correct one can be regenerated later from "View Test Requests". Run once:
+#
+#   ALTER TABLE test_requests
+#     ADD COLUMN template_type VARCHAR(32) NOT NULL DEFAULT 'soil';
+#
 class TestRequestCreate(BaseModel):
     project_id: int
     requested_by: Optional[str] = None
+    template_type: Optional[str] = "soil"
 
 class TestRequestItemAdd(BaseModel):
     quotation_item_id: int   # Index (1,2,3)
@@ -225,7 +385,8 @@ def get_all_test_requests():
                 tr.created_at,
                 p.project_id,
                 p.project_no,
-                p.project_name
+                p.project_name,
+                tr.template_type
             FROM test_requests tr
             JOIN projects p ON tr.project_id = p.project_id
             ORDER BY tr.created_at DESC
@@ -240,7 +401,8 @@ def get_all_test_requests():
                 "created_at": row[4],
                 "project_id": row[5],
                 "project_no": row[6],
-                "project_name": row[7]
+                "project_name": row[7],
+                "template_type": row[8] or "soil"
             }
             for row in cur.fetchall()
         ]
@@ -263,17 +425,33 @@ def create_test_request(payload: TestRequestCreate):
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT project_id FROM projects WHERE project_id = %s", (payload.project_id,))
-        if cur.fetchone() is None:
+        cur.execute(
+            "SELECT project_id, lpo_verified FROM projects WHERE project_id = %s",
+            (payload.project_id,)
+        )
+        project_row = cur.fetchone()
+        if project_row is None:
             raise HTTPException(404, "Project not found")
+
+        if not project_row[1]:
+            raise HTTPException(
+                400,
+                "The LPO and quotation must be reviewed and verified for accuracy "
+                "before Test Requests can be created for this project."
+            )
 
         request_no = generate_request_no(cur)
 
+        # Fall back to "soil" if an unrecognized/empty template_type slips through
+        template_type = payload.template_type or "soil"
+        if template_type not in TEMPLATE_TYPES:
+            template_type = "soil"
+
         cur.execute("""
-            INSERT INTO test_requests (project_id, request_no, requested_by, status)
-            VALUES (%s, %s, %s, 'PENDING_SAMPLES')
+            INSERT INTO test_requests (project_id, request_no, requested_by, status, template_type)
+            VALUES (%s, %s, %s, 'PENDING_SAMPLES', %s)
             RETURNING test_request_id
-        """, (payload.project_id, request_no, payload.requested_by))
+        """, (payload.project_id, request_no, payload.requested_by, template_type))
 
         req_id = cur.fetchone()[0]
         conn.commit()
@@ -281,7 +459,8 @@ def create_test_request(payload: TestRequestCreate):
         return {
             "message": "Test request created",
             "test_request_id": req_id,
-            "request_no": request_no
+            "request_no": request_no,
+            "template_type": template_type
         }
 
     except Exception as e:
@@ -600,7 +779,7 @@ def get_test_request(test_request_id: int):
         cur.execute("""
             SELECT tr.test_request_id, tr.request_no, tr.status, tr.project_id,
                    tr.requested_by, tr.created_at,
-                   p.project_no, p.project_name
+                   p.project_no, p.project_name, tr.template_type
             FROM test_requests tr
             JOIN projects p ON tr.project_id = p.project_id
             WHERE tr.test_request_id = %s
@@ -643,6 +822,7 @@ def get_test_request(test_request_id: int):
             "created_at": header[5],
             "project_no": header[6],
             "project_name": header[7],
+            "template_type": header[8] or "soil",
             "items": items
         }
 
@@ -884,9 +1064,23 @@ def get_test_reports_for_project(project_id: int):
         conn.close()
 
 
+@router.get("/template-types")
+def get_template_types():
+    """Return the list of available test request template types."""
+    return [
+        {"key": key, "label": val["label"]}
+        for key, val in TEMPLATE_TYPES.items()
+    ]
+
+
 @router.get("/{test_request_id}/download-doc")
-def download_test_request_doc(test_request_id: int):
-    """Download test request as Excel document (replaces Word)"""
+def download_test_request_doc(test_request_id: int, template_type: Optional[str] = None):
+    """Download test request as Excel document (replaces Word).
+
+    If template_type isn't explicitly passed in the query string, the template
+    that was selected when this specific test request was created is used
+    (falls back to "soil" only if nothing was ever stored for it).
+    """
     conn = get_connection()
     cur = conn.cursor()
     
@@ -898,7 +1092,8 @@ def download_test_request_doc(test_request_id: int):
                    p.project_no, p.project_name, p.location, p.lpo_no,
                    p.client_id, p.lpo_date,
                    p.is_walk_in, p.walk_in_client, p.contractor,
-                   p.client_name, p.consultant, p.plot_no
+                   p.client_name, p.consultant, p.plot_no,
+                   tr.template_type
             FROM test_requests tr
             JOIN projects p ON tr.project_id = p.project_id
             WHERE tr.test_request_id = %s
@@ -907,6 +1102,11 @@ def download_test_request_doc(test_request_id: int):
         header = cur.fetchone()
         if not header:
             raise HTTPException(404, "Test request not found")
+
+        # Use the explicit query param if given, otherwise fall back to the
+        # template_type that was stored for this test request at creation time.
+        if not template_type:
+            template_type = header[18] or "soil"
         
         # Fetch client details
         client_id = header[10]  # client_id from projects
@@ -975,9 +1175,8 @@ def download_test_request_doc(test_request_id: int):
             "plot_no": header[17] or "",
         }
         
-        # Generate Excel file using Supabase template
-        # The TestRequestExcelGenerator will download the template from Supabase by default
-        excel_generator = TestRequestExcelGenerator()
+        # Generate Excel file using the selected template type
+        excel_generator = get_excel_generator(template_type)
         temp_file = excel_generator.generate_excel(test_request_data, project_data, client_data, items)
         
         # Create filename with request number
@@ -1006,14 +1205,16 @@ def get_projects_with_remaining_tests():
     cur = conn.cursor()
 
     try:
-        # Get all active projects
+        # Get all active projects whose LPO + quotation have been reviewed/verified.
+        # Projects still pending verification are intentionally excluded here so
+        # they can't be used to raise Test Requests until confirmed accurate.
         cur.execute("""
             SELECT p.project_id, p.project_no, p.project_name, p.status,
                    q.quotation_id, COUNT(qi.item_id) as total_tests
             FROM projects p
             JOIN quotations q ON p.quotation_id = q.quotation_id
             JOIN quotation_items qi ON q.quotation_id = qi.quotation_id
-            WHERE p.status = 'ACTIVE'
+            WHERE p.status = 'ACTIVE' AND p.lpo_verified = TRUE
             GROUP BY p.project_id, p.project_no, p.project_name, p.status, q.quotation_id
             ORDER BY p.project_id DESC
         """)
