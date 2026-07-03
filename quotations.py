@@ -111,6 +111,7 @@ class ItemUpdate(BaseModel):
     unit_rate: Optional[float] = None
     test_standard: Optional[str] = None
     net_unit: Optional[str] = None
+    description: Optional[str] = None
 
 # ============================================================
 # Generate Quotation Number
@@ -1055,7 +1056,7 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
             raise HTTPException(400, "Only DRAFT or APPROVED quotations can be modified")
 
         cur.execute("""
-            SELECT item_id, unit_rate, quantity, test_standard, net_unit
+            SELECT item_id, unit_rate, quantity, test_standard, net_unit, description
             FROM quotation_items
             WHERE quotation_id = %s
             ORDER BY item_id
@@ -1067,12 +1068,13 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
         if not item:
             raise HTTPException(404, "Item not found")
 
-        item_id, current_unit_rate, current_quantity, current_test_standard, current_net_unit = item
+        item_id, current_unit_rate, current_quantity, current_test_standard, current_net_unit, current_description = item
 
         quantity = payload.quantity
         unit_rate = payload.unit_rate
         test_standard = payload.test_standard
         net_unit = payload.net_unit
+        description = payload.description
 
         update_field = None
         new_value = None
@@ -1098,8 +1100,12 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
             update_field = 'net_unit'
             new_value = net_unit
             current_value = current_net_unit
+        elif description is not None:
+            update_field = 'description'
+            new_value = description
+            current_value = current_description
         else:
-            raise HTTPException(400, "Must provide quantity, unit_rate, test_standard, or net_unit")
+            raise HTTPException(400, "Must provide quantity, unit_rate, test_standard, net_unit, or description")
 
         if update_field == 'quantity':
             cur.execute("""
@@ -1116,6 +1122,10 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
         elif update_field == 'net_unit':
             cur.execute("""
                 UPDATE quotation_items SET net_unit = %s WHERE item_id = %s RETURNING amount
+            """, (new_value, item_id))
+        elif update_field == 'description':
+            cur.execute("""
+                UPDATE quotation_items SET description = %s WHERE item_id = %s RETURNING amount
             """, (new_value, item_id))
 
         updated_amount = cur.fetchone()[0]
@@ -1154,8 +1164,8 @@ def update_item(quotation_id: int, item_index: int, payload: ItemUpdate):
             "message": f"Item {update_field} updated",
             "item_id": item_id,
             "update_field": update_field,
-            "old_value": current_value if update_field not in ('test_standard', 'net_unit') else str(current_value or ''),
-            "new_value": new_value if update_field not in ('test_standard', 'net_unit') else str(new_value or ''),
+            "old_value": current_value if update_field not in ('test_standard', 'net_unit', 'description') else str(current_value or ''),
+            "new_value": new_value if update_field not in ('test_standard', 'net_unit', 'description') else str(new_value or ''),
             "new_amount": float(updated_amount) if update_field in ['quantity', 'unit_rate'] else None,
             "totals": {
                 "total_amount": total_amount,
