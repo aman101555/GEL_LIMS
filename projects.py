@@ -22,6 +22,11 @@ router = APIRouter(prefix="/projects", tags=["Projects"])
 # ALTER TABLE projects
 #     ADD COLUMN IF NOT EXISTS contractor TEXT,
 #     ADD COLUMN IF NOT EXISTS phone_no   TEXT;
+#
+# DB migration (run once) — LPO/quotation verification gate:
+# ALTER TABLE projects
+#     ADD COLUMN IF NOT EXISTS lpo_verified    BOOLEAN NOT NULL DEFAULT FALSE,
+#     ADD COLUMN IF NOT EXISTS lpo_verified_at TIMESTAMP;
 
 BUCKET_NAME = "projects"  # Supabase bucket name
 
@@ -57,11 +62,17 @@ class ProjectOut(BaseModel):
     plot_no: Optional[str] = None
     contractor: Optional[str] = None
     phone_no: Optional[str] = None
+    lpo_verified: bool = False
+    lpo_verified_at: Optional[str] = None
 
 
 class ProjectStatusUpdate(BaseModel):
     status: str
     halted_date: Optional[str] = None
+
+
+class LpoVerifyPayload(BaseModel):
+    verified: bool = True
 
 
 # ------------------------------
@@ -110,7 +121,8 @@ def list_projects(limit: int = 100, offset: int = 0):
                    p.project_name, p.location, p.lpo_no, p.lpo_date,
                    p.division, p.status, p.created_at,
                    q.quotation_no, COALESCE(c.name, p.client_name) as client_name, p.lpo_file,
-                   p.consultant, p.plot_no, p.contractor, p.phone_no
+                   p.consultant, p.plot_no, p.contractor, p.phone_no,
+                   p.lpo_verified, p.lpo_verified_at
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
@@ -141,6 +153,8 @@ def list_projects(limit: int = 100, offset: int = 0):
                 "plot_no": r[15],
                 "contractor": r[16],
                 "phone_no": r[17],
+                "lpo_verified": bool(r[18]),
+                "lpo_verified_at": str(r[19]) if r[19] else None,
             }
             for r in rows
         ]
@@ -218,25 +232,29 @@ def create_project(payload: ProjectCreate):
         project_name = payload.project_name if payload.project_name != "string" else enquiry_project_name
         location = payload.location if payload.location != "string" else enquiry_location
 
-        # Picks (highest LP number ever issued) + 1, checking both
-        # `projects.project_no` and walk-in `quotations.quotation_no`
+        # Picks (highest LP/GSL number ever issued) + 1, checking both
+        # `projects.project_no` and walk-in `quotations.quotation_no`.
+        # LP and GSL share ONE running counter — GEO division projects get
+        # the "GSL" prefix instead of "LP", but the number keeps counting
+        # up from the same shared sequence (e.g. ...LP/16732, GSL/16733...).
         year_last_two = datetime.utcnow().strftime("%y")
 
         cur.execute(r"""
             SELECT MAX(num) FROM (
-                SELECT (regexp_match(project_no, '^LP/(\d+)/'))[1]::int AS num
+                SELECT (regexp_match(project_no, '^(?:LP|GSL)/(\d+)/'))[1]::int AS num
                 FROM projects
-                WHERE project_no ~ '^LP/\d+/'
+                WHERE project_no ~ '^(?:LP|GSL)/\d+/'
                 UNION ALL
-                SELECT (regexp_match(quotation_no, '^WALKIN-LP/(\d+)/'))[1]::int AS num
+                SELECT (regexp_match(quotation_no, '^WALKIN-(?:LP|GSL)/(\d+)/'))[1]::int AS num
                 FROM quotations
-                WHERE quotation_no ~ '^WALKIN-LP/\d+/'
+                WHERE quotation_no ~ '^WALKIN-(?:LP|GSL)/\d+/'
             ) all_numbers
         """)
         max_existing = cur.fetchone()[0]
         next_number = (max_existing + 1) if max_existing else 16732
 
-        project_no = f"LP/{next_number}/{year_last_two}/DXB"
+        prefix = "GSL" if division == "GEO" else "LP"
+        project_no = f"{prefix}/{next_number}/{year_last_two}/DXB"
 
         lpo_date = None
         if payload.lpo_date and payload.lpo_date != "string":
@@ -312,7 +330,8 @@ def get_project_details(project_id: int):
                    c.address as client_address,
                    c.contact_person as client_contact_person,
                    p.consultant, p.plot_no, p.contractor, p.phone_no,
-                   p.is_walk_in, p.walk_in_client, p.walk_in_phone, p.walk_in_email
+                   p.is_walk_in, p.walk_in_client, p.walk_in_phone, p.walk_in_email,
+                   p.lpo_verified, p.lpo_verified_at
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
@@ -361,6 +380,8 @@ def get_project_details(project_id: int):
             "walk_in_client":        row[21],
             "walk_in_phone":         row[22],
             "walk_in_email":         row[23],
+            "lpo_verified":          bool(row[24]),
+            "lpo_verified_at":       str(row[25]) if row[25] else None,
         }
 
     except Exception as e:
@@ -470,9 +491,12 @@ async def upload_lpo_file(project_id: int, file: UploadFile = File(...)):
 
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{new_cloud_path}"
 
+        # Any new LPO file invalidates a prior verification — force re-review
         cur.execute("""
             UPDATE projects
-            SET lpo_file = %s
+            SET lpo_file = %s,
+                lpo_verified = FALSE,
+                lpo_verified_at = NULL
             WHERE project_id = %s
         """, (public_url, project_id))
 
@@ -515,6 +539,57 @@ def download_lpo(project_id: int):
         return {"download_url": row[0]}
 
     except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ------------------------------
+# CONFIRM LPO + QUOTATION REVIEWED (gate before Test Requests)
+# ------------------------------
+@router.patch("/{project_id}/verify-lpo", summary="Confirm LPO & Quotation Reviewed For Accuracy")
+def verify_lpo(project_id: int, payload: LpoVerifyPayload):
+    """
+    Sets/clears the confirmation that the LPO and quotation have been reviewed
+    and verified for accuracy. A project cannot proceed to Test Requests until
+    this is TRUE. Uploading a new/replacement LPO automatically clears it again
+    (see upload_lpo_file), so it always reflects review of the *current* file.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT lpo_file FROM projects WHERE project_id = %s", (project_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(404, "Project not found")
+
+        if payload.verified and not row[0]:
+            raise HTTPException(400, "Cannot verify: no LPO file has been uploaded for this project yet")
+
+        cur.execute("""
+            UPDATE projects
+            SET lpo_verified = %s,
+                lpo_verified_at = CASE WHEN %s THEN NOW() ELSE NULL END
+            WHERE project_id = %s
+            RETURNING project_id, lpo_verified, lpo_verified_at
+        """, (payload.verified, payload.verified, project_id))
+
+        result = cur.fetchone()
+        conn.commit()
+
+        return {
+            "message": "LPO verified" if result[1] else "LPO verification cleared",
+            "project_id": result[0],
+            "lpo_verified": result[1],
+            "lpo_verified_at": str(result[2]) if result[2] else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
         raise HTTPException(500, str(e))
     finally:
         cur.close()
