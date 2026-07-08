@@ -8,6 +8,7 @@ import os
 import shutil
 import secrets
 import sys
+import time
 
 import requests
 from utils import resource_path
@@ -37,8 +38,34 @@ SUPABASE_STORAGE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/obje
 # Helper Functions
 # ---------------------------
 
+_template_cache = {"files": None, "loaded_at": 0.0}
+_TEMPLATE_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+def _get_available_template_filenames():
+    """
+    List the templates/reports folder in Supabase Storage ONCE (cached for
+    a few minutes) instead of firing an HTTP HEAD request per possible
+    filename per test. A single sample-group lookup with N tests used to
+    make up to N * 7 blocking network calls; this brings it down to at
+    most one list() call per cache window, with everything else answered
+    from an in-memory set.
+    """
+    now = time.time()
+    if _template_cache["files"] is None or (now - _template_cache["loaded_at"]) > _TEMPLATE_CACHE_TTL_SECONDS:
+        try:
+            entries = supabase.storage.from_("templates").list("reports")
+            _template_cache["files"] = {e["name"] for e in entries if e.get("name")}
+        except Exception:
+            # Don't cache a failure — retry on the next call instead of
+            # silently reporting "no templates" for 5 minutes.
+            return set()
+        _template_cache["loaded_at"] = now
+    return _template_cache["files"]
+
+
 def get_template_from_supabase(item_code: str, test_name: str):
-    """Get template from Supabase storage"""
+    """Get template from Supabase storage (checked against a cached folder listing)."""
     possible_filenames = [
         f"{item_code}_Report.xlsx",
         f"{item_code}_Report.docx", 
@@ -48,18 +75,13 @@ def get_template_from_supabase(item_code: str, test_name: str):
         f"{test_name.replace(' ', '_')}_Report.xlsx",
         f"{test_name.replace(' ', '_')}_Report.docx"
     ]
-    
+
+    available = _get_available_template_filenames()
     for filename in possible_filenames:
-        template_url = f"{SUPABASE_STORAGE_URL}/reports/{filename}"
-        
-        try:
-            # Check if the file exists by making a HEAD request
-            response = requests.head(template_url)
-            if response.status_code == 200:
-                return template_url, filename.split('.')[-1]
-        except Exception:
-            continue
-    
+        if filename in available:
+            template_url = f"{SUPABASE_STORAGE_URL}/reports/{filename}"
+            return template_url, filename.split('.')[-1]
+
     return None, None
 
 def get_test_distribution_for_request(request_id: int, cur):
@@ -133,6 +155,194 @@ def get_test_distribution_for_request(request_id: int, cur):
                 sample_index += 1
     
     return sample_to_test_map, test_distribution
+
+
+def resolve_physical_key(cur, sample_input: str):
+    """
+    Given anything the user typed or clicked — a full test sample_no
+    (e.g. 'GS-060726-02/3-1') or a bare physical sample_no
+    (e.g. 'GS-060726-02/3') — resolve it to the physical_sample_no that
+    groups every test recorded under that physical sample. Falls back to
+    the row's own sample_no for legacy rows with no physical_sample_no.
+    """
+    cur.execute("""
+        SELECT COALESCE(physical_sample_no, sample_no)
+        FROM samples
+        WHERE sample_no = %s OR physical_sample_no = %s
+        LIMIT 1
+    """, (sample_input, sample_input))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def get_physical_sample_group(cur, physical_key: str):
+    """
+    Fetch every test (samples table row) recorded under one physical
+    sample, along with each test's report status. A physical sample may
+    carry one or more tests (e.g. '.../3-1', '.../3-2' share physical
+    sample '.../3'); legacy rows without physical_sample_no are treated
+    as their own single-test group.
+    """
+    cur.execute("""
+        SELECT s.sample_id, s.sample_no, s.request_id, s.status,
+               s.assigned_item_code, s.assigned_test_name, s.test_standard,
+               s.physical_sample_no, s.received_date,
+               tr.request_no, tr.project_id
+        FROM samples s
+        JOIN test_requests tr ON s.request_id = tr.test_request_id
+        WHERE COALESCE(s.physical_sample_no, s.sample_no) = %s
+        ORDER BY s.sample_id
+    """, (physical_key,))
+    rows = cur.fetchall()
+    if not rows:
+        return None
+
+    request_id = rows[0][2]
+
+    # Legacy rows created before assigned_item_code/assigned_test_name
+    # existed need the old order-based inference as a fallback.
+    fallback_map = {}
+    if any(r[4] is None or r[5] is None for r in rows):
+        fallback_map, _ = get_test_distribution_for_request(request_id, cur)
+
+    tests = []
+    for r in rows:
+        (sample_id, sample_no, req_id, status, item_code, test_name,
+         test_standard, phys_no, received_date, request_no, project_id) = r
+
+        if not item_code or not test_name:
+            fb = fallback_map.get(sample_id, {})
+            item_code = item_code or fb.get("item_code", "UNKNOWN")
+            test_name = test_name or fb.get("test_name", "Unknown Test")
+
+        cur.execute("""
+            SELECT report_id, report_no, status
+            FROM reports
+            WHERE sample_id = %s
+            LIMIT 1
+        """, (sample_id,))
+        report_row = cur.fetchone()
+
+        template_url, template_ext = get_template_from_supabase(item_code, test_name)
+
+        tests.append({
+            "sample_id": sample_id,
+            "sample_no": sample_no,
+            "item_code": item_code,
+            "test_name": test_name,
+            "test_standard": test_standard,
+            "sample_status": status,
+            "is_reported": report_row is not None,
+            "report": {
+                "report_id": report_row[0],
+                "report_no": report_row[1],
+                "status": report_row[2],
+            } if report_row else None,
+            "template_available": template_url is not None,
+        })
+
+    first = rows[0]
+    return {
+        "physical_sample_no": first[7] or first[1],
+        "request_id": request_id,
+        "request_no": first[9],
+        "project_id": first[10],
+        "received_date": first[8],
+        "tests": tests,
+        "test_count": len(tests),
+        "reported_count": sum(1 for t in tests if t["is_reported"]),
+        "pending_count": sum(1 for t in tests if not t["is_reported"]),
+    }
+
+
+def get_request_sample_groups(cur, request_id: int):
+    """
+    Fetch every physical sample under one test request, each with its own
+    nested list of tests (samples table rows) and per-test report status —
+    i.e. the same shape get_physical_sample_group() returns, but for every
+    physical sample in the request at once instead of just one. Powers the
+    request-first Step 2 screen: pick a Test Request, see every sample
+    under it, pick specific unreported tests from any of them.
+    """
+    cur.execute("""
+        SELECT s.sample_id, s.sample_no, s.request_id, s.status,
+               s.assigned_item_code, s.assigned_test_name, s.test_standard,
+               s.physical_sample_no, s.received_date,
+               tr.request_no, tr.project_id
+        FROM samples s
+        JOIN test_requests tr ON s.request_id = tr.test_request_id
+        WHERE s.request_id = %s
+        ORDER BY s.sample_id
+    """, (request_id,))
+    rows = cur.fetchall()
+    if not rows:
+        return []
+
+    # Legacy rows created before assigned_item_code/assigned_test_name
+    # existed need the old order-based inference as a fallback.
+    fallback_map = {}
+    if any(r[4] is None or r[5] is None for r in rows):
+        fallback_map, _ = get_test_distribution_for_request(request_id, cur)
+
+    groups_by_key = {}
+    order = []
+    for r in rows:
+        (sample_id, sample_no, req_id, status, item_code, test_name,
+         test_standard, phys_no, received_date, request_no, project_id) = r
+
+        if not item_code or not test_name:
+            fb = fallback_map.get(sample_id, {})
+            item_code = item_code or fb.get("item_code", "UNKNOWN")
+            test_name = test_name or fb.get("test_name", "Unknown Test")
+
+        key = phys_no or sample_no
+        if key not in groups_by_key:
+            groups_by_key[key] = {
+                "physical_sample_no": key,
+                "request_id": req_id,
+                "request_no": request_no,
+                "project_id": project_id,
+                "received_date": received_date,
+                "tests": [],
+            }
+            order.append(key)
+
+        cur.execute("""
+            SELECT report_id, report_no, status
+            FROM reports
+            WHERE sample_id = %s
+            LIMIT 1
+        """, (sample_id,))
+        report_row = cur.fetchone()
+
+        template_url, template_ext = get_template_from_supabase(item_code, test_name)
+
+        groups_by_key[key]["tests"].append({
+            "sample_id": sample_id,
+            "sample_no": sample_no,
+            "item_code": item_code,
+            "test_name": test_name,
+            "test_standard": test_standard,
+            "sample_status": status,
+            "is_reported": report_row is not None,
+            "report": {
+                "report_id": report_row[0],
+                "report_no": report_row[1],
+                "status": report_row[2],
+            } if report_row else None,
+            "template_available": template_url is not None,
+        })
+
+    groups = []
+    for key in order:
+        g = groups_by_key[key]
+        tests = g["tests"]
+        g["test_count"] = len(tests)
+        g["reported_count"] = sum(1 for t in tests if t["is_reported"])
+        g["pending_count"] = sum(1 for t in tests if not t["is_reported"])
+        groups.append(g)
+    return groups
+
 
 def generate_report_no(cur):
     """Generate unique report number: GR - DDMMYY - XXX"""
@@ -273,6 +483,255 @@ def get_latest_samples():
 
 
 # ---------------------------
+# 2b. Get Latest 10 UNIQUE Physical Samples (with all tests nested)
+# ---------------------------
+@router.get("/samples/recent")
+def get_recent_samples():
+    """
+    Latest 10 unique physical samples for the picker.
+
+    This only needs to return summary info (physical_sample_no, request_no,
+    test_count, pending_count) — the picker in CreateReport.jsx doesn't
+    render per-test details or template availability for this list; that's
+    fetched separately, per-sample, via /samples/group/{sample_input} once
+    the user actually clicks a sample. So this endpoint does ONE query and
+    never touches Supabase Storage (which was previously the bottleneck —
+    the old version called get_physical_sample_group() per group, which in
+    turn made an HTTP HEAD request to Supabase Storage per test, up to 7
+    attempts each, purely to populate a field this list never displays).
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            WITH latest_groups AS (
+                SELECT COALESCE(physical_sample_no, sample_no) AS phys_key,
+                       MAX(sample_id) AS latest_sample_id
+                FROM samples
+                WHERE sample_no LIKE 'GS%%'
+                GROUP BY COALESCE(physical_sample_no, sample_no)
+                ORDER BY latest_sample_id DESC
+                LIMIT 10
+            )
+            SELECT
+                lg.phys_key,
+                lg.latest_sample_id,
+                tr.request_no,
+                s.request_id,
+                COUNT(s.sample_id) AS test_count,
+                COUNT(s.sample_id) FILTER (WHERE r.report_id IS NULL) AS pending_count
+            FROM latest_groups lg
+            JOIN samples s ON COALESCE(s.physical_sample_no, s.sample_no) = lg.phys_key
+            JOIN test_requests tr ON s.request_id = tr.test_request_id
+            LEFT JOIN reports r ON r.sample_id = s.sample_id
+            GROUP BY lg.phys_key, lg.latest_sample_id, tr.request_no, s.request_id
+            ORDER BY lg.latest_sample_id DESC
+        """)
+        rows = cur.fetchall()
+
+        results = [
+            {
+                "physical_sample_no": r[0],
+                "request_id": r[3],
+                "request_no": r[2],
+                "test_count": r[4],
+                "pending_count": r[5],
+                "reported_count": r[4] - r[5],
+            }
+            for r in rows
+        ]
+        return results
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# 2c. Get Full Test List for One Physical Sample
+# ---------------------------
+@router.get("/samples/group/{sample_input:path}")
+def get_sample_group(sample_input: str):
+    """
+    Resolve whatever the user typed or clicked (a specific test's
+    sample_no, or a bare physical sample_no) to its physical sample, and
+    return every test recorded under it with report status per test.
+    Used by CreateReport Step 2 to drive individual/select-all reporting.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        phys_key = resolve_physical_key(cur, sample_input)
+        if not phys_key:
+            raise HTTPException(404, f"Sample \"{sample_input}\" not found. Please check the sample number.")
+
+        group = get_physical_sample_group(cur, phys_key)
+        if not group:
+            raise HTTPException(404, f"Sample \"{sample_input}\" not found. Please check the sample number.")
+
+        return group
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error fetching sample group: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# 2d. Get Latest 10 Test Requests (Step 1 of the request-first workflow)
+# ---------------------------
+@router.get("/requests/recent")
+def get_recent_requests():
+    """
+    Last 10 test requests for Step 1 of Create/Upload Report. Each entry
+    summarizes how many physical samples/tests it has and how many tests
+    are still pending a report, so the picker can be scanned at a glance
+    before the user drills into Step 2.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT tr.test_request_id, tr.request_no, tr.status, tr.created_at,
+                   COUNT(DISTINCT COALESCE(s.physical_sample_no, s.sample_no)) AS sample_count,
+                   COUNT(s.sample_id) AS test_count,
+                   COUNT(s.sample_id) FILTER (WHERE r.report_id IS NULL) AS pending_count
+            FROM test_requests tr
+            JOIN samples s ON s.request_id = tr.test_request_id
+            LEFT JOIN reports r ON r.sample_id = s.sample_id
+            WHERE s.sample_no LIKE 'GS%%'
+            GROUP BY tr.test_request_id, tr.request_no, tr.status, tr.created_at
+            ORDER BY tr.created_at DESC NULLS LAST, tr.test_request_id DESC
+            LIMIT 10
+        """)
+        rows = cur.fetchall()
+        results = [
+            {
+                "test_request_id": r[0],
+                "request_no": r[1],
+                "status": r[2],
+                "created_at": r[3],
+                "sample_count": r[4],
+                "test_count": r[5],
+                "pending_count": r[6],
+                "reported_count": r[5] - r[6],
+            }
+            for r in rows
+        ]
+        return results
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# 2e. Search Test Requests by Request No (GQ format)
+# ---------------------------
+@router.get("/requests/search")
+def search_requests(request_no: str):
+    """Search for a test request by request number, for the Step 1 search box."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT tr.test_request_id, tr.request_no, tr.status, tr.created_at
+            FROM test_requests tr
+            WHERE LOWER(tr.request_no) LIKE LOWER(%s)
+            ORDER BY tr.created_at DESC
+            LIMIT 10
+        """, (f"%{request_no}%",))
+
+        rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(404, "No test requests found with that request number")
+
+        return [
+            {
+                "test_request_id": r[0],
+                "request_no": r[1],
+                "status": r[2],
+                "created_at": r[3],
+            }
+            for r in rows
+        ]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error searching test requests: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# 2f. Get Every Sample (+ its tests) Under One Test Request
+# ---------------------------
+@router.get("/requests/{request_input:path}/samples")
+def get_request_samples(request_input: str):
+    """
+    Step 2 of the request-first workflow: given a test request (either its
+    numeric test_request_id, as clicked from the recent list, or its
+    request_no text, e.g. 'GQ-060726-04'), return every physical sample
+    under it with its nested tests and per-test report status. A sample
+    with exactly one test is meant to be auto-selected by the frontend;
+    a sample with several tests lets the user pick any subset of the
+    ones that aren't already reported.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        if request_input.isdigit():
+            cur.execute("""
+                SELECT test_request_id, request_no, project_id
+                FROM test_requests WHERE test_request_id = %s
+            """, (int(request_input),))
+        else:
+            cur.execute("""
+                SELECT test_request_id, request_no, project_id
+                FROM test_requests WHERE request_no = %s
+            """, (request_input,))
+        req_row = cur.fetchone()
+        if not req_row:
+            raise HTTPException(404, f"Test request \"{request_input}\" not found. Please check the request number.")
+        request_id, request_no, project_id = req_row
+
+        groups = get_request_sample_groups(cur, request_id)
+        if not groups:
+            raise HTTPException(404, f"Test request \"{request_no}\" has no samples yet.")
+
+        total_tests = sum(g["test_count"] for g in groups)
+        total_pending = sum(g["pending_count"] for g in groups)
+
+        return {
+            "test_request_id": request_id,
+            "request_no": request_no,
+            "project_id": project_id,
+            "samples": groups,
+            "sample_count": len(groups),
+            "test_count": total_tests,
+            "pending_count": total_pending,
+            "reported_count": total_tests - total_pending,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error fetching request samples: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
 # 3. Get Sample Test Info & Check for Existing Reports
 # ---------------------------
 # ---------------------------
@@ -280,101 +739,102 @@ def get_latest_samples():
 # ---------------------------
 @router.post("/upload-report")
 async def upload_report(
-    sample_no: str = Form(...),
+    sample_ids: List[int] = Form(...),
     uploaded_by: int = Form(...),
     file: UploadFile = File(...),
     notes: Optional[str] = Form(None),
     user_role: Optional[str] = Form(None)
 ):
-    """Upload a completed report file to Supabase Storage (covers all samples of same test)"""
+    """
+    Upload a completed report file covering one or more explicitly
+    selected tests (samples table rows) — either a single test or every
+    test under a physical sample, per the user's Step 2 selection.
+    Any test that already has a report is rejected up front so the same
+    test can never be reported twice.
+    """
     conn = get_connection()
     cur = conn.cursor()
-    
+
     try:
-        print(f"Starting report upload for sample: {sample_no}")
-        
-        # Verify sample exists
-        cur.execute("SELECT sample_id, request_id FROM samples WHERE sample_no = %s", (sample_no,))
-        sample_data = cur.fetchone()
-        if not sample_data:
-            raise HTTPException(404, f"Sample not found: {sample_no}")
-        
-        sample_id, request_id = sample_data
-        print(f"Found sample: {sample_id}, request: {request_id}")
-        
-        # Get test distribution
-        try:
-            sample_to_test_map, test_distribution = get_test_distribution_for_request(request_id, cur)
-            print(f"Test distribution loaded: {len(sample_to_test_map)} samples mapped")
-        except Exception as e:
-            print(f"Error in get_test_distribution_for_request: {str(e)}")
-            raise HTTPException(500, f"Error processing test distribution: {str(e)}")
-        
-        # Get which test this sample belongs to
-        test_info = sample_to_test_map.get(sample_id)
-        if not test_info:
-            raise HTTPException(400, f"Cannot determine test type for sample {sample_no}")
-        
-        item_code = test_info.get("item_code", "UNKNOWN")
-        test_name = test_info.get("test_name", "Unknown Test")
-        print(f"Test info: {item_code} - {test_name}")
-        
-        # Get all samples for this test type
-        test_samples = []
-        test_sample_ids = []
-        for sample_id_key, test_data in sample_to_test_map.items():
-            if test_data.get("item_code") == item_code:
-                cur.execute("SELECT sample_no FROM samples WHERE sample_id = %s", (sample_id_key,))
-                sample_row = cur.fetchone()
-                if sample_row:
-                    test_samples.append(sample_row[0])
-                    test_sample_ids.append(sample_id_key)
-        
-        print(f"Found {len(test_samples)} samples for test type {item_code}: {test_samples}")
-        
-        # Check if report already exists for ANY of these samples
-        existing_report_no = None
-        existing_report_id = None
-        for test_sample_id in test_sample_ids:
-            cur.execute("SELECT report_id, report_no FROM reports WHERE sample_id = %s", (test_sample_id,))
-            existing_report = cur.fetchone()
-            if existing_report:
-                existing_report_id, existing_report_no = existing_report
-                break
-        
-        if existing_report_no:
-            is_super_admin = (user_role or "").lower() == "super_admin"
-            if not is_super_admin:
-                raise HTTPException(400, 
-                    f"A report already exists for {test_name}. "
-                    f"Report No: {existing_report_no}. "
-                    f"Please use the existing report instead of creating a new one."
-                )
-            else:
-                # super_admin is replacing the existing report — delete all rows for it
-                print(f"super_admin replacing existing report: {existing_report_no}")
-                cur.execute(
-                    "DELETE FROM reports WHERE report_no = %s",
-                    (existing_report_no,)
-                )
-                print(f"Deleted old report rows for {existing_report_no}")
-        
+        if not sample_ids:
+            raise HTTPException(400, "Select at least one test to report")
+
+        print(f"Starting report upload for sample_ids: {sample_ids}")
+
+        # Load the selected test rows
+        cur.execute("""
+            SELECT sample_id, sample_no, request_id, assigned_item_code, assigned_test_name
+            FROM samples
+            WHERE sample_id = ANY(%s)
+        """, (sample_ids,))
+        rows = cur.fetchall()
+
+        found_ids = {r[0] for r in rows}
+        missing = set(sample_ids) - found_ids
+        if missing:
+            raise HTTPException(404, f"Sample(s) not found: {sorted(missing)}")
+
+        # Fill in item_code/test_name for legacy rows via the order-based
+        # fallback (grouped by request_id, computed once per request).
+        fallback_map = {}
+        request_ids_needing_fallback = {r[2] for r in rows if not r[3] or not r[4]}
+        for rid in request_ids_needing_fallback:
+            m, _ = get_test_distribution_for_request(rid, cur)
+            fallback_map.update(m)
+
+        tests_selected = []
+        for sample_id, sample_no, request_id, item_code, test_name in rows:
+            if not item_code or not test_name:
+                fb = fallback_map.get(sample_id, {})
+                item_code = item_code or fb.get("item_code", "UNKNOWN")
+                test_name = test_name or fb.get("test_name", "Unknown Test")
+            tests_selected.append({
+                "sample_id": sample_id,
+                "sample_no": sample_no,
+                "item_code": item_code,
+                "test_name": test_name,
+            })
+        # Keep a stable, predictable order for covers_samples / filenames
+        tests_selected.sort(key=lambda t: t["sample_no"])
+
+        print(f"Resolved {len(tests_selected)} test(s): {[t['sample_no'] for t in tests_selected]}")
+
+        # Duplicate-reporting guard: none of the selected tests may
+        # already have a report, regardless of role — a super_admin
+        # replaces an EXISTING report through its own flow, not by
+        # re-submitting here.
+        cur.execute("""
+            SELECT s.sample_no, r.report_no
+            FROM reports r
+            JOIN samples s ON r.sample_id = s.sample_id
+            WHERE r.sample_id = ANY(%s)
+        """, (sample_ids,))
+        already_reported = cur.fetchall()
+        if already_reported:
+            details = ", ".join(f"{sno} (Report No: {rno})" for sno, rno in already_reported)
+            raise HTTPException(
+                400,
+                f"The following test(s) have already been reported and can't be reported again: {details}. "
+                f"Refresh the sample to see its current status."
+            )
+
         # Generate unique report number
         report_no = generate_report_no(cur)
         print(f"Generated report number: {report_no}")
-        
+
         # Read file content
         file_content = await file.read()
-        
+
         # Get file extension
         file_extension = os.path.splitext(file.filename)[1].lower()
         if not file_extension:
             file_extension = ".pdf"  # default extension
-        
+
         # Create cloud filename in reports folder
         clean_report_no = report_no.replace(' ', '_').replace('-', '_')
-        cloud_filename = f"reports/{clean_report_no}_{item_code}_{secrets.token_hex(4)}{file_extension}"
-        
+        primary_item_code = tests_selected[0]["item_code"]
+        cloud_filename = f"reports/{clean_report_no}_{primary_item_code}_{secrets.token_hex(4)}{file_extension}"
+
         # Upload to Supabase Storage (using "reports" bucket)
         try:
             upload_response = supabase.storage.from_("reports").upload(
@@ -383,22 +843,26 @@ async def upload_report(
                 file_options={"content-type": file.content_type}
             )
             print(f"✅ Uploaded to Supabase reports bucket: {cloud_filename}")
-            
+
             # Get the public URL
             public_url = supabase.storage.from_("reports").get_public_url(cloud_filename)
-            
+
         except Exception as e:
             print(f"❌ Error uploading to reports bucket: {e}")
             raise HTTPException(500, f"Failed to upload to Supabase: {str(e)}")
-        
-        # Prepare test info with notes
-        test_info_with_notes = test_name
-        if notes and notes.strip():
-            short_notes = notes[:100] + "..." if len(notes) > 100 else notes
-            test_info_with_notes = f"{test_name}"
-        
-        # Insert report record for the FIRST sample with the Supabase URL
-        print(f"Inserting report for sample {test_sample_ids[0]}")
+
+        # Dedup test names for a readable covers_test_type, preserving order
+        distinct_test_names = []
+        for t in tests_selected:
+            if t["test_name"] not in distinct_test_names:
+                distinct_test_names.append(t["test_name"])
+        covers_test_type = ", ".join(distinct_test_names)
+        covers_samples = [t["sample_no"] for t in tests_selected]
+
+        # Insert one report row per selected test, all sharing report_no;
+        # the first is the "main" row, the rest link back to it — same
+        # pattern used elsewhere for multi-sample reports.
+        print(f"Inserting report for sample {tests_selected[0]['sample_id']}")
         cur.execute("""
             INSERT INTO reports (
                 report_no, sample_id, original_filename, 
@@ -409,24 +873,23 @@ async def upload_report(
             RETURNING report_id
         """, (
             report_no,
-            test_sample_ids[0],
+            tests_selected[0]["sample_id"],
             file.filename,
             cloud_filename,
-            public_url,  # Store the Supabase URL here
+            public_url,
             file_extension[1:] if file_extension.startswith('.') else file_extension,
             uploaded_by,
-            test_info_with_notes,
-            test_samples,
+            covers_test_type,
+            covers_samples,
             notes
         ))
-        
+
         main_report_id = cur.fetchone()[0]
         print(f"Created main report with ID: {main_report_id}")
-        
-        # Link this report to other samples of the same test type
-        for i, other_sample_id in enumerate(test_sample_ids[1:], 1):
+
+        for i, t in enumerate(tests_selected[1:], 1):
             try:
-                print(f"Linking report to sample {other_sample_id} ({i+1}/{len(test_sample_ids)})")
+                print(f"Linking report to sample {t['sample_id']} ({i+1}/{len(tests_selected)})")
                 cur.execute("""
                     INSERT INTO reports (
                         report_no, sample_id, original_filename, 
@@ -436,36 +899,35 @@ async def upload_report(
                     VALUES (%s, %s, %s, %s, %s, %s, %s, 'DRAFT', %s, %s, %s)
                 """, (
                     report_no,
-                    other_sample_id,
+                    t["sample_id"],
                     file.filename,
                     cloud_filename,
-                    public_url,  # Same URL for all linked reports
+                    public_url,
                     file_extension[1:] if file_extension.startswith('.') else file_extension,
                     uploaded_by,
-                    test_info_with_notes,
-                    test_samples,
+                    covers_test_type,
+                    covers_samples,
                     main_report_id
                 ))
             except Exception as link_error:
-                print(f"Warning: Failed to link to sample {other_sample_id}: {link_error}")
+                print(f"Warning: Failed to link to sample {t['sample_id']}: {link_error}")
                 # Continue with other samples
-        
+
         conn.commit()
         print("Transaction committed successfully")
-        
+
         return {
-            "message": f"Report uploaded successfully to cloud for {test_name}",
+            "message": f"Report uploaded successfully to cloud for {covers_test_type}",
             "report_id": main_report_id,
             "report_no": report_no,
-            "test_name": test_name,
-            "item_code": item_code,
-            "covers_samples": test_samples,
-            "sample_count": len(test_samples),
+            "covers_test_type": covers_test_type,
+            "covers_samples": covers_samples,
+            "sample_count": len(tests_selected),
             "status": "DRAFT",
             "file_url": public_url,
             "next_step": "Report is in DRAFT status. Submit for supervisor review."
         }
-        
+
     except HTTPException as http_err:
         print(f"HTTP Exception: {http_err.detail}")
         if conn:
@@ -475,7 +937,7 @@ async def upload_report(
         print(f"Unexpected error: {str(e)}")
         import traceback
         traceback.print_exc()
-        
+
         if conn:
             conn.rollback()
         raise HTTPException(500, f"Error uploading report: {str(e)}")
@@ -786,7 +1248,7 @@ def get_reports(status: Optional[str] = None):
 # ---------------------------
 # 8. Get Report by Sample No - UPDATED
 # ---------------------------
-@router.get("/by-sample/{sample_no}")
+@router.get("/by-sample/{sample_no:path}")
 def get_report_by_sample_no(sample_no: str):
     """Get report details by sample number - returns the combined report for the test type"""
     conn = get_connection()
@@ -1261,7 +1723,7 @@ def populate_report_template_from_url(template_url: str, report_data: dict) -> s
             os.remove(temp_template_path)
 
 
-@router.get("/samples/by-number/{sample_no}")
+@router.get("/samples/by-number/{sample_no:path}")
 def get_sample_by_number(sample_no: str):
     """
     Fetch sample info by sample number.
@@ -1348,7 +1810,7 @@ def get_sample_by_number(sample_no: str):
         conn.close()
 
 
-@router.get("/samples/by-number/{sample_no}/download-populated-template")
+@router.get("/samples/by-number/{sample_no:path}/download-populated-template")
 async def download_populated_template_by_sample(
     sample_no: str,
     user_id: Optional[int] = None
@@ -1526,6 +1988,179 @@ async def download_populated_template_by_sample(
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         
+    except Exception as e:
+        raise HTTPException(500, f"Error generating populated template: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# 14b. Download Populated Template for a Selected GROUP of Tests
+# ---------------------------
+@router.get("/samples/group-download-template")
+async def download_populated_template_for_group(
+    sample_ids: str,
+    user_id: Optional[int] = None
+):
+    """
+    Same as download-populated-template above, but driven by an explicit
+    set of selected tests (Step 2's checkboxes) instead of "every sample
+    sharing this test type in the request". A template is only used when
+    every selected test shares the same item_code — a template file maps
+    to one test type, so a mixed selection falls back to the existing
+    "no template" default behavior (manual upload in Step 3) rather than
+    guessing which template to use.
+    """
+    ids = [int(x) for x in sample_ids.split(",") if x.strip()]
+    if not ids:
+        raise HTTPException(400, "No tests selected")
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT s.sample_id, s.sample_no, s.request_id,
+                   s.assigned_item_code, s.assigned_test_name,
+                   tr.request_no, tr.project_id
+            FROM samples s
+            JOIN test_requests tr ON s.request_id = tr.test_request_id
+            WHERE s.sample_id = ANY(%s)
+            ORDER BY s.sample_no
+        """, (ids,))
+        rows = cur.fetchall()
+
+        found_ids = {r[0] for r in rows}
+        missing = set(ids) - found_ids
+        if missing:
+            raise HTTPException(404, f"Sample(s) not found: {sorted(missing)}")
+
+        request_id = rows[0][2]
+        project_id = rows[0][6]
+        request_no = rows[0][5]
+
+        fallback_map = {}
+        if any(r[3] is None or r[4] is None for r in rows):
+            fallback_map, _ = get_test_distribution_for_request(request_id, cur)
+
+        test_samples = []
+        item_codes = set()
+        test_names = []
+        sample_id_by_no = {}
+        for sample_id, sample_no, req_id, item_code, test_name, req_no, proj_id in rows:
+            if not item_code or not test_name:
+                fb = fallback_map.get(sample_id, {})
+                item_code = item_code or fb.get("item_code", "UNKNOWN")
+                test_name = test_name or fb.get("test_name", "Unknown Test")
+            test_samples.append(sample_no)
+            item_codes.add(item_code)
+            if test_name not in test_names:
+                test_names.append(test_name)
+            sample_id_by_no[sample_no] = sample_id
+
+        if len(item_codes) != 1:
+            raise HTTPException(
+                400,
+                "Template download needs every selected test to be the same test type. "
+                "Select tests of one type, or upload a manually prepared report instead."
+            )
+        item_code = item_codes.pop()
+        test_name = test_names[0]
+
+        # Check if a report already exists for any of the selected tests
+        cur.execute("SELECT report_no FROM reports WHERE sample_id = ANY(%s) LIMIT 1", (ids,))
+        existing_row = cur.fetchone()
+        existing_report_no = existing_row[0] if existing_row else None
+
+        # Get project details
+        cur.execute("""
+            SELECT p.project_no, p.project_name, p.location,
+                   c.name as client_name
+            FROM projects p
+            JOIN clients c ON p.client_id = c.client_id
+            WHERE p.project_id = %s
+        """, (project_id,))
+        project_data = cur.fetchone()
+        if not project_data:
+            raise HTTPException(404, "Project not found")
+        project_no, project_name, location, client_name = project_data
+
+        # Get test item details
+        cur.execute("""
+            SELECT qi.item_code, qi.description, qi.test_standard
+            FROM quotation_items qi
+            WHERE qi.item_code = %s
+            LIMIT 1
+        """, (item_code,))
+        item_data = cur.fetchone()
+        if not item_data:
+            cur.execute("""
+                SELECT qi.item_code, qi.description, qi.test_standard
+                FROM quotation_items qi
+                WHERE qi.description ILIKE %s
+                LIMIT 1
+            """, (f"%{test_name}%",))
+            item_data = cur.fetchone()
+        if not item_data:
+            raise HTTPException(404, f"Test item details not found for {item_code}")
+        item_code_db, test_name_db, test_standard = item_data
+
+        # Get user details if user_id is provided
+        tested_by = "Lab Chemist"
+        if user_id:
+            try:
+                cur.execute("SELECT username, full_name FROM users WHERE user_id = %s", (user_id,))
+                user_data = cur.fetchone()
+                if user_data:
+                    tested_by = user_data[1] if user_data[1] else user_data[0]
+            except Exception as user_error:
+                print(f"Error fetching user details: {user_error}")
+
+        if existing_report_no:
+            report_no_for_template = existing_report_no
+        else:
+            today = datetime.now()
+            date_str = today.strftime("%d%m%y")
+            cur.execute("SELECT COUNT(*) FROM reports WHERE DATE(created_at) = CURRENT_DATE")
+            count = cur.fetchone()[0]
+            report_seq = f"{count + 1:03d}"
+            report_no_for_template = f"GR - {date_str} - {report_seq}"
+
+        template_data = {
+            'report_no': report_no_for_template,
+            'report_date': datetime.now().strftime("%d/%m/%Y"),
+            'request_no': request_no,
+            'sample_nos': test_samples,
+            'lp_number': project_no,
+            'date_of_test': datetime.now().strftime("%d/%m/%Y"),
+            'tested_by': tested_by,
+            'location': location,
+            'client_name': client_name,
+            'test_standard': test_standard or "Not specified"
+        }
+
+        supabase_template_url, _ = get_template_from_supabase(item_code, test_name)
+        if not supabase_template_url:
+            supabase_template_url, _ = get_template_from_supabase(item_code_db, test_name_db)
+        if not supabase_template_url:
+            raise HTTPException(404, f"No template found for item code: {item_code}")
+
+        populated_path = populate_report_template_from_url(supabase_template_url, template_data)
+
+        if existing_report_no:
+            download_filename = f"{existing_report_no.replace(' ', '_')}_{item_code}.xlsx"
+        else:
+            download_filename = f"{item_code}_Report_Template_{len(test_samples)}_samples.xlsx"
+
+        return FileResponse(
+            path=populated_path,
+            filename=download_filename,
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Error generating populated template: {str(e)}")
     finally:
