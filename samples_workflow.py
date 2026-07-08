@@ -86,37 +86,43 @@ def download_worksheet_template_from_supabase(item_code: str):
         raise HTTPException(status_code=500, detail=f"Failed to download worksheet template: {str(e)}")
 
 
-def generate_sample_no(cur, request_id: int, sequence_num: int):
+def get_sample_base(cur, request_id: int):
+    """
+    Returns the constant 'GS-{date}-{request_seq}' portion shared by every
+    sample generated for this GQ. The per-sample "/N" suffix is appended
+    by the caller.
+
+    Fixed vs. the old implementation: request_seq used to require
+    len(request_no) >= 12, which silently fell back to "01" for a
+    request_no like "GQ-060726-1" (11 chars) even though that clearly
+    has a usable third segment ("1"). We now just use the split result
+    directly, which matches the documented example
+    (GQ-060726-1 -> GS-060726-1/...).
+    """
     cur.execute("""
-        SELECT request_no, created_at 
-        FROM test_requests 
+        SELECT request_no, created_at
+        FROM test_requests
         WHERE test_request_id = %s
     """, (request_id,))
     row = cur.fetchone()
-    
+
     if not row:
-        return f"GS-{datetime.now().strftime('%d%m%y')}-REQ{request_id:04d}-{sequence_num:02d}"
-    
+        return f"GS-{datetime.now().strftime('%d%m%y')}-REQ{request_id:04d}"
+
     request_no, created_at = row
-    date_part = ""
-    
-    if len(request_no) >= 9 and '-' in request_no:
-        parts = request_no.split('-')
-        if len(parts) >= 2:
-            date_part = parts[1]
-        else:
-            date_part = created_at.strftime("%d%m%y") if created_at else datetime.now().strftime("%d%m%y")
-    else:
-        date_part = created_at.strftime("%d%m%y") if created_at else datetime.now().strftime("%d%m%y")
-    
-    request_seq = "01"
-    if len(request_no) >= 12 and request_no.count('-') >= 2:
-        try:
-            request_seq = request_no.split('-')[2]
-        except (IndexError, AttributeError):
-            request_seq = "01"
-    
-    return f"GS-{date_part}-{request_seq}-{sequence_num}"
+    parts = request_no.split('-') if request_no else []
+
+    date_part = parts[1] if len(parts) >= 2 and parts[1] else (
+        created_at.strftime("%d%m%y") if created_at else datetime.now().strftime("%d%m%y")
+    )
+    request_seq = parts[2] if len(parts) >= 3 and parts[2] else "01"
+
+    return f"GS-{date_part}-{request_seq}"
+
+
+def generate_sample_no(cur, request_id: int, sequence_num: int):
+    base = get_sample_base(cur, request_id)
+    return f"{base}-{sequence_num}"
 
 
 def generate_worksheet_no(cur, sample_id: int):
@@ -266,7 +272,8 @@ def accept_sample(sample_id: int, payload: AcceptSampleIn):
         cur.execute("""
             SELECT s.sample_id, s.sample_no, s.request_id, 
                    s.assigned_tri_id, s.assigned_quotation_item_id,
-                   qi.item_code, qi.description
+                   COALESCE(qi.item_code, s.assigned_item_code) AS item_code,
+                   COALESCE(qi.description, s.assigned_test_name) AS description
             FROM samples s
             LEFT JOIN quotation_items qi ON s.assigned_quotation_item_id = qi.item_id
             WHERE s.sample_id = %s
@@ -355,7 +362,11 @@ def generate_worksheet(sample_id: int, payload: GenerateWorksheetIn):
         cur.execute("""
             SELECT s.sample_id, s.sample_no, s.request_id,
                    s.assigned_tri_id, s.assigned_quotation_item_id,
-                   qi.item_code, qi.description, qi.test_standard, qi.unit_rate
+                   COALESCE(qi.item_code, s.assigned_item_code) AS item_code,
+                   COALESCE(qi.description, s.assigned_test_name) AS description,
+                   COALESCE(qi.test_standard, s.test_standard) AS test_standard,
+                   COALESCE(qi.unit_rate, s.unit_rate) AS unit_rate,
+                   s.department
             FROM samples s
             LEFT JOIN quotation_items qi ON s.assigned_quotation_item_id = qi.item_id
             WHERE s.sample_id = %s
@@ -365,16 +376,24 @@ def generate_worksheet(sample_id: int, payload: GenerateWorksheetIn):
         if not sample_row:
             raise HTTPException(404, f"Sample {sample_id} not found")
         
-        sample_id_db, sample_no, request_id, assigned_tri_id, assigned_quotation_item_id, item_code, description, test_standard, unit_rate = sample_row
+        (sample_id_db, sample_no, request_id, assigned_tri_id, assigned_quotation_item_id,
+         item_code, description, test_standard, unit_rate, department) = sample_row
         
-        if not assigned_quotation_item_id:
+        if not item_code and not description:
             raise HTTPException(400, f"Sample {sample_id} has no assigned test. Please regenerate samples.")
+
+        if unit_rate is None:
+            # Custom (non-catalog) test with no price captured yet — worksheet can still be
+            # generated, but this will need a rate filled in before it can be invoiced.
+            unit_rate = 0
         
+        # A sample row represents exactly one test, so existence is keyed on sample_id alone —
+        # this also covers samples with no assigned_quotation_item_id (NULL never equals NULL in SQL).
         cur.execute("""
             SELECT worksheet_id, worksheet_no, status, created_at
             FROM worksheets 
-            WHERE sample_id = %s AND quotation_item_id = %s
-        """, (sample_id, assigned_quotation_item_id))
+            WHERE sample_id = %s
+        """, (sample_id,))
         
         existing = cur.fetchone()
         if existing:
@@ -471,12 +490,16 @@ def get_pending_samples():
                 s.storage_location,
                 tr.request_no,
                 s.assigned_quotation_item_id,
-                qi.item_code,
-                qi.description,
+                COALESCE(qi.item_code, s.assigned_item_code) AS item_code,
+                COALESCE(qi.description, s.assigned_test_name) AS description,
+                s.test_standard,
+                s.department,
+                s.batch_no,
+                s.physical_sample_no,
                 s.picture_path,
                 s.picture_uploaded_at
             FROM samples s
-            JOIN test_requests tr ON s.request_id = tr.test_request_id
+            LEFT JOIN test_requests tr ON s.request_id = tr.test_request_id
             LEFT JOIN quotation_items qi ON s.assigned_quotation_item_id = qi.item_id
             WHERE s.status = 'PENDING'
             ORDER BY s.sample_id DESC
@@ -489,6 +512,7 @@ def get_pending_samples():
             (sample_id, sample_no, request_id, collected_by, received_date, status,
              reason_rejected, barcode, storage_location, request_no,
              assigned_quotation_item_id, item_code, description,
+             test_standard, department, batch_no, physical_sample_no,
              picture_path, picture_uploaded_at) = sample
 
             result.append({
@@ -504,6 +528,10 @@ def get_pending_samples():
                 "request_no": request_no,
                 "assigned_test": item_code or "Not Assigned",
                 "test_name": description or "No test name",
+                "test_standard": test_standard,
+                "department": department,
+                "batch_no": batch_no,
+                "physical_sample_no": physical_sample_no,
                 "assigned_from_storage": assigned_quotation_item_id is not None,
                 "picture_path": picture_path,
                 "picture_uploaded_at": picture_uploaded_at.isoformat() if picture_uploaded_at else None,
@@ -704,9 +732,12 @@ def get_recent_samples(limit: int = 5):
     try:
         cur.execute("""
             SELECT s.sample_id, s.sample_no, s.status, s.barcode,
-                   tr.request_no, s.request_id, qi.item_code, qi.description
+                   tr.request_no, s.request_id,
+                   COALESCE(qi.item_code, s.assigned_item_code) AS item_code,
+                   COALESCE(qi.description, s.assigned_test_name) AS description,
+                   s.department
             FROM samples s
-            JOIN test_requests tr ON s.request_id = tr.test_request_id
+            LEFT JOIN test_requests tr ON s.request_id = tr.test_request_id
             LEFT JOIN quotation_items qi ON s.assigned_quotation_item_id = qi.item_id
             WHERE s.status IN ('PENDING', 'ACCEPTED')
             ORDER BY s.sample_id DESC
@@ -717,7 +748,8 @@ def get_recent_samples(limit: int = 5):
         return [
             {
                 "sample_id": r[0], "sample_no": r[1], "status": r[2], "barcode": r[3],
-                "request_no": r[4], "assigned_test": r[7] or "Test not assigned", "item_code": r[6] or "N/A"
+                "request_no": r[4], "assigned_test": r[7] or "Test not assigned", "item_code": r[6] or "N/A",
+                "department": r[8]
             }
             for r in rows
         ]
@@ -792,9 +824,12 @@ def get_all_samples():
         cur.execute("""
             SELECT s.sample_id, s.sample_no, s.request_id, s.collected_by, s.received_date,
                    s.status, s.reason_rejected, s.barcode, s.storage_location,
-                   tr.request_no, s.assigned_quotation_item_id, qi.item_code, qi.description
+                   tr.request_no, s.assigned_quotation_item_id,
+                   COALESCE(qi.item_code, s.assigned_item_code) AS item_code,
+                   COALESCE(qi.description, s.assigned_test_name) AS description,
+                   s.test_standard, s.department, s.batch_no, s.physical_sample_no
             FROM samples s
-            JOIN test_requests tr ON s.request_id = tr.test_request_id
+            LEFT JOIN test_requests tr ON s.request_id = tr.test_request_id
             LEFT JOIN quotation_items qi ON s.assigned_quotation_item_id = qi.item_id
             ORDER BY s.sample_id DESC
         """)
@@ -807,6 +842,8 @@ def get_all_samples():
                 "reason_rejected": s[6], "barcode": s[7], "storage_location": s[8],
                 "request_no": s[9], "assigned_test": s[11] or "Not Assigned",
                 "test_name": s[12] or "No test name",
+                "test_standard": s[13], "department": s[14],
+                "batch_no": s[15], "physical_sample_no": s[16],
                 "assigned_from_storage": s[10] is not None,
             }
             for s in samples
@@ -1017,6 +1054,410 @@ def download_filled_worksheet(worksheet_id: int):
         raise
     except Exception as e:
         raise HTTPException(500, f"Error generating filled worksheet: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+# ---------------------------
+# Generate Samples — manual entry (one physical sample, many tests)
+# One row per test-portion, same shape as generate-samples-by-request-no,
+# just without a request_id and with department/test_standard/unit_rate
+# carried directly on the row instead of via quotation_items.
+# ---------------------------
+class ManualSampleTestIn(BaseModel):
+    sample_no: str
+    catalog_id: Optional[int] = None
+    item_code: Optional[str] = None
+    test_name: str
+    test_standard: Optional[str] = None
+    unit_rate: Optional[float] = None
+    department: str
+
+class ManualSampleIn(BaseModel):
+    physical_sample_no: str
+    tests: List[ManualSampleTestIn]
+
+class GenerateSamplesManualIn(BaseModel):
+    batch_no: str
+    collected_by: Optional[str] = None
+    samples: List[ManualSampleIn]
+
+
+@router.post("/generate-samples-manual")
+def generate_samples_manual(payload: GenerateSamplesManualIn):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        created = []
+        for sample in payload.samples:
+            for t in sample.tests:
+                cur.execute("""
+                    INSERT INTO samples (
+                        sample_no, batch_no, physical_sample_no, collected_by, status,
+                        catalog_id, assigned_item_code, assigned_test_name,
+                        test_standard, unit_rate, department
+                    )
+                    VALUES (%s, %s, %s, %s, 'PENDING', %s, %s, %s, %s, %s, %s)
+                    RETURNING sample_id
+                """, (
+                    t.sample_no, payload.batch_no, sample.physical_sample_no, payload.collected_by,
+                    t.catalog_id, t.item_code, t.test_name, t.test_standard, t.unit_rate, t.department
+                ))
+                created.append({"sample_id": cur.fetchone()[0], "sample_no": t.sample_no})
+
+        conn.commit()
+        return {
+            "message": f"{len(created)} sample record(s) created for batch {payload.batch_no}",
+            "count": len(created),
+            "samples": created,
+        }
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# GQ lookup for the "Enter Test Request" screen
+# ---------------------------
+@router.get("/test-requests/recent")
+def get_recent_test_requests(limit: int = 10):
+    """Last N GQs, for the 'select from a list of last 10 GQs' picker."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT tr.test_request_id, tr.request_no, tr.status, tr.created_at,
+                   p.project_no, p.project_name
+            FROM test_requests tr
+            JOIN projects p ON tr.project_id = p.project_id
+            ORDER BY tr.created_at DESC
+            LIMIT %s
+        """, (limit,))
+        return [
+            {
+                "test_request_id": r[0],
+                "request_no": r[1],
+                "status": r[2],
+                "created_at": r[3],
+                "project_no": r[4],
+                "project_name": r[5],
+            }
+            for r in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.get("/test-requests/by-number/{request_no}")
+def get_test_request_by_number(request_no: str):
+    """
+    Everything the 'Generate Samples' screen needs once a GQ number is
+    submitted: the request header, every test on it (with standard and
+    group_name so the UI can branch on 'Aggregate'), and the sample_no
+    base + next available sub-sample counter for this GQ.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT tr.test_request_id, tr.request_no, tr.status, tr.project_id,
+                   p.project_no, p.project_name
+            FROM test_requests tr
+            JOIN projects p ON tr.project_id = p.project_id
+            WHERE tr.request_no = %s
+        """, (request_no,))
+        header = cur.fetchone()
+        if not header:
+            raise HTTPException(404, f"Test request '{request_no}' not found")
+
+        test_request_id = header[0]
+
+        cur.execute("""
+            SELECT tri.tri_id, tri.quotation_item_id, tri.quantity,
+                   qi.catalog_id, qi.item_code, qi.description, qi.test_standard, qi.unit_rate,
+                   pc.group_name, pc.catalog_id AS matched_catalog_id
+            FROM test_request_items tri
+            JOIN quotation_items qi ON tri.quotation_item_id = qi.item_id
+            LEFT JOIN price_catalog pc
+                ON (qi.catalog_id IS NOT NULL AND pc.catalog_id = qi.catalog_id)
+                OR (qi.catalog_id IS NULL AND qi.item_code IS NOT NULL AND pc.code = qi.item_code)
+            WHERE tri.test_request_id = %s
+            ORDER BY tri.tri_id
+        """, (test_request_id,))
+
+        tests = [
+            {
+                "tri_id": r[0],
+                "quotation_item_id": r[1],
+                "quantity": r[2] or 1,
+                # Backfill catalog_id from the code match so downstream
+                # logic (e.g. "is this catalog test already on the GQ?")
+                # still works for legacy rows that were never linked by ID.
+                "catalog_id": r[3] if r[3] is not None else r[9],
+                "item_code": r[4],
+                "test_name": r[5],
+                "test_standard": r[6],
+                "unit_rate": float(r[7]) if r[7] is not None else None,
+                "group_name": r[8],
+            }
+            for r in cur.fetchall()
+        ]
+
+        # Base sample number, plus where to continue numbering if some
+        # samples already exist for this GQ (e.g. this is a second batch).
+        base = get_sample_base(cur, test_request_id)
+        cur.execute("""
+            SELECT physical_sample_no FROM samples
+            WHERE request_id = %s AND physical_sample_no LIKE %s
+        """, (test_request_id, f"{base}/%"))
+        max_seen = 0
+        for (phys_no,) in cur.fetchall():
+            try:
+                n = int(phys_no.split('/')[-1])
+                max_seen = max(max_seen, n)
+            except (ValueError, IndexError):
+                continue
+
+        return {
+            "test_request_id": test_request_id,
+            "request_no": header[1],
+            "status": header[2],
+            "project_id": header[3],
+            "project_no": header[4],
+            "project_name": header[5],
+            "sample_base": base,
+            "next_sequence": max_seen + 1,
+            "tests": tests,
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# Generate Samples — from a GQ, with Aggregate-size branching
+# ---------------------------
+class GenSampleTestIn(BaseModel):
+    tri_id: Optional[int] = None
+    quotation_item_id: Optional[int] = None
+    catalog_id: Optional[int] = None
+    item_code: Optional[str] = None
+    test_name: str
+    test_standard: Optional[str] = None
+    unit_rate: Optional[float] = None
+    department: str
+    # True when this test was picked from the "full catalog list" rather
+    # than the GQ's own list, i.e. it isn't on the GQ yet.
+    is_new_to_gq: bool = False
+
+
+class GenSampleIn(BaseModel):
+    # e.g. "20 mm" / "10 mm" / "5 mm" for Aggregate sub-samples, else None
+    size_label: Optional[str] = None
+    group_name: Optional[str] = None
+    tests: List[GenSampleTestIn]
+
+
+class GenerateSamplesFromRequestIn(BaseModel):
+    request_no: str
+    collected_by: Optional[str] = None
+    samples: List[GenSampleIn]
+
+
+def _ensure_quotation_item(cur, quotation_id: int, t: "GenSampleTestIn"):
+    """
+    Makes sure `t` exists as a quotation_item, inserting one if it's new
+    to the GQ (either a catalog test that wasn't originally quoted, or a
+    fully custom/manual test). Returns quotation_item_id.
+
+    Note: this repo's schema has no separate LPO line-items table (LPO
+    fields live directly on `projects`), so syncing "to the LP" appears
+    to mean nothing further is needed beyond the quotation. If there IS
+    a separate LPO items table elsewhere, this is the place to mirror
+    the insert into it too.
+    """
+    if t.quotation_item_id and not t.is_new_to_gq:
+        return t.quotation_item_id
+
+    unit = None
+    if t.catalog_id:
+        cur.execute("""
+            SELECT unit FROM price_catalog WHERE catalog_id = %s
+        """, (t.catalog_id,))
+        row = cur.fetchone()
+        if row:
+            unit = row[0]
+
+    cur.execute("""
+        INSERT INTO quotation_items (
+            quotation_id, catalog_id, item_code,
+            description, test_standard, unit, unit_rate, quantity
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+        RETURNING item_id
+    """, (
+        quotation_id, t.catalog_id, t.item_code,
+        t.test_name, t.test_standard, unit, t.unit_rate,
+    ))
+    return cur.fetchone()[0]
+
+
+@router.post("/generate-samples-from-request")
+def generate_samples_from_request(payload: GenerateSamplesFromRequestIn):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT test_request_id, project_id FROM test_requests WHERE request_no = %s
+        """, (payload.request_no,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"Test request '{payload.request_no}' not found")
+        test_request_id, project_id = row
+
+        cur.execute("SELECT quotation_id FROM projects WHERE project_id = %s", (project_id,))
+        qrow = cur.fetchone()
+        if not qrow:
+            raise HTTPException(404, "Project not found")
+        quotation_id = qrow[0]
+
+        base = get_sample_base(cur, test_request_id)
+
+        # Continue numbering after any samples already generated for this GQ
+        cur.execute("""
+            SELECT physical_sample_no FROM samples
+            WHERE request_id = %s AND physical_sample_no LIKE %s
+        """, (test_request_id, f"{base}/%"))
+        max_seen = 0
+        for (phys_no,) in cur.fetchall():
+            try:
+                n = int(phys_no.split('/')[-1])
+                max_seen = max(max_seen, n)
+            except (ValueError, IndexError):
+                continue
+
+        created = []
+        seq = max_seen
+
+        for sample in payload.samples:
+            seq += 1
+            physical_sample_no = f"{base}/{seq}"
+
+            if not sample.tests:
+                raise HTTPException(400, f"Sample {physical_sample_no} needs at least one test")
+
+            for ti, t in enumerate(sample.tests):
+                quotation_item_id = _ensure_quotation_item(cur, quotation_id, t)
+
+                tri_id = t.tri_id
+                if t.is_new_to_gq or not tri_id:
+                    cur.execute("""
+                        INSERT INTO test_request_items (test_request_id, quotation_item_id, quantity)
+                        VALUES (%s, %s, 1)
+                        RETURNING tri_id
+                    """, (test_request_id, quotation_item_id))
+                    tri_id = cur.fetchone()[0]
+
+                sample_no = f"{physical_sample_no}-{ti + 1}"
+
+                cur.execute("""
+                    INSERT INTO samples (
+                        sample_no, batch_no, physical_sample_no, request_id, collected_by,
+                        received_date, status, assigned_tri_id, assigned_quotation_item_id,
+                        assigned_item_code, assigned_test_name, test_standard, catalog_id,
+                        unit_rate, department
+                    )
+                    VALUES (%s, %s, %s, %s, %s, NOW(), 'PENDING', %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING sample_id
+                """, (
+                    sample_no, base, physical_sample_no, test_request_id, payload.collected_by,
+                    tri_id, quotation_item_id, t.item_code, t.test_name, t.test_standard,
+                    t.catalog_id, t.unit_rate, t.department,
+                ))
+                sample_id = cur.fetchone()[0]
+                created.append({
+                    "sample_id": sample_id,
+                    "sample_no": sample_no,
+                    "physical_sample_no": physical_sample_no,
+                    "size_label": sample.size_label,
+                    "test_name": t.test_name,
+                })
+
+        conn.commit()
+        return {
+            "message": f"{len(created)} sample record(s) created for {payload.request_no}",
+            "count": len(created),
+            "batch_base": base,
+            "samples": created,
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# Price catalog lookups (for the manual sample-entry form)
+# ---------------------------
+@router.get("/price-catalog/groups")
+def get_price_catalog_groups():
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT DISTINCT group_name FROM price_catalog
+            WHERE active = TRUE AND group_name IS NOT NULL
+            ORDER BY group_name
+        """)
+        return {"groups": [r[0] for r in cur.fetchall()]}
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.get("/price-catalog/tests")
+def get_price_catalog_tests(group_name: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT catalog_id, code, description, test_standard, unit_rate
+            FROM price_catalog
+            WHERE active = TRUE AND group_name = %s
+            ORDER BY description
+        """, (group_name,))
+        return {"tests": [
+            {
+                "catalog_id": r[0], "code": r[1], "description": r[2],
+                "test_standard": r[3], "unit_rate": float(r[4]) if r[4] is not None else None,
+            }
+            for r in cur.fetchall()
+        ]}
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.get("/price-catalog/standards")
+def get_price_catalog_standards():
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT DISTINCT test_standard FROM price_catalog
+            WHERE active = TRUE AND test_standard IS NOT NULL AND test_standard <> ''
+            ORDER BY test_standard
+        """)
+        return {"standards": [r[0] for r in cur.fetchall()]}
     finally:
         cur.close()
         conn.close()
