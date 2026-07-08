@@ -77,12 +77,12 @@ TEMPLATE_TYPES = {
     "steel": {
         "label": "Steel",
         "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/Steel_Test_Request.xlsx",
-        "generator": "concrete",  # Same layout as concrete
+        "generator": "steel",  # Own layout - see SteelTestRequestExcelGenerator
     },
     "water": {
         "label": "Water",
         "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/Water_Test_Request.xlsx",
-        "generator": "concrete",  # Same layout as concrete
+        "generator": "water",  # Own layout - see WaterTestRequestExcelGenerator
     },
     "aggregates": {
         "label": "Aggregates",
@@ -281,7 +281,6 @@ class ConcreteTestRequestExcelGenerator:
                 ws[f'A{row}'] = index
                 ws[f'B{row}'] = item.get('description', '')
                 ws[f'D{row}'] = item.get('test_standard', '')
-                ws[f'G{row}'] = item.get('description', '')   # sample name/number
                 ws[f'I{row}'] = item.get('quantity', 1)
 
             with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
@@ -292,6 +291,172 @@ class ConcreteTestRequestExcelGenerator:
 
         except Exception as e:
             raise Exception(f"Error generating Concrete Excel: {str(e)}")
+
+
+class SteelTestRequestExcelGenerator:
+    """
+    Excel generator for the Steel Test Request template.
+    Layout differs from both the Soil and Concrete-family templates.
+    """
+    def __init__(self, template_url: str):
+        print(f"DEBUG: Downloading steel-layout template from: {template_url}")
+        self.template_source = download_test_request_template_from_supabase(template_url)
+
+    def generate_excel(self, test_request_data, project_data, client_data, items):
+        """
+        Fill the Steel-layout Excel template with test request data.
+
+        Header cells:
+          C6  → request_no
+          C7  → lpo_no
+          C8  → project_name
+          C10 → client address
+          C13 → consultant
+          C38 → requested_by
+          C12 → plot_no + ", " + location
+          F9  → created_at (date)
+          F10 → current time (HH:MM)
+          F8  → project_no
+          C9  → walk_in_client (walk-in) / contractor (non-walk-in)
+          C11 → client_name (walk-in) / client_name or clients.name (non-walk-in)
+
+        Item table starts at row 20:
+          A{row} → serial index
+          C{row} → description
+          D{row} → test_standard
+          G{row} → quantity
+        """
+        try:
+            self.template_source.seek(0)
+            wb = load_workbook(self.template_source)
+            ws = wb.active
+
+            # ── Header cells ──────────────────────────────────────────────
+            ws['C6'] = test_request_data.get('request_no', '')
+            ws['C7'] = project_data.get('lpo_no', '')
+            ws['C8'] = test_request_data.get('project_name', '')
+            ws['C10'] = client_data.get('address', '') if client_data else ''
+            ws['C13'] = project_data.get('consultant', '')
+            ws['C38'] = test_request_data.get('requested_by', '')
+
+            plot_no = project_data.get('plot_no', '')
+            location = project_data.get('location', '')
+            ws['C12'] = f"{plot_no}, {location}".strip(', ') if (plot_no or location) else ''
+
+            ws['F9'] = test_request_data.get('created_at', '')
+            ws['F10'] = datetime.now().strftime("%H:%M")
+            ws['F8'] = test_request_data.get('project_no', '')
+
+            # ── Walk-in / Non-walk-in ────────────────────────────────────────
+            is_walk_in = project_data.get('is_walk_in', False)
+            if is_walk_in:
+                ws['C9'] = project_data.get('walk_in_client', '')
+                ws['C11'] = project_data.get('client_name', '')
+            else:
+                ws['C9'] = project_data.get('contractor', '')
+                ws['C11'] = (
+                    project_data.get('client_name', '')
+                    or (client_data.get('name', '') if client_data else '')
+                )
+
+            # ── Test items table (starts at row 20) ──────────────────────────
+            start_row = 20
+            for index, item in enumerate(items, 1):
+                row = start_row + index - 1
+                ws[f'A{row}'] = index
+                ws[f'C{row}'] = item.get('description', '')
+                ws[f'D{row}'] = item.get('test_standard', '')
+                ws[f'G{row}'] = item.get('quantity', 1)
+
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                temp_file_path = tmp.name
+                wb.save(temp_file_path)
+
+            return temp_file_path
+
+        except Exception as e:
+            raise Exception(f"Error generating Steel Excel: {str(e)}")
+
+
+class WaterTestRequestExcelGenerator:
+    """
+    Excel generator for the Water Test Request template.
+    Layout is its own — do not reuse the Concrete-family generator for this.
+
+    Header cells:
+      C6  → request_no
+      C7  → lpo_no
+      C8  → project_name
+      C10 → client address
+      C12 → consultant
+      C43 → requested_by
+      C15 → plot_no + ", " + location
+      H8  → project_no
+      H9  → created_date
+      H10 → created_time (HH:MM)
+      C9  → walk_in_client (walk-in) / contractor (non-walk-in)
+      C11 → client_name (walk-in) / client_name or clients.name (non-walk-in)
+
+    Item table starts at row 20:
+      A{row} → serial index
+      C{row} → description
+      E{row} → test_standard
+      (No quantity column on this template.)
+    """
+    def __init__(self, template_url: str):
+        print(f"DEBUG: Downloading water-layout template from: {template_url}")
+        self.template_source = download_test_request_template_from_supabase(template_url)
+
+    def generate_excel(self, test_request_data, project_data, client_data, items):
+        try:
+            self.template_source.seek(0)
+            wb = load_workbook(self.template_source)
+            ws = wb.active
+
+            # ── Header cells ──────────────────────────────────────────────
+            ws['C6'] = test_request_data.get('request_no', '')
+            ws['C7'] = project_data.get('lpo_no', '')
+            ws['C8'] = test_request_data.get('project_name', '')
+            ws['C10'] = client_data.get('address', '') if client_data else ''
+            ws['C12'] = project_data.get('consultant', '')
+            ws['C43'] = test_request_data.get('requested_by', '')
+
+            plot_no = project_data.get('plot_no', '')
+            location = project_data.get('location', '')
+            ws['C15'] = f"{plot_no}, {location}".strip(', ') if (plot_no or location) else ''
+
+            ws['H8'] = test_request_data.get('project_no', '')
+            ws['H9'] = test_request_data.get('created_at', '')
+            ws['H10'] = datetime.now().strftime("%H:%M")
+
+            # ── Walk-in / Non-walk-in ────────────────────────────────────────
+            is_walk_in = project_data.get('is_walk_in', False)
+            if is_walk_in:
+                ws['C9'] = project_data.get('walk_in_client', '')
+                ws['C11'] = project_data.get('client_name', '')
+            else:
+                ws['C9'] = project_data.get('contractor', '')
+                ws['C11'] = (
+                    project_data.get('client_name', '')
+                    or (client_data.get('name', '') if client_data else '')
+                )
+
+            # ── Test items table (starts at row 20) ──────────────────────────
+            start_row = 20
+            for index, item in enumerate(items, 1):
+                row = start_row + index - 1
+                ws[f'A{row}'] = index
+                ws[f'C{row}'] = item.get('description', '')
+                ws[f'E{row}'] = item.get('test_standard', '')
+
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                temp_file_path = tmp.name
+                wb.save(temp_file_path)
+
+            return temp_file_path
+
+        except Exception as e:
+            raise Exception(f"Error generating Water Excel: {str(e)}")
 
 
 def get_excel_generator(template_type: str):
@@ -305,6 +470,10 @@ def get_excel_generator(template_type: str):
 
     if generator_kind == "concrete":
         return ConcreteTestRequestExcelGenerator(template_url=url)
+    elif generator_kind == "steel":
+        return SteelTestRequestExcelGenerator(template_url=url)
+    elif generator_kind == "water":
+        return WaterTestRequestExcelGenerator(template_url=url)
     else:
         # soil (default)
         return TestRequestExcelGenerator(template_url=url)
