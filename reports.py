@@ -550,6 +550,83 @@ def get_recent_samples():
 
 
 # ---------------------------
+# 2b-2. Samples Progress — generated but not yet reported (Dashboard widget)
+# ---------------------------
+@router.get("/samples/in-progress")
+def get_samples_in_progress(limit: int = 10):
+    """
+    Samples that have been generated (exist in the `samples` table) but
+    have no row in `reports` yet — i.e. still being processed. Used by
+    the Dashboard "Samples Progress" widget. One query, LEFT JOIN reports
+    to exclude anything already reported, LEFT JOIN worksheets to know
+    whether a worksheet has been created yet (drives the 3-step tracker:
+    Sample Creation -> Worksheet Creation -> Report Creation).
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                s.sample_id,
+                s.sample_no,
+                COALESCE(s.physical_sample_no, s.sample_no) AS physical_sample_no,
+                COALESCE(qi.item_code, s.assigned_item_code) AS item_code,
+                COALESCE(qi.description, s.assigned_test_name) AS test_name,
+                s.test_standard,
+                s.status,
+                s.received_date,
+                tr.request_no,
+                COALESCE(ws.worksheet_count, 0) AS worksheet_count,
+                ws.latest_worksheet_status,
+                s.department
+            FROM samples s
+            LEFT JOIN reports r ON r.sample_id = s.sample_id
+            LEFT JOIN test_requests tr ON s.request_id = tr.test_request_id
+            LEFT JOIN quotation_items qi ON s.assigned_quotation_item_id = qi.item_id
+            LEFT JOIN (
+                SELECT sample_id, COUNT(*) AS worksheet_count, MAX(status) AS latest_worksheet_status
+                FROM worksheets
+                GROUP BY sample_id
+            ) ws ON ws.sample_id = s.sample_id
+            WHERE r.report_id IS NULL
+              AND s.status IS DISTINCT FROM 'REJECTED'
+            ORDER BY s.received_date DESC NULLS LAST, s.sample_id DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+
+        now = datetime.now()
+        results = []
+        for (sample_id, sample_no, physical_sample_no, item_code, test_name,
+             test_standard, status, received_date, request_no,
+             worksheet_count, latest_worksheet_status, department) in rows:
+            sample_age_days = (now - received_date).days if received_date else None
+            results.append({
+                "sample_id": sample_id,
+                "sample_no": sample_no,
+                "physical_sample_no": physical_sample_no,
+                "item_code": item_code,
+                "test_name": test_name or "Unassigned Test",
+                "test_standard": test_standard,
+                "db_status": status,
+                "status": "In Progress",
+                "received_date": received_date.isoformat() if received_date else None,
+                "sample_age_days": sample_age_days,
+                "request_no": request_no,
+                "has_worksheet": worksheet_count > 0,
+                "worksheet_status": latest_worksheet_status,
+                "sample_type": department,
+            })
+        return results
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
 # 2c. Get Full Test List for One Physical Sample
 # ---------------------------
 @router.get("/samples/group/{sample_input:path}")
