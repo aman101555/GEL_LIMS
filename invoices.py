@@ -1856,6 +1856,12 @@ def _fill_proforma_sheet(ws, invoice: dict, project: dict, items: list):
                 tgt.alignment = copy(src.alignment)
 
     # Fill item rows
+    # NOTE: Report No. / Report Date are only printed on the FIRST row of a
+    # given report's items to avoid repeating the same value down every line
+    # (matches the merged-cell look of the printed proforma). Rows belonging
+    # to the same report are assumed contiguous, since items are ordered by
+    # item_id which preserves report grouping.
+    prev_report_no = None
     for idx, item in enumerate(items):
         row = FIRST_ROW + idx
         report_no  = item.get("report_no") or " - "
@@ -1865,8 +1871,11 @@ def _fill_proforma_sheet(ws, invoice: dict, project: dict, items: list):
         rate       = float(item.get("unit_rate") or 0)
         amount     = float(item.get("amount") or qty * rate)
 
-        set_cell(ws, f"A{row}", report_no)
-        set_cell(ws, f"B{row}", report_dt)
+        is_new_report = (report_no != prev_report_no)
+        set_cell(ws, f"A{row}", report_no if is_new_report else None)
+        set_cell(ws, f"B{row}", report_dt if is_new_report else None)
+        prev_report_no = report_no
+
         set_cell(ws, f"D{row}", desc)
         set_cell(ws, f"I{row}", qty)
         set_cell(ws, f"J{row}", rate)
@@ -1968,6 +1977,12 @@ def _fill_tax_sheet(ws, invoice: dict, project: dict, items: list):
                 tgt.alignment = copy(src.alignment)
 
     # Fill item rows
+    # NOTE: Report No. / Report Date are only printed on the FIRST row of a
+    # given report's items to avoid repeating the same value down every line
+    # (matches the merged-cell look of the printed tax invoice). Rows
+    # belonging to the same report are assumed contiguous, since items are
+    # ordered by item_id which preserves report grouping.
+    prev_report_no = None
     for idx, item in enumerate(items):
         row = FIRST_ROW + idx
         report_no  = item.get("report_no") or " - "
@@ -1979,8 +1994,11 @@ def _fill_tax_sheet(ws, invoice: dict, project: dict, items: list):
         vat_amt    = round(excl_vat * 0.05, 2)
         incl_vat   = round(excl_vat + vat_amt, 2)
 
-        set_cell(ws, f"A{row}", report_no)
-        set_cell(ws, f"B{row}", report_dt)
+        is_new_report = (report_no != prev_report_no)
+        set_cell(ws, f"A{row}", report_no if is_new_report else None)
+        set_cell(ws, f"B{row}", report_dt if is_new_report else None)
+        prev_report_no = report_no
+
         set_cell(ws, f"D{row}", desc)
         set_cell(ws, f"I{row}", qty)
         set_cell(ws, f"J{row}", rate)
@@ -3328,6 +3346,14 @@ def generate_invoice_with_reports_and_tests_v2(payload: NonWalkInInvoiceRequest)
             tax_no = generate_invoice_no(cur, "TAX")
             invoice_result["tax_invoice_no"] = tax_no
 
+            # Persist the tax number on the proforma row's remarks. No separate
+            # TAX invoice row is created for BOTH mode, but the regenerate-download
+            # logic (and the department revenue view) both look for
+            # "Tax Invoice No: ..." in remarks, so it must be saved here.
+            cur.execute("UPDATE invoices SET remarks = %s WHERE invoice_id = %s",
+                        (f"Tax Invoice No: {tax_no}", invoice_id))
+            conn.commit()
+
             # Build Excel — both sheets
             return _build_nonwi_combined_excel(invoice_id, invoice_result, cur,
                                                fill_tax=True, mode="BOTH")
@@ -3744,6 +3770,8 @@ def list_all_invoices():
       - generation_mode  (BOTH | PROFORMA_ONLY | TAX_ONLY | NULL)
       - payment_status, paid_date, invoice_date
       - linked_invoice_no  (for TAX_ONLY rows: the proforma number embedded in remarks)
+      - total        (invoice grand total, for daily/monthly financial summaries)
+      - is_walk_in   (True = Walk-In Customer invoice, False = Credit/Non-Walk-In invoice)
 
     The frontend uses generation_mode + contractor_name to reconstruct the
     downloaded filename and filters out rows that don't match the known
@@ -3762,6 +3790,8 @@ def list_all_invoices():
                 i.payment_status,
                 i.paid_date,
                 i.remarks,
+                i.total,
+                p.is_walk_in,
                 -- Contractor name: walk-in uses walk_in_client / project_name,
                 -- non-walk-in uses clients.name
                 CASE
@@ -3782,6 +3812,7 @@ def list_all_invoices():
         for row in rows:
             (invoice_id, invoice_no, invoice_type, generation_mode,
              invoice_date, payment_status, paid_date, remarks,
+             total, is_walk_in,
              contractor_name) = row
 
             # For TAX_ONLY invoices the proforma number is stored in remarks;
@@ -3803,6 +3834,8 @@ def list_all_invoices():
                 "paid_date":        paid_date.isoformat() if paid_date else None,
                 "contractor_name":  contractor_name or "",
                 "linked_invoice_no": linked_invoice_no,
+                "total":            float(total) if total is not None else 0.0,
+                "is_walk_in":       bool(is_walk_in),
             })
 
         return result
@@ -4370,3 +4403,162 @@ def get_project_reports_invoiced_status(project_id: int):
     finally:
         cur.close()
         conn.close()
+
+
+# ============================================================================
+# "Test Wise Department" — department revenue breakdown for View Invoices
+#
+# Revenue is attributed to a department via:
+#     invoice_items.sample_id  ->  samples.department
+# This only covers non-walk-in invoices, since walk-in items are not tied to
+# a lab sample (walk_in_items has no department column). Walk-in revenue is
+# therefore intentionally excluded from this view.
+#
+# PRF / Tax number pairing is read off invoices.remarks, using the same
+# cross-reference convention already used elsewhere in this file:
+#   - a PROFORMA row's remarks contains "Tax Invoice No: <no>" once a tax
+#     invoice has actually been created against it (BOTH mode, or a later
+#     PROFORMA_ONLY -> TAX_ONLY conversion)
+#   - a TAX row's remarks contains "Proforma Invoice No: <no>" when it was
+#     converted from an existing proforma
+# If no such reference exists, the corresponding number is left blank —
+# i.e. "if tax is not made, do not show it".
+# ============================================================================
+
+import re as _dept_re
+
+
+def _prf_tax_numbers(invoice_type: str, remarks: str, invoice_no: str):
+    """Given one invoice row, return (prf_number, tax_number) using the
+    remarks cross-reference convention described above."""
+    prf_number = None
+    tax_number = None
+    if invoice_type == "PROFORMA":
+        prf_number = invoice_no
+        if remarks:
+            m = _dept_re.search(r"Tax Invoice No[:\s]+(\S+)", remarks)
+            if m:
+                tax_number = m.group(1).strip()
+    elif invoice_type == "TAX":
+        tax_number = invoice_no
+        if remarks:
+            m = _dept_re.search(r"Proforma Invoice No[:\s]+(\S+)", remarks)
+            if m:
+                prf_number = m.group(1).strip()
+    return prf_number, tax_number
+
+
+@router.get("/departments/summary")
+def get_department_revenue_summary():
+    """
+    Returns every department that has invoiced tests, with the total cost
+    and test count across all (non-walk-in) invoices.
+
+    [{ "department": "GeoTech", "test_count": 3, "total_cost": 300.0 }, ...]
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT s.department,
+                   COUNT(*)                    AS test_count,
+                   COALESCE(SUM(ii.amount), 0) AS total_cost
+            FROM invoice_items ii
+            JOIN samples  s ON ii.sample_id = s.sample_id
+            JOIN invoices i ON ii.invoice_id = i.invoice_id
+            WHERE s.department IS NOT NULL
+              AND s.department <> ''
+              AND i.generation_mode IS NOT NULL
+            GROUP BY s.department
+            ORDER BY total_cost DESC
+        """)
+        rows = cur.fetchall()
+        return [
+            {
+                "department": dept,
+                "test_count": int(count),
+                "total_cost": float(total) if total is not None else 0.0,
+            }
+            for dept, count, total in rows
+        ]
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close(); conn.close()
+
+
+@router.get("/departments/breakdown")
+def get_department_revenue_breakdown(department: str):
+    """
+    Month-wise drill-down for a single department: for each month, the list
+    of tests (test name, invoice date, PRF no., Tax no. if made, cost) plus
+    a month total, newest month first.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT ii.description,
+                   ii.amount,
+                   i.invoice_no,
+                   i.invoice_type,
+                   i.invoice_date,
+                   i.remarks
+            FROM invoice_items ii
+            JOIN samples  s ON ii.sample_id = s.sample_id
+            JOIN invoices i ON ii.invoice_id = i.invoice_id
+            WHERE s.department = %s
+              AND i.generation_mode IS NOT NULL
+            ORDER BY i.invoice_date DESC NULLS LAST, ii.item_id DESC
+        """, (department,))
+        rows = cur.fetchall()
+
+        months = []          # ordered list of month buckets
+        by_key = {}           # month_key -> bucket dict
+        total_cost = 0.0
+
+        for description, amount, invoice_no, invoice_type, invoice_date, remarks in rows:
+            cost = float(amount) if amount is not None else 0.0
+            total_cost += cost
+
+            prf_number, tax_number = _prf_tax_numbers(invoice_type, remarks, invoice_no)
+
+            if invoice_date:
+                month_key   = invoice_date.strftime("%Y-%m")
+                month_label = invoice_date.strftime("%B %Y")
+                date_str    = invoice_date.strftime("%d-%b-%Y")
+            else:
+                month_key = month_label = "Undated"
+                date_str  = None
+
+            if month_key not in by_key:
+                bucket = {"month_key": month_key, "month_label": month_label,
+                          "total_cost": 0.0, "tests": []}
+                by_key[month_key] = bucket
+                months.append(bucket)
+
+            bucket = by_key[month_key]
+            bucket["total_cost"] += cost
+            bucket["tests"].append({
+                "test_name":    description or "—",
+                "invoice_date": date_str,
+                "prf_number":   prf_number,
+                "tax_number":   tax_number,
+                "cost":         round(cost, 2),
+            })
+
+        for bucket in months:
+            bucket["total_cost"] = round(bucket["total_cost"], 2)
+
+        return {
+            "department": department,
+            "total_cost": round(total_cost, 2),
+            "test_count": len(rows),
+            "months":     months,
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close(); conn.close()
