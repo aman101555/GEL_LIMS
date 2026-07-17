@@ -89,6 +89,33 @@ TEMPLATE_TYPES = {
         "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/Aggregates_Test_Request.xlsx",
         "generator": "concrete",  # Same layout as concrete
     },
+    # "Other" catch-all category (Admixture, Geotechnical, Grout, Hardened Concrete,
+    # Lab, NDT, Rebound, Storage, Waterproofing group_names). No dedicated template
+    # exists yet for this category, so it temporarily reuses the soil template/layout.
+    # Revisit once a proper "Other" template is designed.
+    "other": {
+        "label": "Other",
+        "url": "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/test-requests/ST_Test_Request.xlsx",
+        "generator": "soil",
+    },
+}
+
+
+# ---------------------------
+# Test Request Type -> price_catalog.group_name filter map
+# ---------------------------
+# The "Test Request Type" selector on the frontend now has 6 options that map
+# onto price_catalog.group_name values (via quotation_items.catalog_id). This
+# is what powers "show only tests belonging to this group" filtering on the
+# Test Request Scene's test selection table.
+GROUP_FILTER_MAP = {
+    "soil": ["Soil", "Aggregate"],               # "Soil - Aggregate"
+    "water": ["Water"],
+    "in_situ": ["In-situ", "In-Situ"],           # both casings seen in data
+    "steel": ["Steel"],
+    "concrete": ["Asphalt", "Blocks/Tiles", "Cement/Materials", "Concrete", "Fresh Concrete"],
+    "other": ["Admixture", "Geotechnical", "Grout", "Hardened Concrete", "Lab",
+              "NDT", "Rebound", "Storage", "Waterproofing"],
 }
 
 
@@ -508,6 +535,9 @@ class TestRequestStatusUpdate(BaseModel):
 
 class ItemQuantityUpdate(BaseModel):
     quantity: int
+
+class ItemStandardUpdate(BaseModel):
+    test_standard: str   # Fully combined string, e.g. "BS 812 - S 103.1 7.2/7.3"
 
 
 # ---------------------------
@@ -1065,13 +1095,14 @@ def get_available_items(test_request_id: int):
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT project_id FROM test_requests WHERE test_request_id = %s", (test_request_id,))
+        cur.execute("SELECT project_id, template_type FROM test_requests WHERE test_request_id = %s", (test_request_id,))
         row = cur.fetchone()
 
         if row is None:
             raise HTTPException(404, "Test request not found")
 
         project_id = row[0]
+        template_type = row[1] or "soil"
 
         cur.execute("SELECT quotation_id FROM projects WHERE project_id = %s", (project_id,))
         qrow = cur.fetchone()
@@ -1081,13 +1112,29 @@ def get_available_items(test_request_id: int):
 
         quotation_id = qrow[0]
 
-        # Get ALL quotation items
-        cur.execute("""
-            SELECT qi.item_id, qi.description, qi.test_standard, qi.quantity, qi.unit_rate, qi.amount
-            FROM quotation_items qi
-            WHERE qi.quotation_id = %s
-            ORDER BY qi.item_id
-        """, (quotation_id,))
+        # Get ALL quotation items, filtered to the group(s) matching this test
+        # request's selected "Test Request Type" (e.g. Soil-Aggregate, Water,
+        # In-Situ, Steel, Concrete, Other). Filtering is via price_catalog.group_name,
+        # joined through quotation_items.catalog_id. Items without a catalog_id
+        # (not yet backfilled) are still shown so nothing silently disappears.
+        allowed_groups = GROUP_FILTER_MAP.get(template_type)
+
+        if allowed_groups:
+            cur.execute("""
+                SELECT qi.item_id, qi.description, qi.test_standard, qi.quantity, qi.unit_rate, qi.amount
+                FROM quotation_items qi
+                LEFT JOIN price_catalog pc ON qi.catalog_id = pc.catalog_id
+                WHERE qi.quotation_id = %s
+                  AND (pc.group_name = ANY(%s) OR qi.catalog_id IS NULL)
+                ORDER BY qi.item_id
+            """, (quotation_id, allowed_groups))
+        else:
+            cur.execute("""
+                SELECT qi.item_id, qi.description, qi.test_standard, qi.quantity, qi.unit_rate, qi.amount
+                FROM quotation_items qi
+                WHERE qi.quotation_id = %s
+                ORDER BY qi.item_id
+            """, (quotation_id,))
 
         all_items = cur.fetchall()
         
@@ -1136,6 +1183,174 @@ def get_available_items(test_request_id: int):
 
     except Exception as e:
         raise HTTPException(500, f"Error loading available items: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# Assign / Edit Test Standard on a quotation item
+# ---------------------------
+# Used by both the "Assign Standard" flow (test_standard was NULL/blank) and
+# the pencil-icon "edit" flow (test_standard already had a value). Either way
+# it's the same operation: overwrite quotation_items.test_standard with the
+# fully-combined standard string built by the frontend wizard. Since this
+# updates the underlying quotation item, the change is reflected everywhere
+# that item is read from (test request views, downloads, invoicing).
+@router.patch("/items/{item_id}/standard")
+def update_item_standard(item_id: int, payload: ItemStandardUpdate):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        standard = (payload.test_standard or "").strip()
+        if not standard:
+            raise HTTPException(400, "test_standard cannot be empty")
+
+        cur.execute("""
+            UPDATE quotation_items
+            SET test_standard = %s
+            WHERE item_id = %s
+            RETURNING item_id, description, test_standard
+        """, (standard, item_id))
+
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(404, "Quotation item not found")
+
+        conn.commit()
+
+        return {
+            "item_id": row[0],
+            "description": row[1],
+            "test_standard": row[2],
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Error updating test standard: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# Admin: backfill quotation_items.catalog_id
+# ---------------------------
+# One-time-ish data-linking helper, exposed as endpoints instead of a CLI
+# script so it can be run from the browser/Postman. Requires the migration
+# (catalog_id column + FK on quotation_items) to already be applied.
+#
+# Matching strategy per quotation_item with catalog_id IS NULL:
+#   1. Exact match on TRIM(LOWER(description)) AND TRIM(LOWER(test_standard))
+#      against a single price_catalog row -> confident match.
+#   2. Exact match on TRIM(LOWER(description)) only, and exactly ONE
+#      price_catalog row has that description -> confident match.
+#   3. Otherwise -> reported under "needs_review", never guessed.
+#
+# NOTE: these are unauthenticated, same as every other endpoint in this
+# router. Since /apply performs a bulk UPDATE, don't expose this router
+# publicly without adding auth first.
+def _normalize(s):
+    return (s or "").strip().lower()
+
+
+def _compute_catalog_id_matches(cur):
+    cur.execute("""
+        SELECT catalog_id, description, test_standard
+        FROM price_catalog
+        WHERE active IS DISTINCT FROM false
+    """)
+    catalog_rows = cur.fetchall()
+
+    exact_lookup = {}
+    desc_only_lookup = {}
+    for catalog_id, description, test_standard in catalog_rows:
+        exact_lookup.setdefault((_normalize(description), _normalize(test_standard)), []).append(catalog_id)
+        desc_only_lookup.setdefault(_normalize(description), []).append(catalog_id)
+
+    cur.execute("""
+        SELECT item_id, description, test_standard
+        FROM quotation_items
+        WHERE catalog_id IS NULL
+        ORDER BY item_id
+    """)
+    unmatched_items = cur.fetchall()
+
+    matches = []       # (item_id, catalog_id, reason)
+    needs_review = []  # (item_id, description, test_standard, reason)
+
+    for item_id, description, test_standard in unmatched_items:
+        exact_candidates = exact_lookup.get((_normalize(description), _normalize(test_standard)), [])
+        if len(exact_candidates) == 1:
+            matches.append((item_id, exact_candidates[0], "exact description+standard"))
+            continue
+
+        desc_candidates = desc_only_lookup.get(_normalize(description), [])
+        if len(desc_candidates) == 1:
+            matches.append((item_id, desc_candidates[0], "unique description match"))
+            continue
+
+        if len(exact_candidates) > 1 or len(desc_candidates) > 1:
+            needs_review.append((item_id, description, test_standard, "ambiguous — multiple price_catalog rows match"))
+        else:
+            needs_review.append((item_id, description, test_standard, "no matching price_catalog row found"))
+
+    return matches, needs_review
+
+
+@router.get("/admin/backfill-catalog-ids/preview")
+def preview_backfill_catalog_ids():
+    """Dry run — reports what would be linked, writes nothing."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        matches, needs_review = _compute_catalog_id_matches(cur)
+        return {
+            "total_missing_catalog_id": len(matches) + len(needs_review),
+            "confident_matches": len(matches),
+            "needs_review_count": len(needs_review),
+            "needs_review": [
+                {"item_id": item_id, "description": description, "test_standard": test_standard, "reason": reason}
+                for item_id, description, test_standard, reason in needs_review
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Error previewing backfill: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.post("/admin/backfill-catalog-ids/apply")
+def apply_backfill_catalog_ids():
+    """Writes catalog_id for every confident match found by the preview logic."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        matches, needs_review = _compute_catalog_id_matches(cur)
+
+        for item_id, catalog_id, reason in matches:
+            cur.execute(
+                "UPDATE quotation_items SET catalog_id = %s WHERE item_id = %s",
+                (catalog_id, item_id)
+            )
+        conn.commit()
+
+        return {
+            "applied": len(matches),
+            "needs_review_count": len(needs_review),
+            "needs_review": [
+                {"item_id": item_id, "description": description, "test_standard": test_standard, "reason": reason}
+                for item_id, description, test_standard, reason in needs_review
+            ],
+        }
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Error applying backfill: {str(e)}")
     finally:
         cur.close()
         conn.close()
