@@ -18,6 +18,20 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, date
+
+
+def _ensure_walkin_items_invoiced_columns(cur):
+    """
+    Same idempotent migration as the one in invoices.py (kept local here too
+    so this router doesn't depend on load order between the two files).
+    Adds tracking for whether a walk-in test has already been pulled onto a
+    generated invoice, so it stops being offered/auto-selected afterwards.
+    """
+    cur.execute("""
+        ALTER TABLE walk_in_items
+            ADD COLUMN IF NOT EXISTS invoiced    BOOLEAN NOT NULL DEFAULT FALSE,
+            ADD COLUMN IF NOT EXISTS invoice_id   INTEGER
+    """)
 import os
 import re
 import tempfile
@@ -143,6 +157,8 @@ def get_items_for_payment_advice(project_id: int):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        _ensure_walkin_items_invoiced_columns(cur)
+
         cur.execute("""
             SELECT project_id, project_no, walk_in_client, project_name,
                    consultant, plot_no, walk_in_phone, client_name
@@ -158,7 +174,8 @@ def get_items_for_payment_advice(project_id: int):
 
         cur.execute("""
             SELECT item_id, description, test_standard, unit_rate,
-                   quantity, amount, net_unit, item_code, pa_generated
+                   quantity, amount, net_unit, item_code, pa_generated,
+                   COALESCE(invoiced, FALSE)
             FROM walk_in_items
             WHERE project_id = %s
             ORDER BY item_id
@@ -176,6 +193,7 @@ def get_items_for_payment_advice(project_id: int):
                 "net_unit": r[6],
                 "item_code": r[7],
                 "already_advised": bool(r[8]),
+                "already_invoiced": bool(r[9]),  # NEW: set once this test is pulled onto a generated invoice
             }
             for r in rows
         ]
