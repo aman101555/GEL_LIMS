@@ -12,9 +12,15 @@ from supabase import create_client, Client
 from template_processor import CoverSheetTemplateProcessor, WorkInstructionTemplateProcessor, BoreholeLogTemplateProcessor, SampleDescriptionTemplateProcessor
 
 SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
-SUPABASE_KEY = "sb_secret_-8uQCdQSiUgDFO_MUEsTWg_TPWtsyy3"
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# NOTE: this MUST be the legacy JWT-format service_role key
+# (Supabase Dashboard -> Settings -> API keys -> "Legacy anon, service_role API keys" -> service_role/secret),
+# i.e. a string starting with "eyJhbGci...". The new-style "sb_secret_..." key format is NOT a JWT and
+# causes Supabase Storage to throw "403 Invalid Compact JWS" when used with supabase-py's create_client().
+# service_role (not anon) is required because this file deletes/upserts LPO files, which needs to bypass RLS.
+SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhxd2drbWJqbWN4cHhid2NjY2xvIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTM2MDcyNywiZXhwIjoyMDg0OTM2NzI3fQ.nwZeCYBQlhHW_kpa3H96TCRPAd-VAZviJ-87Xa5KLME"
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
