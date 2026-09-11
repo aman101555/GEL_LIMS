@@ -22,7 +22,7 @@ from supabase import create_client, Client
 
 # Supabase configuration
 SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
-SUPABASE_KEY = "sb_secret_-8uQCdQSiUgDFO_MUEsTWg_TPWtsyy3"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhxd2drbWJqbWN4cHhid2NjY2xvIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTM2MDcyNywiZXhwIjoyMDg0OTM2NzI3fQ.nwZeCYBQlhHW_kpa3H96TCRPAd-VAZviJ-87Xa5KLME"
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
