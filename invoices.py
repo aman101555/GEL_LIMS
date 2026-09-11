@@ -10,6 +10,28 @@ from utils import resource_path  # ADD THIS LINE
 import requests
 import tempfile
 
+# Advance Payment feature — shared ledger helpers (see advance_payments.py)
+from advance_payments import (
+    ensure_advance_table,
+    get_client_advance_balance,
+    record_advance_usage,
+)
+
+
+def _ensure_walkin_items_invoiced_columns(cur):
+    """
+    walk_in_items previously only tracked `pa_generated` ("Already Advised").
+    There was no way to tell an item had already been pulled onto a generated
+    invoice, so the "Payment Advised Tests" picker in Generate Invoice kept
+    showing (and auto-selecting) tests indefinitely, letting them be invoiced
+    over and over. Adds the missing tracking columns — idempotent, cheap.
+    """
+    cur.execute("""
+        ALTER TABLE walk_in_items
+            ADD COLUMN IF NOT EXISTS invoiced    BOOLEAN NOT NULL DEFAULT FALSE,
+            ADD COLUMN IF NOT EXISTS invoice_id   INTEGER
+    """)
+
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -32,7 +54,7 @@ class InvoiceItemCreate(BaseModel):
 class InvoiceCreate(BaseModel):
     project_id: int
     invoice_type: Literal['CASH', 'CREDIT', 'PROFORMA', 'TAX']
-    payment_method: Optional[Literal['CASH', 'CREDIT']] = 'CASH'  # NEW
+    payment_method: Optional[Literal['CASH', 'CREDIT', 'ADVANCE']] = 'CASH'  # NEW: added ADVANCE
     invoice_date: Optional[date] = None
     client_reference: Optional[str] = None
     lpo_reference: Optional[str] = None
@@ -672,6 +694,9 @@ def _create_invoice_with_payment_method_impl(
     payload: InvoiceCreate,
     sample_ids: Optional[List[int]] = None,
     shared_cur=None,          # ← NEW: pass caller's cursor to avoid cross-connection deadlocks
+    deduct_advance: bool = True,                  # NEW: see ADVANCE PAYMENT note below
+    override_payment_status: Optional[str] = None,  # NEW
+    override_paid_date=None,                         # NEW
 ):
     """
     Shared implementation for creating an invoice.
@@ -683,6 +708,16 @@ def _create_invoice_with_payment_method_impl(
                     The caller is responsible for commit/rollback.
                     When None (standalone callers), this function manages its own
                     connection and commits internally.
+
+    ADVANCE PAYMENT NOTE — `deduct_advance` / `override_payment_status` /
+    `override_paid_date`:
+        A PROFORMA_ONLY invoice already deducts the advance (and is marked
+        PAID/UNPAID accordingly) when it's created. When that same proforma
+        is later finalized into a TAX invoice (TAX_ONLY mode), the caller
+        must pass `deduct_advance=False` plus the ORIGINAL proforma's
+        `payment_status`/`paid_date` as the override_* args — otherwise the
+        advance would be deducted a second time for the same amount, and
+        the status would be recomputed against an already-reduced balance.
     """
     _own_conn = shared_cur is None          # True  → we manage conn lifecycle
     conn = None
@@ -765,6 +800,38 @@ def _create_invoice_with_payment_method_impl(
         payment_terms = payload.payment_terms or "30 days" if payload.payment_method == "CREDIT" else "Immediate"
 
         # ---------------------------------------------------
+        # 5a. ADVANCE PAYMENT — determine status BEFORE insert.
+        # This does NOT touch CASH/CREDIT behavior at all.
+        #
+        # The ledger deduction itself only happens after the invoice row +
+        # items are successfully committed (see step 7a below), so a failed
+        # invoice never consumes advance. If the advance fully covers the
+        # invoice total, the invoice is created directly as PAID using the
+        # same paid_date convention as the existing manual
+        # PATCH /{invoice_id}/payment-status endpoint (paid_date = invoice date
+        # / today). If it doesn't fully cover it, generation proceeds
+        # completely normally (UNPAID) and the balance is still allowed to go
+        # negative — invoice creation is never blocked.
+        # ---------------------------------------------------
+        client_id_for_advance = project_data[6]
+        invoice_date_val = payload.invoice_date or date.today()
+        payment_status_initial = "UNPAID"
+        paid_date_val = None
+
+        if override_payment_status is not None:
+            # TAX_ONLY finalization of an already-settled ADVANCE proforma —
+            # inherit the status as-is, do NOT recompute against the (already
+            # reduced) current balance.
+            payment_status_initial = override_payment_status
+            paid_date_val = override_paid_date
+        elif payload.payment_method == "ADVANCE":
+            ensure_advance_table(cur)
+            current_advance_balance = float(get_client_advance_balance(cur, client_id_for_advance))
+            if current_advance_balance >= total:
+                payment_status_initial = "PAID"
+                paid_date_val = invoice_date_val
+
+        # ---------------------------------------------------
         # 6. Insert invoice header
         # ---------------------------------------------------
         cur.execute("""
@@ -772,16 +839,16 @@ def _create_invoice_with_payment_method_impl(
                 invoice_no, project_id, invoice_type, payment_method, invoice_date,
                 client_reference, lpo_reference, lpo_date, payment_terms,
                 subtotal, vat, total, amount_in_words, services_description, remarks,
-                payment_status
+                payment_status, paid_date
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING invoice_id
         """, (
             invoice_no,
             payload.project_id,
             payload.invoice_type,
             payload.payment_method,
-            payload.invoice_date or date.today(),
+            invoice_date_val,
             payload.client_reference,
             lpo_reference,
             lpo_date,
@@ -789,7 +856,8 @@ def _create_invoice_with_payment_method_impl(
             subtotal, vat, total, amount_words,
             payload.services_description or f"Testing services for {project_data[2]}",
             payload.remarks,
-            "UNPAID",
+            payment_status_initial,
+            paid_date_val,
         ))
         invoice_id = cur.fetchone()[0]
 
@@ -809,6 +877,27 @@ def _create_invoice_with_payment_method_impl(
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (invoice_id, description, test_standard,
                   unit_rate_float, quantity, amount, sample_id))
+
+        # ---------------------------------------------------
+        # 7a. ADVANCE PAYMENT — record the deduction now that the invoice
+        # (and its items) have been successfully built. The full invoice
+        # total (incl. VAT) is always deducted, even if it takes the
+        # client's balance negative — invoice generation is never blocked
+        # on advance being insufficient (see spec: "do not prevent invoice
+        # generation"). This only records a ledger entry once, at the
+        # moment the invoice is actually saved/generated — never during
+        # live preview.
+        # ---------------------------------------------------
+        if payload.payment_method == "ADVANCE" and deduct_advance:
+            record_advance_usage(
+                cur,
+                client_id=client_id_for_advance,
+                amount=total,
+                invoice_id=invoice_id,
+                invoice_no=invoice_no,
+                invoice_date=invoice_date_val,
+                note=f"Applied to invoice {invoice_no}",
+            )
 
         # ---------------------------------------------------
         # 8. Commit only when we own the connection
@@ -908,7 +997,8 @@ def get_latest_projects():
                 COALESCE(c.name, p.client_name, p.walk_in_client) as client_name,
                 p.location,
                 q.quotation_no,
-                p.is_walk_in
+                p.is_walk_in,
+                c.client_id
             FROM projects p
             LEFT JOIN clients c ON p.client_id = c.client_id
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
@@ -920,7 +1010,7 @@ def get_latest_projects():
 
         projects = []
         for row in cur.fetchall():
-            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in = row
+            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in, client_id = row
             display_label = f"{project_no} - {project_name} ({client_name})"
             projects.append({
                 "project_id": project_id,
@@ -931,6 +1021,7 @@ def get_latest_projects():
                 "location": location,
                 "quotation_no": quotation_no,
                 "is_walk_in": bool(is_walk_in),
+                "client_id": client_id,  # NEW: used to look up advance balance
                 "value": project_id,
                 "label": display_label,
             })
@@ -966,7 +1057,8 @@ def search_projects(q: str = ""):
                 COALESCE(c.name, p.client_name, p.walk_in_client) as client_name,
                 p.location,
                 q.quotation_no,
-                p.is_walk_in
+                p.is_walk_in,
+                c.client_id
             FROM projects p
             LEFT JOIN clients c ON p.client_id = c.client_id
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
@@ -985,7 +1077,7 @@ def search_projects(q: str = ""):
 
         projects = []
         for row in cur.fetchall():
-            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in = row
+            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in, client_id = row
             display_label = f"{project_no} - {project_name} ({client_name})"
             projects.append({
                 "project_id": project_id,
@@ -996,6 +1088,7 @@ def search_projects(q: str = ""):
                 "location": location,
                 "quotation_no": quotation_no,
                 "is_walk_in": bool(is_walk_in),
+                "client_id": client_id,  # NEW: used to look up advance balance
                 "value": project_id,
                 "label": display_label,
             })
@@ -1641,6 +1734,76 @@ def get_reports_for_invoice(project_id: int, invoice_type: str):
 
 
 # =====================================================
+# NEW: Advance Payment support — live totals preview
+# =====================================================
+@router.get("/projects/{project_id}/preview-totals",
+            summary="Live subtotal/VAT/total preview for a report selection (no invoice created)")
+def preview_invoice_totals(project_id: int, include_all: bool = True, report_ids: Optional[str] = None):
+    """
+    Computes subtotal / VAT / total for a given set of report_ids using the
+    exact same item-resolution logic as real invoice creation
+    (get_project_quotation_items + get_sample_ids_for_reports), WITHOUT
+    creating an invoice or touching the advance ledger.
+
+    Used by the "Advance Paid" payment method preview in Create Invoice so
+    the Remaining Advance figure updates live as reports/tests are
+    added/removed, before the invoice is actually generated.
+
+    report_ids: comma-separated report_id list. Ignored when include_all=True.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_walkin_proforma_records_table(cur)
+
+        if include_all:
+            cur.execute("""
+                SELECT DISTINCT r.report_id
+                FROM reports r
+                JOIN samples s ON r.sample_id = s.sample_id
+                JOIN test_requests tr ON s.request_id = tr.test_request_id
+                WHERE tr.project_id = %s
+                  AND r.status = 'APPROVED'
+                  AND r.report_no NOT IN (
+                      SELECT report_no FROM invoice_report_links WHERE invoice_type = 'PROFORMA'
+                  )
+            """, (project_id,))
+            report_id_list = [r[0] for r in cur.fetchall()]
+        else:
+            report_id_list = [int(x) for x in report_ids.split(",") if x.strip().isdigit()] if report_ids else []
+
+        if not report_id_list:
+            return {"subtotal": 0.0, "vat": 0.0, "total": 0.0}
+
+        sample_ids_filter = get_sample_ids_for_reports(report_id_list, cur)
+        if not sample_ids_filter:
+            return {"subtotal": 0.0, "vat": 0.0, "total": 0.0}
+
+        items = get_project_quotation_items(project_id, cur, sample_ids=sample_ids_filter)
+
+        subtotal = 0.0
+        for item in items:
+            (item_id, description, test_standard, unit_rate, quantity,
+             test_request_id, request_no, sample_id, sample_no, sample_status) = item
+            unit_rate_f = float(unit_rate) if isinstance(unit_rate, Decimal) else unit_rate
+            subtotal += unit_rate_f * quantity
+
+        vat   = subtotal * 0.05
+        total = subtotal + vat
+
+        return {
+            "subtotal": round(subtotal, 2),
+            "vat": round(vat, 2),
+            "total": round(total, 2),
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# =====================================================
 # MODIFIED: Create Invoice - Record report links
 # =====================================================
 @router.patch("/{invoice_id}/payment-status")
@@ -2171,7 +2334,7 @@ def generate_excel_invoice_combined(invoice_id: int):
 
 class WalkInInvoiceRequest(BaseModel):
     project_id: int
-    payment_method: Optional[Literal['CASH', 'CREDIT']] = 'CASH'
+    payment_method: Optional[Literal['CASH', 'CREDIT', 'ADVANCE']] = 'CASH'  # NEW: added ADVANCE
     selected_item_ids: Optional[List[int]] = None
     include_all_items: bool = True
 
@@ -2194,7 +2357,7 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
         # ──────────────────────────────────────────────────────────
         cur.execute("""
             SELECT project_id, project_no, walk_in_client, walk_in_phone,
-                   consultant, plot_no, client_name, project_name
+                   consultant, plot_no, client_name, project_name, client_id
             FROM projects
             WHERE project_id = %s AND is_walk_in = TRUE
         """, (payload.project_id,))
@@ -2203,7 +2366,7 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
             raise HTTPException(404, "Walk-in LP not found")
 
         (project_id, project_no, walk_in_client, walk_in_phone,
-         consultant, plot_no, client_name, project_name) = proj
+         consultant, plot_no, client_name, project_name, client_id) = proj
 
         if not project_no or project_no == "PENDING":
             raise HTTPException(400, "LP number has not been generated for this walk-in yet")
@@ -2219,28 +2382,32 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
         # 2. Resolve items
         #
         # BUSINESS RULE: Only tests that have a Payment Advice
-        # (pa_generated = TRUE) can be invoiced. Tests without a PA
-        # are not yet invoiceable and must be excluded regardless of
-        # what the frontend sends.
+        # (pa_generated = TRUE) AND have NOT already been invoiced
+        # can be invoiced. Tests without a PA, or already consumed by
+        # a previous invoice, must be excluded regardless of what the
+        # frontend sends.
         # ──────────────────────────────────────────────────────────
+        _ensure_walkin_items_invoiced_columns(cur)
+
         if payload.include_all_items:
-            # "Select All" from the UI = all ADVISED items for this LP
+            # "Select All" from the UI = all ADVISED, NOT-YET-INVOICED items
             cur.execute("""
                 SELECT item_id, description, test_standard, unit_rate, quantity, amount
                 FROM walk_in_items
-                WHERE project_id = %s AND pa_generated = TRUE
+                WHERE project_id = %s AND pa_generated = TRUE AND invoiced = FALSE
                 ORDER BY item_id
             """, (project_id,))
         else:
             if not payload.selected_item_ids:
                 raise HTTPException(400, "No tests selected")
-            # Explicit selection — enforce pa_generated = TRUE as a safety guard
+            # Explicit selection — enforce pa_generated = TRUE and not-yet-invoiced
             cur.execute("""
                 SELECT item_id, description, test_standard, unit_rate, quantity, amount
                 FROM walk_in_items
                 WHERE project_id = %s
                   AND item_id = ANY(%s)
                   AND pa_generated = TRUE
+                  AND invoiced = FALSE
                 ORDER BY item_id
             """, (project_id, payload.selected_item_ids))
 
@@ -2249,7 +2416,8 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
             raise HTTPException(
                 400,
                 "No invoiceable tests found. Only tests with a Payment Advice (Already Advised) "
-                "can be included on an invoice. Please generate a Payment Advice first."
+                "that haven't already been invoiced can be included. Please generate a Payment "
+                "Advice first, or check whether these tests were already invoiced."
             )
 
         items = [
@@ -2281,6 +2449,29 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
         payment_terms = "30 days" if payload.payment_method == "CREDIT" else "Immediate"
 
         # ──────────────────────────────────────────────────────────
+        # 4a. ADVANCE PAYMENT — same rules as the non-walk-in flow:
+        # never blocks generation, only deducts once the invoice is
+        # actually saved, marks PAID immediately when fully covered.
+        # ──────────────────────────────────────────────────────────
+        invoice_date_val = date.today()
+        payment_status_initial = "UNPAID"
+        paid_date_val = None
+
+        if payload.payment_method == "ADVANCE":
+            if not client_id:
+                raise HTTPException(
+                    400,
+                    "This walk-in customer isn't linked to a client record yet, "
+                    "so Advance Payment can't be used. Edit the walk-in's "
+                    "'Client / Owner' field and pick the client from the list."
+                )
+            ensure_advance_table(cur)
+            current_advance_balance = float(get_client_advance_balance(cur, client_id))
+            if current_advance_balance >= grand_total:
+                payment_status_initial = "PAID"
+                paid_date_val = invoice_date_val
+
+        # ──────────────────────────────────────────────────────────
         # 5. Persist invoice header (walk-in projects have no client_id /
         #    quotation_id so we use the PROFORMA invoice row only; the Tax
         #    number is recorded in the remarks field for traceability).
@@ -2290,15 +2481,15 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
                 invoice_no, project_id, invoice_type, payment_method, invoice_date,
                 lpo_reference, payment_terms,
                 subtotal, vat, total, amount_in_words,
-                services_description, remarks, payment_status
+                services_description, remarks, payment_status, paid_date, generation_mode
             )
-            VALUES (%s, %s, 'PROFORMA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'UNPAID')
+            VALUES (%s, %s, 'PROFORMA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'BOTH')
             RETURNING invoice_id
         """, (
             proforma_no,
             project_id,
             payload.payment_method,
-            date.today(),
+            invoice_date_val,
             project_no,          # LP number stored as lpo_reference for walk-ins
             payment_terms,
             subtotal,
@@ -2307,6 +2498,8 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
             words,
             f"Testing services — {proj_name}",
             f"Tax Invoice No: {tax_no}",
+            payment_status_initial,
+            paid_date_val,
         ))
         invoice_id = cur.fetchone()[0]
 
@@ -2326,6 +2519,34 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
                 item["quantity"],
                 item["amount"],
             ))
+
+        # ──────────────────────────────────────────────────────────
+        # 5a. Mark these walk_in_items as invoiced so they stop showing up
+        # (and stop auto-selecting) as available/"Already Advised" tests on
+        # future invoice-generation attempts for this LP.
+        # ──────────────────────────────────────────────────────────
+        cur.execute("""
+            UPDATE walk_in_items
+            SET invoiced = TRUE, invoice_id = %s
+            WHERE item_id = ANY(%s)
+        """, (invoice_id, [item["item_id"] for item in items]))
+
+        # ──────────────────────────────────────────────────────────
+        # 5b. ADVANCE PAYMENT — record the deduction now that the invoice
+        # (and its items) have been successfully built. Deducts the full
+        # total even if it takes the balance negative — generation is
+        # never blocked.
+        # ──────────────────────────────────────────────────────────
+        if payload.payment_method == "ADVANCE":
+            record_advance_usage(
+                cur,
+                client_id=client_id,
+                amount=grand_total,
+                invoice_id=invoice_id,
+                invoice_no=proforma_no,
+                invoice_date=invoice_date_val,
+                note=f"Applied to invoice {proforma_no}",
+            )
 
         conn.commit()
 
@@ -2657,7 +2878,7 @@ import urllib.parse as _urlparse
 class WalkInProformaOnlyRequest(BaseModel):
     """Option B — Proforma Only (walk-in LP)"""
     project_id:         int
-    payment_method:     Optional[Literal['CASH', 'CREDIT']] = 'CASH'
+    payment_method:     Optional[Literal['CASH', 'CREDIT', 'ADVANCE']] = 'CASH'  # NEW: added ADVANCE
     selected_item_ids:  Optional[List[int]] = None   # None / empty → all advised
     include_all_items:  bool = True
 
@@ -2666,14 +2887,14 @@ class WalkInTaxOnlyRequest(BaseModel):
     """Option C — Tax Only (walk-in LP)"""
     project_id:         int
     proforma_record_id: int          # walkin_proforma_records.id chosen by user
-    payment_method:     Optional[Literal['CASH', 'CREDIT']] = 'CASH'
+    payment_method:     Optional[Literal['CASH', 'CREDIT', 'ADVANCE']] = 'CASH'  # NEW: added ADVANCE
 
 
 class NonWalkInInvoiceRequest(BaseModel):
     """Unified request for non-walk-in LPs (Options A / B / C)"""
     project_id:          int
     generation_mode:     Literal['BOTH', 'PROFORMA_ONLY', 'TAX_ONLY']
-    payment_method:      Optional[Literal['CASH', 'CREDIT']] = 'CASH'
+    payment_method:      Optional[Literal['CASH', 'CREDIT', 'ADVANCE']] = 'CASH'  # NEW: added ADVANCE
     include_all_reports: bool = True
     selected_report_ids: Optional[List[int]] = None
     # Only required for TAX_ONLY
@@ -2811,7 +3032,7 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
         # 1. Load project
         cur.execute("""
             SELECT project_id, project_no, walk_in_client, walk_in_phone,
-                   consultant, plot_no, client_name, project_name
+                   consultant, plot_no, client_name, project_name, client_id
             FROM projects
             WHERE project_id = %s AND is_walk_in = TRUE
         """, (payload.project_id,))
@@ -2820,13 +3041,16 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
             raise HTTPException(404, "Walk-in LP not found")
         if not proj[1] or proj[1] == "PENDING":
             raise HTTPException(400, "LP number has not been generated yet")
+        walkin_client_id = proj[8]
 
-        # 2. Resolve items (pa_generated = TRUE guard)
+        # 2. Resolve items (pa_generated = TRUE guard, and not already invoiced)
+        _ensure_walkin_items_invoiced_columns(cur)
+
         if payload.include_all_items or not payload.selected_item_ids:
             cur.execute("""
                 SELECT item_id, description, test_standard, unit_rate, quantity, amount
                 FROM walk_in_items
-                WHERE project_id = %s AND pa_generated = TRUE
+                WHERE project_id = %s AND pa_generated = TRUE AND invoiced = FALSE
                 ORDER BY item_id
             """, (payload.project_id,))
         else:
@@ -2836,6 +3060,7 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
                 WHERE project_id = %s
                   AND item_id = ANY(%s)
                   AND pa_generated = TRUE
+                  AND invoiced = FALSE
                 ORDER BY item_id
             """, (payload.project_id, payload.selected_item_ids))
 
@@ -2843,7 +3068,8 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
         if not rows:
             raise HTTPException(
                 400,
-                "No invoiceable tests found. Only tests with a Payment Advice can be invoiced."
+                "No invoiceable tests found. Only tests with a Payment Advice that "
+                "haven't already been invoiced can be invoiced."
             )
 
         items = [
@@ -2872,15 +3098,33 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
         today_str     = today.strftime("%d-%b-%Y")
         project_no    = proj[1]
 
+        # 4a. ADVANCE PAYMENT — same rules as elsewhere: never blocks
+        # generation, deducted only once the invoice is actually saved.
+        payment_status_initial = "UNPAID"
+        paid_date_val = None
+        if payload.payment_method == "ADVANCE":
+            if not walkin_client_id:
+                raise HTTPException(
+                    400,
+                    "This walk-in customer isn't linked to a client record yet, "
+                    "so Advance Payment can't be used. Edit the walk-in's "
+                    "'Client / Owner' field and pick the client from the list."
+                )
+            ensure_advance_table(cur)
+            current_advance_balance = float(get_client_advance_balance(cur, walkin_client_id))
+            if current_advance_balance >= grand_total:
+                payment_status_initial = "PAID"
+                paid_date_val = today
+
         # 5. Persist invoice row (PROFORMA only)
         cur.execute("""
             INSERT INTO invoices (
                 invoice_no, project_id, invoice_type, payment_method, invoice_date,
                 lpo_reference, payment_terms,
                 subtotal, vat, total, amount_in_words,
-                services_description, remarks, payment_status, generation_mode
+                services_description, remarks, payment_status, paid_date, generation_mode
             )
-            VALUES (%s, %s, 'PROFORMA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'UNPAID', 'PROFORMA_ONLY')
+            VALUES (%s, %s, 'PROFORMA', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PROFORMA_ONLY')
             RETURNING invoice_id
         """, (
             proforma_no, payload.project_id, payload.payment_method, today,
@@ -2888,6 +3132,7 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
             subtotal, vat, grand_total, words,
             f"Testing services — {proj[7] or proj[2] or ''}",
             "Proforma Invoice — Tax Invoice pending",
+            payment_status_initial, paid_date_val,
         ))
         invoice_id = cur.fetchone()[0]
 
@@ -2909,6 +3154,30 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
             RETURNING id
         """, (payload.project_id, invoice_id, proforma_no, item_ids))
         record_id = cur.fetchone()[0]
+
+        # 5a. Mark these walk_in_items as invoiced — the Proforma already
+        # commits them; the later Tax finalization (Option C) reuses the
+        # SAME items via walkin_proforma_records.item_ids and does not
+        # re-select from the pool, so this is the right (and only) place
+        # to mark them for the two-step flow too.
+        cur.execute("""
+            UPDATE walk_in_items
+            SET invoiced = TRUE, invoice_id = %s
+            WHERE item_id = ANY(%s)
+        """, (invoice_id, item_ids))
+
+        # 5b. ADVANCE PAYMENT — record the deduction now the invoice (and its
+        # items + proforma record) have been successfully built.
+        if payload.payment_method == "ADVANCE":
+            record_advance_usage(
+                cur,
+                client_id=walkin_client_id,
+                amount=grand_total,
+                invoice_id=invoice_id,
+                invoice_no=proforma_no,
+                invoice_date=today,
+                note=f"Applied to invoice {proforma_no}",
+            )
 
         conn.commit()
 
@@ -3098,7 +3367,8 @@ def generate_walkin_tax_only(payload: WalkInTaxOnlyRequest):
 
         # 3. Load original proforma invoice for financials
         cur.execute("""
-            SELECT subtotal, vat, total, amount_in_words, payment_method
+            SELECT subtotal, vat, total, amount_in_words, payment_method,
+                   payment_status, paid_date
             FROM invoices WHERE invoice_id = %s
         """, (proforma_invoice_id,))
         inv_row = cur.fetchone()
@@ -3110,6 +3380,13 @@ def generate_walkin_tax_only(payload: WalkInTaxOnlyRequest):
         grand_total = float(inv_row[2]) if inv_row[2] is not None else 0.0
         words       = inv_row[3] or number_to_words(grand_total)
         orig_method = inv_row[4] or payload.payment_method
+        orig_payment_status = inv_row[5]
+        orig_paid_date      = inv_row[6]
+        # If the proforma was settled via Advance, the tax finalization must
+        # carry the SAME method/status forward and must NOT touch the advance
+        # ledger again — it was already deducted when the proforma was created.
+        is_advance_settled = (orig_method == "ADVANCE")
+        tax_payment_method = "ADVANCE" if is_advance_settled else payload.payment_method
 
         # 4. Load original items from walk_in_items
         cur.execute("""
@@ -3132,11 +3409,17 @@ def generate_walkin_tax_only(payload: WalkInTaxOnlyRequest):
 
         # 5. Generate Tax Invoice number
         tax_no        = generate_invoice_no(cur, "TAX")
-        payment_terms = "30 days" if payload.payment_method == "CREDIT" else "Immediate"
+        payment_terms = "30 days" if tax_payment_method == "CREDIT" else "Immediate"
         today         = date.today()
         today_str     = today.strftime("%d-%b-%Y")
         project_no    = proj[1]
         proj_name     = proj[7] or proj[2] or "—"
+
+        # Advance-settled proformas carry their PAID/UNPAID + paid_date
+        # forward as-is (already determined & deducted at proforma time);
+        # everything else keeps the previous UNPAID-on-creation behavior.
+        tax_payment_status = orig_payment_status if is_advance_settled else "UNPAID"
+        tax_paid_date      = orig_paid_date if is_advance_settled else None
 
         # 6. Persist Tax Invoice row
         cur.execute("""
@@ -3144,18 +3427,22 @@ def generate_walkin_tax_only(payload: WalkInTaxOnlyRequest):
                 invoice_no, project_id, invoice_type, payment_method, invoice_date,
                 lpo_reference, payment_terms,
                 subtotal, vat, total, amount_in_words,
-                services_description, remarks, payment_status, generation_mode
+                services_description, remarks, payment_status, paid_date, generation_mode
             )
-            VALUES (%s, %s, 'TAX', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'UNPAID', 'TAX_ONLY')
+            VALUES (%s, %s, 'TAX', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'TAX_ONLY')
             RETURNING invoice_id
         """, (
-            tax_no, project_id, payload.payment_method, today,
+            tax_no, project_id, tax_payment_method, today,
             project_no, payment_terms,
             subtotal, vat, grand_total, words,
             f"Testing services — {proj_name}",
             f"Proforma Invoice No: {proforma_no}",
+            tax_payment_status, tax_paid_date,
         ))
         tax_invoice_id = cur.fetchone()[0]
+
+        # NOTE: no advance ledger call here on purpose — see is_advance_settled
+        # above. The deduction already happened when the proforma was created.
 
         for item in items:
             cur.execute("""
@@ -3397,7 +3684,8 @@ def generate_invoice_with_reports_and_tests_v2(payload: NonWalkInInvoiceRequest)
             proforma_invoice_id = payload.proforma_invoice_id
             cur.execute("""
                 SELECT invoice_no, subtotal, vat, total, amount_in_words,
-                       payment_method, invoice_date, generation_mode
+                       payment_method, invoice_date, generation_mode,
+                       payment_status, paid_date
                 FROM invoices
                 WHERE invoice_id = %s AND invoice_type = 'PROFORMA'
             """, (proforma_invoice_id,))
@@ -3426,6 +3714,8 @@ def generate_invoice_with_reports_and_tests_v2(payload: NonWalkInInvoiceRequest)
             words          = pfm[4] or number_to_words(grand_total)
             orig_method    = pfm[5] or payment_method
             proforma_date  = pfm[6]
+            orig_payment_status = pfm[8]
+            orig_paid_date      = pfm[9]
 
             # Get the report links from the original proforma
             cur.execute("""
@@ -3448,16 +3738,28 @@ def generate_invoice_with_reports_and_tests_v2(payload: NonWalkInInvoiceRequest)
 
             # Create Tax Invoice — generate number first, then insert on shared cursor
             tax_no = generate_invoice_no(cur, "TAX")
+
+            # If the original proforma was paid via Advance, the tax finalization
+            # MUST carry the same payment_method/status forward and must NOT
+            # deduct the advance again — it was already deducted when the
+            # proforma itself was created.
+            is_advance_settled = (orig_method == "ADVANCE")
+
             inv_payload = InvoiceCreate(
                 project_id          = project_id,
                 invoice_type        = "TAX",
-                payment_method      = payment_method,
+                payment_method      = "ADVANCE" if is_advance_settled else payment_method,
                 invoice_date        = today,
                 payment_terms       = "30 days" if payment_method == "CREDIT" else "Immediate",
                 services_description= payload.services_description or "Professional services rendered",
                 remarks             = f"Proforma Invoice No: {proforma_no}",
             )
-            tax_invoice_result = _create_invoice_with_payment_method_impl(inv_payload, sample_ids=sample_ids_filter, shared_cur=cur)
+            tax_invoice_result = _create_invoice_with_payment_method_impl(
+                inv_payload, sample_ids=sample_ids_filter, shared_cur=cur,
+                deduct_advance=not is_advance_settled,
+                override_payment_status=orig_payment_status if is_advance_settled else None,
+                override_paid_date=orig_paid_date if is_advance_settled else None,
+            )
             tax_invoice_id = tax_invoice_result["invoice_id"]
 
             # Link same reports under TAX type + mark mode
