@@ -67,6 +67,11 @@ class WalkInCreate(BaseModel):
     consultant: Optional[str] = None
     plot_no: Optional[str] = None
     client: Optional[str] = None        # NEW: the actual project Client/Owner — distinct from client_name (Contractor) above
+    client_id: Optional[int] = None     # NEW: links to the real `clients` table row (set when picked from the
+                                         # client dropdown / "+ New Client" in the UI). Powers Advance Payment
+                                         # for walk-ins, which is keyed off projects.client_id like every other
+                                         # project. If omitted, we best-effort resolve it by exact name match
+                                         # against `clients.name` — see _resolve_client_id() below.
 
 
 class WalkInDetailsUpdate(BaseModel):
@@ -79,6 +84,7 @@ class WalkInDetailsUpdate(BaseModel):
     phone: Optional[str] = None
     email: Optional[str] = None
     client: Optional[str] = None        # the actual project Client/Owner
+    client_id: Optional[int] = None     # NEW: explicitly (re)link to a `clients` row
 
 
 class WalkInItemCreate(BaseModel):
@@ -104,6 +110,40 @@ class WalkInItemUpdate(BaseModel):
 
 class LPNumberUpdate(BaseModel):
     lp_number: str
+
+
+# ─── Helper: resolve a real clients.client_id for a walk-in ───────────────────
+
+def _resolve_client_id(cur, client_id: Optional[int], client_name: Optional[str]) -> Optional[int]:
+    """
+    Best-effort resolution of the `clients` table row a walk-in's "Client / Owner"
+    refers to, so Advance Payment (keyed off projects.client_id, same as every
+    other project) also works for walk-ins.
+
+    - If client_id is given, just verify it exists and return it.
+    - Otherwise, if a client_name (free-typed "Client / Owner" text) is given,
+      try an exact case-insensitive match against clients.name. We deliberately
+      do NOT auto-create a new clients row here (that could silently create
+      duplicates from typos) — only the explicit "+ New Client" flow creates
+      clients, exactly as before.
+    - Returns None if nothing can be resolved (walk-in behaves exactly as it
+      did before this feature — no advance option shown, nothing else breaks).
+    """
+    if client_id:
+        cur.execute("SELECT client_id FROM clients WHERE client_id = %s", (client_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    if client_name and client_name.strip():
+        cur.execute(
+            "SELECT client_id FROM clients WHERE LOWER(name) = LOWER(%s) LIMIT 1",
+            (client_name.strip(),)
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    return None
 
 
 # ─── Helper: generate LP number (identical logic to projects.py) ──────────────
@@ -191,6 +231,8 @@ def create_walk_in(payload: WalkInCreate):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        resolved_client_id = _resolve_client_id(cur, payload.client_id, payload.client)
+
         cur.execute("""
             INSERT INTO projects (
                 project_no, quotation_id, client_id,
@@ -198,10 +240,11 @@ def create_walk_in(payload: WalkInCreate):
                 is_walk_in, walk_in_client, walk_in_phone, walk_in_email,
                 consultant, plot_no, client_name
             )
-            VALUES ('PENDING', NULL, NULL, %s, 'Walk-In', %s, 'PENDING',
+            VALUES ('PENDING', NULL, %s, %s, 'Walk-In', %s, 'PENDING',
                     TRUE, %s, %s, %s, %s, %s, %s)
             RETURNING project_id
         """, (
+            resolved_client_id,
             payload.project_name or payload.client_name,
             payload.division,
             payload.client_name,
@@ -220,6 +263,7 @@ def create_walk_in(payload: WalkInCreate):
             "consultant": payload.consultant,
             "plot_no": payload.plot_no,
             "client": payload.client,
+            "client_id": resolved_client_id,  # NEW: null if it couldn't be resolved — non-breaking
             "division": payload.division,
             "message": "Walk-in customer created. Add tests and then generate LPO.",
         }
@@ -242,7 +286,7 @@ def get_walk_in(project_id: int):
             SELECT project_id, project_no, project_name, division, status,
                    walk_in_client, walk_in_phone, walk_in_email,
                    is_walk_in, created_at, lpo_no, lpo_date,
-                   consultant, plot_no, client_name
+                   consultant, plot_no, client_name, client_id
             FROM projects
             WHERE project_id = %s AND is_walk_in = TRUE
         """, (project_id,))
@@ -286,6 +330,7 @@ def get_walk_in(project_id: int):
             "consultant":   row[12],
             "plot_no":      row[13],
             "client":       row[14],  # NEW: the actual Client/Owner name (distinct from Contractor above)
+            "client_id":    row[15],  # NEW: links to `clients` table — powers Advance Payment for this walk-in
             "items":        items,
             "total_amount": total,
             "vat":          vat,
@@ -682,6 +727,15 @@ def update_walk_in_details(project_id: int, payload: WalkInDetailsUpdate):
         if payload.client is not None:
             fields.append("client_name = %s"); values.append(payload.client)
 
+        # NEW: (re)link to a real clients row — either explicitly (client_id
+        # passed) or best-effort resolved from the client name being saved.
+        # This is what lets Advance Payment start working for walk-ins that
+        # were created before this field existed, or that were free-typed.
+        if payload.client_id is not None or payload.client is not None:
+            resolved_client_id = _resolve_client_id(cur, payload.client_id, payload.client)
+            if resolved_client_id is not None:
+                fields.append("client_id = %s"); values.append(resolved_client_id)
+
         if not fields:
             raise HTTPException(400, "Nothing to update")
 
@@ -690,7 +744,7 @@ def update_walk_in_details(project_id: int, payload: WalkInDetailsUpdate):
             UPDATE projects
             SET {", ".join(fields)}
             WHERE project_id = %s
-            RETURNING project_id, project_name, consultant, plot_no, walk_in_phone, walk_in_email, client_name
+            RETURNING project_id, project_name, consultant, plot_no, walk_in_phone, walk_in_email, client_name, client_id
         """, values)
         row = cur.fetchone()
         conn.commit()
@@ -704,6 +758,7 @@ def update_walk_in_details(project_id: int, payload: WalkInDetailsUpdate):
             "walk_in_phone": row[4],
             "walk_in_email": row[5],
             "client":       row[6],
+            "client_id":    row[7],  # NEW
         }
     except HTTPException:
         raise
