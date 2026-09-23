@@ -1415,6 +1415,9 @@ def generate_delivery_note_excel_template(payload: DeliveryNoteRequest):
         
         wb = openpyxl.load_workbook(template_path, data_only=False)
         ws = wb.active
+
+        # Global TRN -> H3 (Arial, bold, red, 12, centred)
+        stamp_trn(ws)
         
         # =====================================================
         # 2. Fill Template Fields
@@ -1888,6 +1891,151 @@ def download_template_from_supabase(template_type: str = "invoice"):
         raise HTTPException(status_code=500, detail=f"Failed to download template: {e}")
 
 # =====================================================
+# GLOBAL TRN (Tax Registration Number)
+# -----------------------------------------------------
+# One TRN is stored in the `app_settings` table and stamped into cell H3 of
+# every generated Excel document (Proforma / Tax invoices, Delivery notes).
+#   GET /invoices/settings/trn  -> {"trn": "..."}
+#   PUT /invoices/settings/trn  -> body {"trn": "..."}
+# Changing it affects FUTURE generations only.
+#
+# Other modules (e.g. payment advice) can reuse it:
+#     from invoices import stamp_trn
+#     stamp_trn(ws)
+# =====================================================
+import re as _trn_re
+
+TRN_SETTING_KEY = "active_trn"
+TRN_CELL = "H3"
+
+# Used only until a TRN is set from the UI for the first time.
+# Set the DEFAULT_TRN environment variable to seed it; otherwise H3 stays blank.
+DEFAULT_TRN = os.getenv("DEFAULT_TRN", "").strip()
+
+# Letters/digits, optionally separated by spaces or hyphens, 3-30 chars.
+# (A UAE TRN is 15 digits - tighten to r"^\d{15}$" to enforce that strictly.)
+_TRN_PATTERN = _trn_re.compile(r"^[0-9A-Za-z][0-9A-Za-z \-]{2,29}$")
+
+
+def ensure_settings_table(cur):
+    """Idempotent, cheap - same pattern as the other ensure_* helpers."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key         TEXT PRIMARY KEY,
+            value       TEXT,
+            updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """)
+
+
+def normalize_trn(raw) -> str:
+    """Trim + validate. Raises ValueError with a user-facing message."""
+    trn = (raw or "").strip()
+    if not trn:
+        raise ValueError("TRN cannot be empty.")
+    if not _TRN_PATTERN.match(trn):
+        raise ValueError(
+            "TRN may only contain letters, digits, spaces or hyphens (3-30 characters)."
+        )
+    return trn
+
+
+def get_active_trn() -> str:
+    """
+    Return the active TRN ("" if none configured).
+
+    Never raises: this runs mid-generation, often after the invoice row has
+    already been committed, so a settings-lookup failure must not abort the
+    export. It logs and falls back to DEFAULT_TRN instead.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        ensure_settings_table(cur)
+        conn.commit()
+        cur.execute("SELECT value FROM app_settings WHERE key = %s", (TRN_SETTING_KEY,))
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row and row[0] else DEFAULT_TRN
+    except Exception:
+        print("ERROR: could not read active TRN, using DEFAULT_TRN fallback")
+        traceback.print_exc()
+        return DEFAULT_TRN
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def set_active_trn(raw) -> str:
+    """Validate and persist the TRN (upsert). Returns the stored value."""
+    trn = normalize_trn(raw)
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_settings_table(cur)
+        cur.execute("""
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (key)
+            DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        """, (TRN_SETTING_KEY, trn))
+        conn.commit()
+        return trn
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def stamp_trn(ws, trn=None):
+    """
+    Write the active TRN into H3 of `ws`: Arial, bold, red, size 12, centred.
+
+    Merge-safe: if H3 sits inside a merged range, the value and style go on
+    the range's top-left anchor cell (other cells of a merged range are
+    read-only in openpyxl).
+    """
+    if trn is None:
+        trn = get_active_trn()
+
+    target = ws[TRN_CELL]
+    for merged in ws.merged_cells.ranges:
+        if TRN_CELL in merged:
+            target = ws.cell(row=merged.min_row, column=merged.min_col)
+            break
+
+    target.value = f"TRN : {trn}" if trn else None
+    target.font = Font(name="Arial", size=12, bold=True, color="FF0000")
+    target.alignment = Alignment(horizontal="center", vertical="center")
+
+
+class TRNUpdate(BaseModel):
+    trn: str
+
+
+@router.get("/settings/trn")
+def get_trn_setting():
+    return {"trn": get_active_trn()}
+
+
+@router.put("/settings/trn")
+def update_trn_setting(payload: TRNUpdate):
+    try:
+        return {"trn": set_active_trn(payload.trn)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to save TRN: {e}")
+
+
+# =====================================================
 # COMBINED PROFORMA + TAX INVOICE GENERATION
 # =====================================================
 
@@ -1961,6 +2109,8 @@ def _fill_proforma_sheet(ws, invoice: dict, project: dict, items: list):
       K37 - Grand Total
       C38 - Amount in words
     """
+    stamp_trn(ws)   # global TRN -> H3 (Arial, bold, red, 12, centred)
+
     from openpyxl.styles import Font, Alignment
     from datetime import date as date_type
 
@@ -2082,6 +2232,8 @@ def _fill_tax_sheet(ws, invoice: dict, project: dict, items: list):
       M37 - Grand Total Incl VAT (=SUM(M18:Mn))
       D38 - Amount in words
     """
+    stamp_trn(ws)   # global TRN -> H3 (Arial, bold, red, 12, centred)
+
     from openpyxl.styles import Font, Alignment
     from datetime import date as date_type
 
@@ -2681,6 +2833,8 @@ def _wi_fill_proforma(ws, meta: dict, items: list):
       K37 = Grand Total
       C38 = Amount in Words
     """
+    stamp_trn(ws)   # global TRN -> H3 (Arial, bold, red, 12, centred)
+
     FIRST_ROW         = 18
     LAST_TEMPLATE_ROW = 34
     ITEM_COLS         = ["D", "I", "J", "K"]
@@ -2766,6 +2920,8 @@ def _wi_fill_tax(ws, meta: dict, items: list):
       M37 = Grand Total      (=SUM(M18:M34))
       D38 = Amount in Words
     """
+    stamp_trn(ws)   # global TRN -> H3 (Arial, bold, red, 12, centred)
+
     FIRST_ROW         = 18
     LAST_TEMPLATE_ROW = 34
     ITEM_COLS         = ["D", "I", "J", "K", "L", "M"]
