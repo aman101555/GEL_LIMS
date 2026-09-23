@@ -352,15 +352,25 @@ def list_walk_ins(limit: int = 100, offset: int = 0):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        # has_payment_advice is computed here (one EXISTS per row, in-DB) instead
+        # of the frontend calling GET /payment-advice/{project_id}/items for every
+        # walk-in with an LP number. That old approach turned one page load into
+        # 1 + N sequential-ish HTTP round trips (each of which re-ran an ALTER
+        # TABLE IF NOT EXISTS check and two more SELECTs) just to read a single
+        # boolean — by far the biggest cost on this screen.
         cur.execute("""
-            SELECT project_id, project_no, 
-                   COALESCE(walk_in_client, project_name) as contractor_display,
-                   division, status,
-                   walk_in_client, walk_in_phone, walk_in_email, created_at,
-                   project_name, consultant, plot_no, client_name
-            FROM projects
-            WHERE is_walk_in = TRUE
-            ORDER BY project_id DESC
+            SELECT p.project_id, p.project_no,
+                   COALESCE(p.walk_in_client, p.project_name) as contractor_display,
+                   p.division, p.status,
+                   p.walk_in_client, p.walk_in_phone, p.walk_in_email, p.created_at,
+                   p.project_name, p.consultant, p.plot_no, p.client_name,
+                   EXISTS (
+                       SELECT 1 FROM walk_in_items wi
+                       WHERE wi.project_id = p.project_id AND wi.pa_generated = TRUE
+                   ) AS has_payment_advice
+            FROM projects p
+            WHERE p.is_walk_in = TRUE
+            ORDER BY p.project_id DESC
             LIMIT %s OFFSET %s
         """, (limit, offset))
         rows = cur.fetchall()
@@ -379,6 +389,7 @@ def list_walk_ins(limit: int = 100, offset: int = 0):
                 "consultant":    r[10],
                 "plot_no":       r[11],
                 "client":        r[12],  # NEW: the actual Client/Owner name
+                "has_payment_advice": r[13],  # NEW: replaces the old N+1 frontend check
             }
             for r in rows
         ]
