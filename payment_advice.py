@@ -43,7 +43,7 @@ import openpyxl
 from db import get_connection
 
 # Reuse the amount-in-words helper that already exists for invoices.
-from invoices import number_to_words
+from invoices import number_to_words, stamp_trn  # stamp_trn -> writes 'TRN : <number>' into H3
 
 router = APIRouter(prefix="/payment-advice", tags=["Payment Advice"])
 
@@ -315,6 +315,9 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
         wb = openpyxl.load_workbook(template_path, data_only=False)
         ws = wb.active
 
+        # Global TRN -> H3 ("TRN : <number>", Arial, bold, red, 12, centred)
+        stamp_trn(ws)
+
         # Header fields
         _safe_set(ws, "A5", contractor)
         _safe_set(ws, "I4", pa_no)
@@ -566,6 +569,9 @@ def redownload_payment_advice(project_id: int):
 
         wb = openpyxl.load_workbook(template_path, data_only=False)
         ws = wb.active
+
+        # Global TRN -> H3 ("TRN : <number>", Arial, bold, red, 12, centred)
+        stamp_trn(ws)
 
         # Header fields – use the stored pa_no and pa_date
         _safe_set(ws, "A5", contractor)
