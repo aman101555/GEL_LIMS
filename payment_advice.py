@@ -26,12 +26,43 @@ def _ensure_walkin_items_invoiced_columns(cur):
     so this router doesn't depend on load order between the two files).
     Adds tracking for whether a walk-in test has already been pulled onto a
     generated invoice, so it stops being offered/auto-selected afterwards.
+
+    Runs its ALTER TABLE only once per process — after the first successful
+    run the columns are guaranteed to exist, so repeating the DDL check on
+    every request just adds a needless round trip. Purely a speed guard;
+    the migration itself is unchanged and still runs on first use.
     """
+    global _walkin_items_columns_ensured
+    if _walkin_items_columns_ensured:
+        return
     cur.execute("""
         ALTER TABLE walk_in_items
             ADD COLUMN IF NOT EXISTS invoiced    BOOLEAN NOT NULL DEFAULT FALSE,
             ADD COLUMN IF NOT EXISTS invoice_id   INTEGER
     """)
+    _walkin_items_columns_ensured = True
+
+
+def _ensure_pa_lookup_index(cur):
+    """
+    Idempotent, no-op-after-first-run: speeds up the per-item PA lookup used
+    to show which Payment Advice each walk-in test belongs to. Purely a
+    performance index — doesn't touch PA creation/numbering/status logic.
+
+    Also gated to run once per process for the same reason as above.
+    """
+    global _pa_lookup_index_ensured
+    if _pa_lookup_index_ensured:
+        return
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payment_advice_items_item_id_lookup
+            ON payment_advice_items (item_id, pa_item_id DESC)
+    """)
+    _pa_lookup_index_ensured = True
+
+
+_walkin_items_columns_ensured = False
+_pa_lookup_index_ensured = False
 import os
 import re
 import tempfile
@@ -150,6 +181,72 @@ def _safe_set(ws, coord: str, value):
     raise RuntimeError(f"Cell {coord} is a MergedCell but no merge range covers it")
 
 
+# ─── Helper: decide reuse vs new PA (BUSINESS RULE) ───────────────────────────
+#
+#   - If the project's most recent PA has NOT had any of its items invoiced
+#     yet, it's "unprocessed" -> newly advised tests should be APPENDED to
+#     that same PA (same pa_no), not spun into a new one.
+#   - If at least one item on that PA has been invoiced, it's "processed"
+#     -> it must be left untouched; new tests go onto a brand-new PA.
+#   - If there's no PA yet at all for this project, there's nothing to
+#     reuse -> a new PA is started (unchanged from previous behaviour).
+#
+# "Invoiced" is read straight off walk_in_items.invoiced, the same flag
+# invoices.py already sets when a walk-in invoice is generated — so this
+# needs no new columns and can never drift out of sync with invoicing.
+
+def _get_reusable_pa(cur, project_id: int):
+    """
+    Returns {"pa_id", "pa_no", "items": [...]} for the project's most recent
+    Payment Advice if it can still be appended to, else None. `items` are
+    the tests already recorded on that PA (in original insertion order),
+    shaped identically to the `items` list built elsewhere in this file.
+    """
+    cur.execute("""
+        SELECT pa_id, pa_no
+        FROM payment_advices
+        WHERE project_id = %s
+        ORDER BY pa_id DESC
+        LIMIT 1
+    """, (project_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    pa_id, pa_no = row
+
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT 1
+            FROM payment_advice_items pai
+            JOIN walk_in_items wi ON wi.item_id = pai.item_id
+            WHERE pai.pa_id = %s AND wi.invoiced = TRUE
+        )
+    """, (pa_id,))
+    already_processed = cur.fetchone()[0]
+    if already_processed:
+        return None
+
+    cur.execute("""
+        SELECT item_id, description, test_standard, unit_rate, quantity, amount
+        FROM payment_advice_items
+        WHERE pa_id = %s
+        ORDER BY pa_item_id
+    """, (pa_id,))
+    items = [
+        {
+            "item_id": r[0],
+            "description": r[1] or " - ",
+            "test_standard": r[2] or "",
+            "unit_rate": float(r[3]) if r[3] is not None else 0.0,
+            "quantity": r[4] or 0,
+            "amount": float(r[5]) if r[5] is not None else 0.0,
+        }
+        for r in cur.fetchall()
+    ]
+
+    return {"pa_id": pa_id, "pa_no": pa_no, "items": items}
+
+
 # ─── 1. List tests under an LP, available for Payment Advice ─────────────────
 
 @router.get("/{project_id}/items", summary="Get walk-in tests available for Payment Advice")
@@ -158,44 +255,55 @@ def get_items_for_payment_advice(project_id: int):
     cur = conn.cursor()
     try:
         _ensure_walkin_items_invoiced_columns(cur)
+        _ensure_pa_lookup_index(cur)
 
+        # Single round trip: project header + items + each item's PA number,
+        # instead of two separate queries. Project columns repeat per row
+        # (harmless — we only read them off the first row); item columns are
+        # NULL on that first row only when the walk-in has no items at all.
         cur.execute("""
-            SELECT project_id, project_no, walk_in_client, project_name,
-                   consultant, plot_no, walk_in_phone, client_name
-            FROM projects
-            WHERE project_id = %s AND is_walk_in = TRUE
-        """, (project_id,))
-        proj = cur.fetchone()
-        if not proj:
-            raise HTTPException(404, "Walk-in not found")
-
-        if not proj[1] or proj[1] == "PENDING":
-            raise HTTPException(400, "LP number has not been generated for this walk-in yet")
-
-        cur.execute("""
-            SELECT item_id, description, test_standard, unit_rate,
-                   quantity, amount, net_unit, item_code, pa_generated,
-                   COALESCE(invoiced, FALSE)
-            FROM walk_in_items
-            WHERE project_id = %s
-            ORDER BY item_id
+            SELECT p.project_id, p.project_no, p.walk_in_client, p.project_name,
+                   p.consultant, p.plot_no, p.walk_in_phone, p.client_name,
+                   wi.item_id, wi.description, wi.test_standard, wi.unit_rate,
+                   wi.quantity, wi.amount, wi.net_unit, wi.item_code, wi.pa_generated,
+                   COALESCE(wi.invoiced, FALSE), pa.pa_no
+            FROM projects p
+            LEFT JOIN walk_in_items wi ON wi.project_id = p.project_id
+            LEFT JOIN LATERAL (
+                SELECT pai.pa_id
+                FROM payment_advice_items pai
+                WHERE pai.item_id = wi.item_id
+                ORDER BY pai.pa_item_id DESC
+                LIMIT 1
+            ) latest_pai ON TRUE
+            LEFT JOIN payment_advices pa ON pa.pa_id = latest_pai.pa_id
+            WHERE p.project_id = %s AND p.is_walk_in = TRUE
+            ORDER BY wi.item_id
         """, (project_id,))
         rows = cur.fetchall()
 
+        if not rows:
+            raise HTTPException(404, "Walk-in not found")
+
+        proj = rows[0]
+        if not proj[1] or proj[1] == "PENDING":
+            raise HTTPException(400, "LP number has not been generated for this walk-in yet")
+
         items = [
             {
-                "item_id": r[0],
-                "description": r[1],
-                "test_standard": r[2],
-                "unit_rate": float(r[3]) if r[3] is not None else 0.0,
-                "quantity": r[4],
-                "amount": float(r[5]) if r[5] is not None else 0.0,
-                "net_unit": r[6],
-                "item_code": r[7],
-                "already_advised": bool(r[8]),
-                "already_invoiced": bool(r[9]),  # NEW: set once this test is pulled onto a generated invoice
+                "item_id": r[8],
+                "description": r[9],
+                "test_standard": r[10],
+                "unit_rate": float(r[11]) if r[11] is not None else 0.0,
+                "quantity": r[12],
+                "amount": float(r[13]) if r[13] is not None else 0.0,
+                "net_unit": r[14],
+                "item_code": r[15],
+                "already_advised": bool(r[16]),
+                "already_invoiced": bool(r[17]),  # NEW: set once this test is pulled onto a generated invoice
+                "pa_no": r[18],  # NEW: display-only — which Payment Advice this test belongs to (None if not on one)
             }
-            for r in rows
+            for r in rows if r[8] is not None
         ]
 
         return {
@@ -228,6 +336,8 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
     cur = conn.cursor()
 
     try:
+        _ensure_walkin_items_invoiced_columns(cur)
+
         # ----------------------------------------------------
         # 1. Validate walk-in / LP
         # ----------------------------------------------------
@@ -288,25 +398,58 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
             for r in rows
         ]
 
-        if len(items) > TEMPLATE_ITEM_ROWS:
-            raise HTTPException(
-                400,
-                f"Template supports a maximum of {TEMPLATE_ITEM_ROWS} test rows (D18:D32). "
-                f"You selected {len(items)}. Please generate multiple Payment Advices instead."
-            )
+        # ----------------------------------------------------
+        # 3. Decide: append to the existing PA, or start a new one?
+        # See _get_reusable_pa() for the business rule this implements.
+        # ----------------------------------------------------
+        reusable_pa = _get_reusable_pa(cur, payload.project_id)
 
-        subtotal = sum(i["amount"] for i in items)
+        if reusable_pa:
+            pa_id = reusable_pa["pa_id"]
+            pa_no = reusable_pa["pa_no"]
+            existing_items = reusable_pa["items"]
+            existing_ids = {i["item_id"] for i in existing_items}
+
+            # Defensive — the pa_generated=FALSE filter above already keeps
+            # previously-advised items out of `items`, so this should never
+            # actually trigger.
+            new_items = [i for i in items if i["item_id"] not in existing_ids]
+            if not new_items:
+                raise HTTPException(400, "Selected tests are already on the current Payment Advice")
+
+            all_items = existing_items + new_items
+            if len(all_items) > TEMPLATE_ITEM_ROWS:
+                raise HTTPException(
+                    400,
+                    f"Payment Advice {pa_no} already has {len(existing_items)} test(s). Adding "
+                    f"{len(new_items)} more would exceed the {TEMPLATE_ITEM_ROWS}-row template limit "
+                    f"({len(all_items)} total). Please generate an invoice for {pa_no} first, or "
+                    f"select fewer tests."
+                )
+
+            pa_date = date.today()
+            is_reuse = True
+        else:
+            if len(items) > TEMPLATE_ITEM_ROWS:
+                raise HTTPException(
+                    400,
+                    f"Template supports a maximum of {TEMPLATE_ITEM_ROWS} test rows (D18:D32). "
+                    f"You selected {len(items)}. Please generate multiple Payment Advices instead."
+                )
+            all_items = items
+            new_items = items
+            pa_no = _generate_pa_number(cur)
+            pa_date = date.today()
+            is_reuse = False
+
+        subtotal = sum(i["amount"] for i in all_items)
         vat = round(subtotal * VAT_RATE, 2)
         grand_total = round(subtotal + vat, 2)
 
         # ----------------------------------------------------
-        # 3. Generate the PA number
-        # ----------------------------------------------------
-        pa_no = _generate_pa_number(cur)
-        pa_date = date.today()
-
-        # ----------------------------------------------------
-        # 4. Fill the Excel template
+        # 4. Fill the Excel template — always with the FULL current set of
+        # tests on this PA (existing + newly added), so a reused PA's file
+        # always shows every test, not just the ones just picked.
         # ----------------------------------------------------
         template_path = _download_template()
         if not os.path.exists(template_path):
@@ -336,8 +479,8 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
             for col in ['D', 'I', 'J', 'K']:
                 _safe_set(ws, f"{col}{row}", None)
 
-        # Fill item rows + per-row formula in K
-        for index, item in enumerate(items):
+        # Fill item rows + per-row formula in K — the full current set
+        for index, item in enumerate(all_items):
             row = FIRST_ITEM_ROW + index
             _safe_set(ws, f"D{row}", item["description"])
             _safe_set(ws, f"I{row}", item["quantity"])
@@ -347,7 +490,7 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
         # Fill the IF formula in every row covered by the K35 SUM range
         # (K18:K34) so unused rows correctly evaluate to "" rather than 0.
         for row in range(FIRST_ITEM_ROW, SUM_RANGE_END_ROW + 1):
-            if row > FIRST_ITEM_ROW + len(items) - 1:
+            if row > FIRST_ITEM_ROW + len(all_items) - 1:
                 _safe_set(ws, f"K{row}", f'=IF(I{row}="","",(I{row}*J{row}))')
 
         # Totals + amount in words
@@ -371,15 +514,25 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
         # ----------------------------------------------------
         # 6. Record the Payment Advice + mark items as advised
         # ----------------------------------------------------
-        cur.execute("""
-            INSERT INTO payment_advices
-                (pa_no, project_id, lp_number, client_name, subtotal, vat, grand_total, pa_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING pa_id
-        """, (pa_no, payload.project_id, lp_number, contractor, subtotal, vat, grand_total, pa_date))
-        pa_id = cur.fetchone()[0]
+        if is_reuse:
+            # Same PA, same pa_no — just recalculate its stored totals/date.
+            cur.execute("""
+                UPDATE payment_advices
+                SET subtotal = %s, vat = %s, grand_total = %s, pa_date = %s
+                WHERE pa_id = %s
+            """, (subtotal, vat, grand_total, pa_date, pa_id))
+        else:
+            cur.execute("""
+                INSERT INTO payment_advices
+                    (pa_no, project_id, lp_number, client_name, subtotal, vat, grand_total, pa_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING pa_id
+            """, (pa_no, payload.project_id, lp_number, contractor, subtotal, vat, grand_total, pa_date))
+            pa_id = cur.fetchone()[0]
 
-        for item in items:
+        # Only the NEWLY selected tests get a fresh payment_advice_items row
+        # — tests already on a reused PA already have theirs from before.
+        for item in new_items:
             cur.execute("""
                 INSERT INTO payment_advice_items
                     (pa_id, item_id, description, test_standard, unit_rate, quantity, amount)
@@ -387,12 +540,12 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
             """, (pa_id, item["item_id"], item["description"], item["test_standard"],
                   item["unit_rate"], item["quantity"], item["amount"]))
 
-        item_ids = [i["item_id"] for i in items]
+        new_item_ids = [i["item_id"] for i in new_items]
         cur.execute("""
             UPDATE walk_in_items
             SET pa_generated = TRUE
             WHERE item_id = ANY(%s)
-        """, (item_ids,))
+        """, (new_item_ids,))
 
         conn.commit()
 
@@ -404,7 +557,13 @@ def generate_payment_advice(payload: GeneratePaymentAdviceRequest):
             filename=download_filename,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}; filename=\"{download_filename}\""
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}; filename=\"{download_filename}\"",
+                # NEW: lets the frontend say "added to existing PA" vs
+                # "new PA created" without a second round trip. Optional —
+                # any client that ignores these headers behaves exactly as
+                # before.
+                "X-PA-Action": "reused" if is_reuse else "new",
+                "X-PA-No": pa_no,
             }
         )
 
