@@ -44,6 +44,27 @@ DB additions required (run once):
         item_code      TEXT,
         created_at     TIMESTAMPTZ DEFAULT NOW()
     );
+
+    -- quotation_item_id: links a walk_in_items row to the quotation_items row
+    -- it was copied/synced into (see _sync_item_to_quotation() below). NULL
+    -- until an LP number exists for the project (quotation_items only starts
+    -- existing once create-lpo runs) — see the "live sync" note below.
+    ALTER TABLE walk_in_items
+        ADD COLUMN IF NOT EXISTS quotation_item_id INTEGER
+            REFERENCES quotation_items(item_id) ON DELETE SET NULL;
+
+    -- Live sync (added after launch): originally quotation_items was only
+    -- ever populated ONCE, at create-lpo time, from whatever was in
+    -- walk_in_items at that instant (_copy_walkin_items_to_quotation()).
+    -- Anything added to walk_in_items afterward silently never made it into
+    -- quotation_items — which is what Create Test Requests reads from — so
+    -- new tests added post-LPO never showed up there (Invoice/Payment Advice
+    -- read walk_in_items directly, so they always looked fine).
+    --
+    -- Fix: add_item / add_item_from_catalog / delete_item now keep
+    -- quotation_items in sync live, item-by-item, via quotation_item_id as
+    -- the link. update_item also pushes edits through so the two tables
+    -- never drift apart.
 """
 
 from fastapi import APIRouter, HTTPException
@@ -205,19 +226,105 @@ def _recalc_totals(cur, project_id: int):
 # ─── Helper: Copy walk_in_items to quotation_items ──────────────────────────────
 
 def _copy_walkin_items_to_quotation(cur, project_id: int, quotation_id: int):
-    """Copy walk_in_items to quotation_items for the new quotation"""
-    # Don't include 'amount' - it's a generated column
+    """
+    Copy walk_in_items to quotation_items for the new quotation (runs once,
+    at create-lpo time). Unlike the original version, this now goes row by
+    row and writes the resulting quotation_items.item_id back onto
+    walk_in_items.quotation_item_id, so every item — not just ones added
+    later — is linked and stays sync-able going forward.
+    """
     cur.execute("""
-        INSERT INTO quotation_items (
-            quotation_id, description, test_standard, 
-            unit_rate, quantity, net_unit, item_code
-        )
-        SELECT 
-            %s, description, test_standard,
-            unit_rate, quantity, net_unit, item_code
+        SELECT item_id, description, test_standard, unit_rate, quantity, net_unit, item_code
         FROM walk_in_items
         WHERE project_id = %s
-    """, (quotation_id, project_id))
+    """, (project_id,))
+    rows = cur.fetchall()
+
+    for (wi_item_id, description, test_standard, unit_rate, quantity, net_unit, item_code) in rows:
+        # Don't include 'amount' - it's a generated column
+        cur.execute("""
+            INSERT INTO quotation_items (
+                quotation_id, description, test_standard,
+                unit_rate, quantity, net_unit, item_code
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING item_id
+        """, (quotation_id, description, test_standard, unit_rate, quantity, net_unit, item_code))
+        qi_item_id = cur.fetchone()[0]
+
+        cur.execute("""
+            UPDATE walk_in_items SET quotation_item_id = %s WHERE item_id = %s
+        """, (qi_item_id, wi_item_id))
+
+
+# ─── Helper: get a project's LP number + quotation_id (None if no LPO yet) ──────
+
+def _get_project_lp_and_quotation(cur, project_id: int):
+    cur.execute("""
+        SELECT project_no, quotation_id
+        FROM projects
+        WHERE project_id = %s
+    """, (project_id,))
+    row = cur.fetchone()
+    if not row:
+        return None, None
+    lp_number, quotation_id = row
+    if not quotation_id or lp_number == "PENDING":
+        return None, None
+    return lp_number, quotation_id
+
+
+# ─── Helper: live-sync a single new walk_in_items row into quotation_items ──────
+
+def _sync_item_to_quotation(cur, project_id: int, wi_item_id: int,
+                             description: str, test_standard: Optional[str],
+                             unit_rate: float, quantity: int,
+                             net_unit: Optional[str], item_code: Optional[str]):
+    """
+    If this walk-in already has an LP number (quotation_items exists for it),
+    insert a matching row into quotation_items right now and link it back via
+    walk_in_items.quotation_item_id — so a test added AFTER the LPO was
+    created still shows up on Create Test Requests immediately.
+
+    If there's no LP number yet, does nothing (the eventual create-lpo call
+    will pick this item up in its normal one-time copy).
+
+    Returns the linked quotation_items.item_id if synced, else None.
+    """
+    lp_number, quotation_id = _get_project_lp_and_quotation(cur, project_id)
+    if not quotation_id:
+        return None, None
+
+    cur.execute("""
+        INSERT INTO quotation_items (
+            quotation_id, description, test_standard,
+            unit_rate, quantity, net_unit, item_code
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING item_id
+    """, (quotation_id, description, test_standard, unit_rate, quantity, net_unit, item_code))
+    qi_item_id = cur.fetchone()[0]
+
+    cur.execute("""
+        UPDATE walk_in_items SET quotation_item_id = %s WHERE item_id = %s
+    """, (qi_item_id, wi_item_id))
+
+    return qi_item_id, lp_number
+
+
+# ─── Helper: is a quotation_items row already pulled into a Test Request? ───────
+
+def _quotation_item_in_use(cur, quotation_item_id: int):
+    """Returns the request_no of the Test Request using this item, or None."""
+    cur.execute("""
+        SELECT tr.request_no
+        FROM test_request_items tri
+        JOIN test_requests tr ON tri.test_request_id = tr.test_request_id
+        WHERE tri.quotation_item_id = %s
+        LIMIT 1
+    """, (quotation_item_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 # ─── 1. CREATE WALK-IN (no LP yet — just saves customer info) ────────────────
@@ -427,6 +534,15 @@ def add_item(project_id: int, payload: WalkInItemCreate):
             payload.unit_rate, payload.quantity, payload.net_unit, payload.item_code
         ))
         item_id = cur.fetchone()[0]
+
+        # Live-sync into quotation_items if an LP number already exists for
+        # this walk-in, so it shows up on Create Test Requests right away.
+        quotation_item_id, lp_number = _sync_item_to_quotation(
+            cur, project_id, item_id,
+            payload.description, payload.test_standard,
+            payload.unit_rate, payload.quantity, payload.net_unit, payload.item_code
+        )
+
         conn.commit()
 
         total, vat, grand_total = _recalc_totals(cur, project_id)
@@ -435,6 +551,8 @@ def add_item(project_id: int, payload: WalkInItemCreate):
             "item_id": item_id,
             "message": "Item added",
             "totals": {"total_amount": total, "vat": vat, "grand_total": grand_total},
+            "synced_to_test_requests": quotation_item_id is not None,
+            "lp_number": lp_number,
         }
     except HTTPException:
         raise
@@ -478,6 +596,15 @@ def add_item_from_catalog(project_id: int, payload: WalkInItemFromCatalog):
             RETURNING item_id
         """, (project_id, description, test_standard, unit_rate, payload.quantity, code))
         item_id = cur.fetchone()[0]
+
+        # Live-sync into quotation_items if an LP number already exists for
+        # this walk-in, so it shows up on Create Test Requests right away.
+        quotation_item_id, lp_number = _sync_item_to_quotation(
+            cur, project_id, item_id,
+            description, test_standard, unit_rate, payload.quantity,
+            None, code
+        )
+
         conn.commit()
 
         total, vat, grand_total = _recalc_totals(cur, project_id)
@@ -486,6 +613,8 @@ def add_item_from_catalog(project_id: int, payload: WalkInItemFromCatalog):
             "item_id": item_id,
             "message": "Catalog item added",
             "totals": {"total_amount": total, "vat": vat, "grand_total": grand_total},
+            "synced_to_test_requests": quotation_item_id is not None,
+            "lp_number": lp_number,
         }
     except HTTPException:
         raise
@@ -505,7 +634,7 @@ def update_item(project_id: int, item_id: int, payload: WalkInItemUpdate):
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT item_id, unit_rate, quantity, test_standard, net_unit
+            SELECT item_id, unit_rate, quantity, test_standard, net_unit, quotation_item_id
             FROM walk_in_items
             WHERE item_id = %s AND project_id = %s
         """, (item_id, project_id))
@@ -513,18 +642,28 @@ def update_item(project_id: int, item_id: int, payload: WalkInItemUpdate):
         if not row:
             raise HTTPException(404, "Item not found")
 
+        quotation_item_id = row[5]
+
         if payload.quantity is not None:
             if payload.quantity <= 0:
                 raise HTTPException(400, "Quantity must be > 0")
             cur.execute("UPDATE walk_in_items SET quantity = %s WHERE item_id = %s", (payload.quantity, item_id))
+            if quotation_item_id:
+                cur.execute("UPDATE quotation_items SET quantity = %s WHERE item_id = %s", (payload.quantity, quotation_item_id))
         elif payload.unit_rate is not None:
             if payload.unit_rate < 0:
                 raise HTTPException(400, "Unit rate cannot be negative")
             cur.execute("UPDATE walk_in_items SET unit_rate = %s WHERE item_id = %s", (payload.unit_rate, item_id))
+            if quotation_item_id:
+                cur.execute("UPDATE quotation_items SET unit_rate = %s WHERE item_id = %s", (payload.unit_rate, quotation_item_id))
         elif payload.test_standard is not None:
             cur.execute("UPDATE walk_in_items SET test_standard = %s WHERE item_id = %s", (payload.test_standard, item_id))
+            if quotation_item_id:
+                cur.execute("UPDATE quotation_items SET test_standard = %s WHERE item_id = %s", (payload.test_standard, quotation_item_id))
         elif payload.net_unit is not None:
             cur.execute("UPDATE walk_in_items SET net_unit = %s WHERE item_id = %s", (payload.net_unit, item_id))
+            if quotation_item_id:
+                cur.execute("UPDATE quotation_items SET net_unit = %s WHERE item_id = %s", (payload.net_unit, quotation_item_id))
         else:
             raise HTTPException(400, "Nothing to update")
 
@@ -553,6 +692,39 @@ def delete_item(project_id: int, item_id: int):
     cur = conn.cursor()
     try:
         cur.execute("""
+            SELECT quotation_item_id
+            FROM walk_in_items
+            WHERE item_id = %s AND project_id = %s
+        """, (item_id, project_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Item not found")
+
+        quotation_item_id = row[0]
+
+        # Guard: if this test has already been pulled into a Test Request,
+        # deleting it here would silently orphan that Test Request's line
+        # item. Block it and tell the user exactly where it's in use.
+        if quotation_item_id:
+            request_no = _quotation_item_in_use(cur, quotation_item_id)
+            if request_no:
+                raise HTTPException(
+                    400,
+                    f"This test has already been added to Test Request {request_no}. "
+                    f"Remove it from that Test Request before deleting it here."
+                )
+
+        lp_number, _ = _get_project_lp_and_quotation(cur, project_id)
+
+        # Desync: remove the mirrored row from quotation_items first (if any)
+        # so it stops showing up on Create Test Requests, then delete the
+        # walk_in_items row itself.
+        desynced = False
+        if quotation_item_id:
+            cur.execute("DELETE FROM quotation_items WHERE item_id = %s", (quotation_item_id,))
+            desynced = True
+
+        cur.execute("""
             DELETE FROM walk_in_items
             WHERE item_id = %s AND project_id = %s
             RETURNING item_id
@@ -565,6 +737,8 @@ def delete_item(project_id: int, item_id: int):
         return {
             "message": "Item deleted",
             "totals": {"total_amount": total, "vat": vat, "grand_total": grand_total},
+            "desynced_from_test_requests": desynced,
+            "lp_number": lp_number,
         }
     except HTTPException:
         raise
