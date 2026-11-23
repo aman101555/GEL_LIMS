@@ -5,10 +5,12 @@ from db import get_connection
 from datetime import datetime
 from typing import Optional, List
 import os
+import re
 import shutil
 import supabase
 
 from supabase import create_client, Client
+from plots import project_context
 from template_processor import CoverSheetTemplateProcessor, WorkInstructionTemplateProcessor, BoreholeLogTemplateProcessor, SampleDescriptionTemplateProcessor
 
 SUPABASE_URL = "https://hqwgkmbjmcxpxbwccclo.supabase.co"
@@ -50,14 +52,16 @@ class ProjectCreate(BaseModel):
     client_name: Optional[str] = None
     contractor: Optional[str] = None   # Non Walk-In: contractor name
     phone_no: Optional[str] = None     # Non Walk-In: phone number
+    area_code: Optional[str] = None    # suffix of the generated number (DXB, AUH, ... or a custom code). Default DXB.
+    project_no: Optional[str] = None   # manual override of the auto-generated number (the editable preview on Create Project)
 
 class ProjectOut(BaseModel):
     project_id: int
     project_no: str
     quotation_id: int
     client_id: Optional[int]
-    project_name: str
-    location: str
+    project_name: Optional[str] = None
+    location: Optional[str] = None
     status: str
     lpo_no: Optional[str] = None
     lpo_date: Optional[str] = None
@@ -113,6 +117,77 @@ def delete_old_lpo_from_supabase(project_id: int):
 
 
 # ------------------------------
+# HELPERS: next LP / GSL number (shared by the live preview and by create)
+# ------------------------------
+def _clean_area(area: Optional[str]) -> str:
+    """DXB, AUH ... or a custom code typed in the UI. Letters/digits only; falls back to DXB."""
+    return re.sub(r"[^A-Z0-9]", "", (area or "").upper())[:10] or "DXB"
+
+
+def _peek_next_project_no(cur, division: Optional[str], area_code: Optional[str]) -> dict:
+    """
+    (highest LP/GSL number ever issued) + 1 across projects AND walk-in quotations.
+    LP and GSL share ONE running counter — GEO division gets the GSL prefix.
+    Read-only: nothing is reserved, so the real number is fixed at create time.
+    """
+    year_last_two = datetime.utcnow().strftime("%y")
+    cur.execute(r"""
+        SELECT MAX(num) FROM (
+            SELECT (regexp_match(project_no, '^(?:LP|GSL)/(\d+)/'))[1]::int AS num
+            FROM projects
+            WHERE project_no ~ '^(?:LP|GSL)/\d+/'
+            UNION ALL
+            SELECT (regexp_match(quotation_no, '^WALKIN-(?:LP|GSL)/(\d+)/'))[1]::int AS num
+            FROM quotations
+            WHERE quotation_no ~ '^WALKIN-(?:LP|GSL)/\d+/'
+        ) all_numbers
+    """)
+    max_existing = cur.fetchone()[0]
+    next_number = (max_existing + 1) if max_existing else 16732
+    prefix = "GSL" if division == "GEO" else "LP"
+    area = _clean_area(area_code)
+    return {
+        "project_no": f"{prefix}/{next_number}/{year_last_two}/{area}",
+        "prefix": prefix,
+        "number": next_number,
+        "year": year_last_two,
+        "area_code": area,
+    }
+
+
+def _assert_project_no_free(cur, project_no: str, exclude_project_id: Optional[int] = None):
+    """A hand-typed number must not collide with an existing LP or a walk-in's quotation_no."""
+    cur.execute(
+        """
+        SELECT 1 FROM projects WHERE project_no = %s AND (%s::int IS NULL OR project_id <> %s)
+        UNION ALL
+        SELECT 1 FROM quotations WHERE quotation_no = %s
+        LIMIT 1
+        """,
+        (project_no, exclude_project_id, exclude_project_id, f"WALKIN-{project_no}"),
+    )
+    if cur.fetchone():
+        raise HTTPException(409, f"{project_no} is already in use. Choose a different number.")
+
+
+@router.get("/next-number", summary="Preview the LP / Project number that will be created next")
+def preview_next_project_no(division: Optional[str] = None, area_code: Optional[str] = None):
+    """
+    Powers the live preview on Create Project and Walk-In. NOTE: must stay ABOVE
+    the /{project_id} route or FastAPI would try to parse "next-number" as an int.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        return _peek_next_project_no(cur, division, area_code)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ------------------------------
 # LIST PROJECTS
 # ------------------------------
 @router.get("/projects", response_model=List[ProjectOut])
@@ -132,7 +207,7 @@ def list_projects(limit: int = 100, offset: int = 0):
             FROM projects p
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
             LEFT JOIN clients c ON p.client_id = c.client_id
-            ORDER BY p.project_id DESC
+            ORDER BY (regexp_match(p.project_no, '^(?:LP|GSL)/(\\d+)/'))[1]::int DESC NULLS LAST, p.project_id DESC
             LIMIT %s OFFSET %s
             """,
             (limit, offset),
@@ -173,6 +248,60 @@ def list_projects(limit: int = 100, offset: int = 0):
 
 
 # ------------------------------
+# SEARCH (top search bar) — server-side, indexed-size result, includes is_walk_in
+# Must stay ABOVE "/{project_id}" so "search" isn't parsed as an id.
+# ------------------------------
+@router.get("/search", summary="Quick search by LP middle number (e.g. 17345) or plot no")
+def search_projects(q: str = "", limit: int = 8):
+    q = (q or "").strip()
+    if not q:
+        return []
+    limit = max(1, min(limit, 20))
+    like = f"%{q}%"
+    prefix = f"{q}%"
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        if q.isdigit():
+            # "17345" -> LP/17345/26/DXB or GSL/17345/..., plus plot numbers containing it
+            where = """
+                (regexp_match(p.project_no, '^(?:LP|GSL)/([0-9]+)/'))[1] LIKE %s
+                OR p.plot_no ILIKE %s
+            """
+            params = (prefix, like)
+        else:
+            where = "p.project_no ILIKE %s OR p.plot_no ILIKE %s"
+            params = (like, like)
+        cur.execute(
+            f"""
+            SELECT p.project_id, p.project_no, p.plot_no, p.project_name,
+                   COALESCE(p.is_walk_in, FALSE) AS is_walk_in
+            FROM projects p
+            WHERE {where}
+            ORDER BY (regexp_match(p.project_no, '^(?:LP|GSL)/([0-9]+)/'))[1]::int DESC NULLS LAST,
+                     p.project_id DESC
+            LIMIT %s
+            """,
+            params + (limit,),
+        )
+        return [
+            {
+                "project_id": r[0],
+                "project_no": r[1],
+                "plot_no": r[2],
+                "project_name": r[3],
+                "is_walk_in": bool(r[4]),
+            }
+            for r in cur.fetchall()
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ------------------------------
 # SUMMARY (dashboard only — no JOINs, minimal columns, fast)
 # ------------------------------
 @router.get("/summary")
@@ -187,7 +316,7 @@ def list_projects_summary():
                    COALESCE(client_name, walk_in_client) AS client_name,
                    created_at, client_id
             FROM projects
-            ORDER BY project_id DESC
+            ORDER BY (regexp_match(project_no, '^(?:LP|GSL)/(\\d+)/'))[1]::int DESC NULLS LAST, project_id DESC
             LIMIT 500
         """)
         rows = cur.fetchall()
@@ -238,29 +367,16 @@ def create_project(payload: ProjectCreate):
         project_name = payload.project_name if payload.project_name != "string" else enquiry_project_name
         location = payload.location if payload.location != "string" else enquiry_location
 
-        # Picks (highest LP/GSL number ever issued) + 1, checking both
-        # `projects.project_no` and walk-in `quotations.quotation_no`.
-        # LP and GSL share ONE running counter — GEO division projects get
-        # the "GSL" prefix instead of "LP", but the number keeps counting
-        # up from the same shared sequence (e.g. ...LP/16732, GSL/16733...).
-        year_last_two = datetime.utcnow().strftime("%y")
-
-        cur.execute(r"""
-            SELECT MAX(num) FROM (
-                SELECT (regexp_match(project_no, '^(?:LP|GSL)/(\d+)/'))[1]::int AS num
-                FROM projects
-                WHERE project_no ~ '^(?:LP|GSL)/\d+/'
-                UNION ALL
-                SELECT (regexp_match(quotation_no, '^WALKIN-(?:LP|GSL)/(\d+)/'))[1]::int AS num
-                FROM quotations
-                WHERE quotation_no ~ '^WALKIN-(?:LP|GSL)/\d+/'
-            ) all_numbers
-        """)
-        max_existing = cur.fetchone()[0]
-        next_number = (max_existing + 1) if max_existing else 16732
-
-        prefix = "GSL" if division == "GEO" else "LP"
-        project_no = f"{prefix}/{next_number}/{year_last_two}/DXB"
+        # A hand-edited number (the inline edit next to the preview) wins; otherwise
+        # the next free LP/GSL number is generated here, at confirm time.
+        override = (payload.project_no or "").strip()
+        if override and override != "string":
+            if len(override) > 60:
+                raise HTTPException(400, "Project number is too long")
+            _assert_project_no_free(cur, override)
+            project_no = override
+        else:
+            project_no = _peek_next_project_no(cur, division, payload.area_code)["project_no"]
 
         lpo_date = None
         if payload.lpo_date and payload.lpo_date != "string":
@@ -308,6 +424,9 @@ def create_project(payload: ProjectCreate):
             "phone_no": payload.phone_no,
         }
 
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))
@@ -361,6 +480,7 @@ def get_project_details(project_id: int):
             contractor_value = row[18]  # contractor field
             phone_value = row[19]       # phone_no field
 
+        ctx = project_context(cur, project_id)   # this project's test requests (no tests)
         return {
             "project_id":            row[0],
             "project_no":            row[1],
@@ -388,6 +508,7 @@ def get_project_details(project_id: int):
             "walk_in_email":         row[23],
             "lpo_verified":          bool(row[24]),
             "lpo_verified_at":       str(row[25]) if row[25] else None,
+            "requests":              ctx["requests"],
         }
 
     except Exception as e:

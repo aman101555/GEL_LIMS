@@ -1,6 +1,7 @@
 # reports.py - UPDATED VERSION WITH SUPABASE STORAGE FOR REPORTS
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from db import get_connection
@@ -9,9 +10,15 @@ import shutil
 import secrets
 import sys
 import time
+import threading
 
 import requests
 from utils import resource_path
+
+# Reuse the exact same mailing credentials/config already used by the
+# "Add Tests to Quotation" mail feature (quotations.py) instead of
+# duplicating a second mailing system.
+from quotations import RESEND_API_KEY, SENDER_DOMAIN
 
 import openpyxl
 from openpyxl.styles import Font, Alignment
@@ -1246,6 +1253,79 @@ async def download_report_file_direct(report_id: int):
         cur.close()
         conn.close()
 # ---------------------------
+# MAIL — schema/table guards (defensive, same pattern used elsewhere in
+# the codebase e.g. invoices.py's "CREATE TABLE IF NOT EXISTS
+# invoice_report_links"). These are safe no-ops once already applied and
+# never touch existing columns/rows.
+# ---------------------------
+_report_cols_ready = False
+_links_table_ready = False
+_schema_lock = threading.Lock()
+
+_REPORT_MAIL_COLUMNS = {
+    "mailed": "BOOLEAN DEFAULT FALSE",
+    "mailed_at": "TIMESTAMP",
+    "mailed_to": "TEXT",
+    # Report Identification (CAR / BF / E / R# / C / NOC) - see gr_workflow.format_ident
+    "report_ident": "TEXT",
+    "report_ident_fields": "JSONB",
+}
+
+
+def _ensure_report_mail_columns(cur):
+    """
+    Runs the ALTERs at most once per process, and only if a column is really
+    missing. ALTER TABLE ... IF NOT EXISTS takes an ACCESS EXCLUSIVE lock even
+    when it does nothing, so running it on every request made requests queue
+    behind each other until Supabase hit its statement timeout.
+    """
+    global _report_cols_ready
+    if _report_cols_ready:
+        return
+    with _schema_lock:
+        if _report_cols_ready:
+            return
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'reports'
+        """)
+        existing = {row[0] for row in cur.fetchall()}
+        missing = {c: t for c, t in _REPORT_MAIL_COLUMNS.items() if c not in existing}
+        if missing:
+            cur.execute("SET LOCAL lock_timeout = '5s'")
+            for col, typ in missing.items():
+                cur.execute(f"ALTER TABLE reports ADD COLUMN IF NOT EXISTS {col} {typ}")
+        _report_cols_ready = True
+
+
+def _ensure_invoice_report_links_table(cur):
+    # Mirrors invoices.py's table definition exactly - reports.py needs to
+    # read this table (to check paid status) even if invoices.py hasn't
+    # run its own guard yet in this process. Runs once per process.
+    global _links_table_ready
+    if _links_table_ready:
+        return
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS invoice_report_links (
+            id           SERIAL PRIMARY KEY,
+            invoice_id   INTEGER NOT NULL,
+            report_no    TEXT    NOT NULL,
+            invoice_type TEXT    NOT NULL,
+            created_at   TIMESTAMP DEFAULT NOW(),
+            UNIQUE (invoice_id, report_no, invoice_type)
+        )
+    """)
+    _links_table_ready = True
+
+
+class ReportSendEmailPayload(BaseModel):
+    from_local: str
+    to_email: str
+    cc_emails: Optional[List[str]] = None
+
+
+# ---------------------------
 # 7. Get Reports with Status Filter - OPTIMISED
 # ---------------------------
 @router.get("")
@@ -1255,6 +1335,10 @@ def get_reports(status: Optional[str] = None):
     cur = conn.cursor()
 
     try:
+        _ensure_report_mail_columns(cur)
+        _ensure_invoice_report_links_table(cur)
+        conn.commit()
+
         # Single query: DISTINCT ON deduplicates by report_no, and a lateral
         # aggregate pulls all covered sample numbers in one pass — no per-row loop.
         query = """
@@ -1274,6 +1358,15 @@ def get_reports(status: Optional[str] = None):
                 u.username                              AS uploaded_by_username,
                 uc.username                             AS checked_by_username,
                 ua.username                             AS approved_by_username,
+                cl.email                                AS client_email,
+                EXISTS (
+                    SELECT 1
+                    FROM invoice_report_links irl
+                    JOIN invoices i ON i.invoice_id = irl.invoice_id
+                    WHERE irl.report_no = r.report_no
+                      AND irl.invoice_type != 'PROFORMA'
+                      AND i.payment_status = 'PAID'
+                )                                       AS is_paid,
                 -- All sample_nos that share this report_no, as a comma-separated string
                 (
                     SELECT STRING_AGG(s3.sample_no, ',' ORDER BY s3.sample_no)
@@ -1282,10 +1375,13 @@ def get_reports(status: Optional[str] = None):
                     WHERE r3.report_no = r.report_no
                 )                                       AS covered_samples_csv
             FROM reports r
-            LEFT JOIN samples s  ON r.sample_id  = s.sample_id
-            LEFT JOIN users u    ON r.uploaded_by = u.user_id
-            LEFT JOIN users uc   ON r.checked_by  = uc.user_id
-            LEFT JOIN users ua   ON r.approved_by  = ua.user_id
+            LEFT JOIN samples s         ON r.sample_id   = s.sample_id
+            LEFT JOIN users u           ON r.uploaded_by = u.user_id
+            LEFT JOIN users uc          ON r.checked_by  = uc.user_id
+            LEFT JOIN users ua          ON r.approved_by = ua.user_id
+            LEFT JOIN test_requests tr  ON s.request_id  = tr.test_request_id
+            LEFT JOIN projects proj     ON tr.project_id = proj.project_id
+            LEFT JOIN clients cl        ON proj.client_id = cl.client_id
             WHERE 1=1
         """
         params = []
@@ -1311,12 +1407,242 @@ def get_reports(status: Optional[str] = None):
             report_dict["sample_count"] = len(covered)
             reports.append(report_dict)
 
+        # GRs that have been created but have no report uploaded yet appear ONLY under
+        # "All Reports", with status GENERATED. They are never part of Pending / Approved.
+        if not status or status == "ALL":
+            try:
+                from gr_workflow import ensure_report_ident_columns
+                ensure_report_ident_columns(conn)
+                cur.execute(
+                    """
+                    SELECT g.gr_no, g.created_at, g.report_ident,
+                           (SELECT STRING_AGG(DISTINCT s.assigned_test_name, ', ')
+                            FROM samples s WHERE s.gr_id = g.gr_id),
+                           (SELECT COUNT(*) FROM samples s WHERE s.gr_id = g.gr_id)
+                    FROM gr_reports g
+                    WHERE NOT EXISTS (SELECT 1 FROM reports r WHERE r.report_no = g.gr_no)
+                    """
+                )
+                for gr_no, created_at, ident, tests, n in cur.fetchall():
+                    reports.append({
+                        "report_id": None, "report_no": gr_no, "status": "GENERATED",
+                        "created_at": created_at, "report_ident": ident or "",
+                        "test_name": tests, "covered_samples": [], "sample_count": n,
+                        "uploaded_by": None, "approved_by": None, "notes": None,
+                        "is_locked": False, "is_paid": False, "mailed": False,
+                    })
+            except Exception:
+                conn.rollback()   # never let the GENERATED rows break the main list
+                import traceback
+                traceback.print_exc()
+
         return reports
 
     except Exception as e:
+        conn.rollback()
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Error fetching reports: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------
+# 7b. Mail an Approved + Paid Report to the Client
+#     (mirrors quotations.py's /quotations/{id}/send-email — same
+#      Resend credentials, same attachment-by-URL approach, same
+#      request/response shape. Access to this page is already gated by
+#      ALLOWED_ROLES in ViewReports.jsx, matching how the reference
+#      "Add Tests to Quotation" mail feature is gated only on the
+#      frontend with no additional backend check.)
+# ---------------------------
+@router.post("/reports/{report_id}/send-email", summary="Email Report as Attachment")
+def send_report_email(report_id: int, payload: ReportSendEmailPayload):
+    import base64
+
+    if not payload.from_local.strip():
+        raise HTTPException(400, "From address is required")
+    if not payload.to_email.strip():
+        raise HTTPException(400, "To address is required")
+
+    from_email = f"{payload.from_local.strip().lower()}@{SENDER_DOMAIN}"
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        _ensure_report_mail_columns(cur)
+        _ensure_invoice_report_links_table(cur)
+        conn.commit()
+
+        cur.execute("""
+            SELECT r.report_id, r.report_no, r.status, r.original_filename,
+                   r.file_path, r.file_type, r.covers_test_type,
+                   cl.name, cl.contact_person, cl.email,
+                   proj.project_name, proj.project_no, proj.plot_no,
+                   EXISTS (
+                       SELECT 1
+                       FROM invoice_report_links irl
+                       JOIN invoices i ON i.invoice_id = irl.invoice_id
+                       WHERE irl.report_no = r.report_no
+                         AND irl.invoice_type != 'PROFORMA'
+                         AND i.payment_status = 'PAID'
+                   ) AS is_paid
+            FROM reports r
+            LEFT JOIN samples s        ON r.sample_id  = s.sample_id
+            LEFT JOIN test_requests tr ON s.request_id = tr.test_request_id
+            LEFT JOIN projects proj    ON tr.project_id = proj.project_id
+            LEFT JOIN clients cl       ON proj.client_id = cl.client_id
+            WHERE r.report_id = %s
+        """, (report_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Report not found")
+
+        (r_id, report_no, status, original_filename, file_path, file_type, test_name,
+         client_name, contact_person, client_email_on_file,
+         project_name, project_no, plot_no, is_paid) = row
+
+        # Same business rule as the "Made -> Approved -> Paid" workflow
+        # requested: only an approved AND paid report may be mailed.
+        if status != "APPROVED":
+            raise HTTPException(400, "Only approved reports can be mailed")
+        if not is_paid:
+            raise HTTPException(400, "This report cannot be mailed until it has been paid")
+
+        if not file_path or not file_path.startswith("http"):
+            raise HTTPException(400, "No report file found. Please upload the report first.")
+
+        file_response = requests.get(file_path, timeout=30)
+        if file_response.status_code != 200:
+            raise HTTPException(500, "Failed to fetch report file for mailing")
+
+        file_bytes = file_response.content
+        filename = original_filename or f"Report_{report_no}.{(file_type or 'pdf').lstrip('.')}"
+        file_b64 = base64.b64encode(file_bytes).decode()
+
+        contact_name = contact_person or client_name or "Sir/Madam"
+
+        email_html = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
+            <div style="background: #1a1a2e; padding: 24px 32px; border-radius: 8px 8px 0 0;">
+                <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 500;">
+                    Report {report_no}
+                </h1>
+            </div>
+            <div style="background: #f9f9f9; padding: 28px 32px; border: 1px solid #e5e5e5; border-top: none;">
+                <p style="margin: 0 0 16px;">Dear {contact_name},</p>
+                <p style="margin: 0 0 16px; line-height: 1.6;">
+                    Please find attached your report <strong>{report_no}</strong>.
+                </p>
+                <div style="background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 16px 20px; margin: 20px 0;">
+                    <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">Project Name</td>
+                            <td style="padding: 5px 0; text-align: right; font-weight: 500;">{project_name or " - "}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">Project Number (LP)</td>
+                            <td style="padding: 5px 0; text-align: right; font-weight: 500;">{project_no or " - "}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">Contractor</td>
+                            <td style="padding: 5px 0; text-align: right; font-weight: 500;">{client_name or " - "}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">Plot No</td>
+                            <td style="padding: 5px 0; text-align: right; font-weight: 500;">{plot_no or " - "}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 5px 0; color: #666;">Test(s)</td>
+                            <td style="padding: 5px 0; text-align: right; font-weight: 500;">{test_name or " - "}</td>
+                        </tr>
+                        <tr style="border-top: 1px solid #eee;">
+                            <td style="padding: 10px 0 0; color: #666;">Payment Status</td>
+                            <td style="padding: 10px 0 0; text-align: right; font-weight: 600; color: #16a34a;">Paid &amp; Invoiced</td>
+                        </tr>
+                    </table>
+                </div>
+                <p style="margin: 24px 0 0; font-size: 14px;">
+                    Best regards,<br>
+                    <strong>Global Engineering Laboratory</strong><br>
+                    <span style="color: #888; font-size: 13px;">{from_email}</span>
+                </p>
+            </div>
+            <div style="background: #f0f0f0; padding: 12px 32px; border-radius: 0 0 8px 8px; border: 1px solid #e5e5e5; border-top: none;">
+                <p style="margin: 0; font-size: 11px; color: #999; text-align: center;">
+                    Global Engineering · Dubai, UAE · www.glabint.com
+                </p>
+            </div>
+        </div>
+        """
+
+        # Clean up CC list: strip whitespace, drop blanks, drop dupes of the "to" address.
+        cc_list = []
+        if payload.cc_emails:
+            seen_cc = set()
+            for addr in payload.cc_emails:
+                addr = (addr or "").strip()
+                if addr and addr.lower() != payload.to_email.strip().lower() and addr.lower() not in seen_cc:
+                    cc_list.append(addr)
+                    seen_cc.add(addr.lower())
+
+        resend_payload = {
+            "from": f"Global Engineering Laboratory <{from_email}>",
+            "to": [payload.to_email.strip()],
+            "subject": f"Report {report_no}",
+            "html": email_html,
+            "attachments": [{"filename": filename, "content": file_b64}]
+        }
+        if cc_list:
+            resend_payload["cc"] = cc_list
+
+        resend_response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=resend_payload,
+            timeout=30
+        )
+
+        if resend_response.status_code not in (200, 201):
+            raise HTTPException(500, f"Email send failed: {resend_response.text}")
+
+        # Mark every row sharing this report_no as mailed - same grouping
+        # approach approve_report() already uses for this table.
+        # mailed_to keeps the primary recipient plus any CC'd addresses for
+        # traceability (still shown as "Mailed to <this>" on the button).
+        mailed_to_record = payload.to_email.strip()
+        if cc_list:
+            mailed_to_record += f" (cc: {', '.join(cc_list)})"
+
+        cur.execute("""
+            UPDATE reports
+            SET mailed = TRUE, mailed_at = NOW(), mailed_to = %s
+            WHERE report_no = %s
+            RETURNING report_id
+        """, (mailed_to_record, report_no))
+        conn.commit()
+
+        return {
+            "message": f"Report emailed successfully to {payload.to_email.strip()}"
+                       + (f" (cc: {', '.join(cc_list)})" if cc_list else ""),
+            "report_id": report_id,
+            "report_no": report_no,
+            "mailed": True,
+            "mailed_to": payload.to_email.strip(),
+            "cc": cc_list
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Error sending report email: {str(e)}")
     finally:
         cur.close()
         conn.close()

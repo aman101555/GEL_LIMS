@@ -15,9 +15,47 @@ from advance_payments import (
     ensure_advance_table,
     get_client_advance_balance,
     record_advance_usage,
+    ensure_client_trn_column,
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEMA GUARD (fixes "deadlock detected" when several screens call the API at once)
+# The ensure_* helpers below run ALTER TABLE / CREATE TABLE. Even "IF NOT EXISTS"
+# takes an ACCESS EXCLUSIVE lock on the table, so two requests running them at the
+# same time (Generate Invoice fires 3-4 calls together) could lock reports /
+# gr_reports / invoices in opposite orders and deadlock. Each helper now runs
+# ONCE per process (serialised by a lock) and commits straight away, so it never
+# holds table locks while other queries run. Later calls return immediately.
+# ─────────────────────────────────────────────────────────────────────────────
+import threading
+import functools
+
+_SCHEMA_LOCK = threading.RLock()      # re-entrant: some helpers call other helpers
+_SCHEMA_DONE = set()
+
+
+def _run_once(fn):
+    key = f"{fn.__module__}.{fn.__qualname__}"
+
+    @functools.wraps(fn)
+    def wrapper(cur, *args, **kwargs):
+        if key in _SCHEMA_DONE:
+            return
+        with _SCHEMA_LOCK:
+            if key in _SCHEMA_DONE:
+                return
+            fn(cur, *args, **kwargs)
+            cur.connection.commit()   # release the DDL locks immediately
+            _SCHEMA_DONE.add(key)
+
+    return wrapper
+
+
+ensure_client_trn_column = _run_once(ensure_client_trn_column)
+
+
+@_run_once
 def _ensure_walkin_items_invoiced_columns(cur):
     """
     walk_in_items previously only tracked `pa_generated` ("Already Advised").
@@ -31,6 +69,174 @@ def _ensure_walkin_items_invoiced_columns(cur):
             ADD COLUMN IF NOT EXISTS invoiced    BOOLEAN NOT NULL DEFAULT FALSE,
             ADD COLUMN IF NOT EXISTS invoice_id   INTEGER
     """)
+
+
+# =====================================================================
+# MODE OF PAYMENT  /  RECEIPT NUMBER  /  P NUMBER   (Tax-invoice settlement)
+#
+# Rule: the moment a TAX invoice is made (generation_mode BOTH or TAX_ONLY) it
+# is PAID straight away. A PROFORMA_ONLY invoice stays UNPAID (or ADVANCE-
+# settled, exactly as before). At that same moment we also stamp:
+#   * mode_of_payment — CASH | CHEQUE | BANK_TRANSFER (asked in a popup)
+#   * receipt_no      — running integer, first one is 35851
+#   * p_number        — "P-<running>-<YY>", first running number is 2112
+#                       e.g. P-2112-26
+# All invoices that existed before this feature are back-filled as CASH.
+# =====================================================================
+MOP_VALUES      = ("CASH", "CHEQUE", "BANK_TRANSFER")
+RECEIPT_START   = 35851
+P_NUMBER_START  = 2112
+_RECEIPT_LOCK   = 7351          # pg advisory-lock key — serialises number allocation
+_PAYCOLS_LOCK   = 7352
+
+
+@_run_once
+def ensure_payment_receipt_columns(cur):
+    """Idempotent migration (cheap no-op once applied)."""
+    wanted = ("mode_of_payment", "receipt_no", "p_number")
+
+    def _have():
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'invoices'
+              AND column_name = ANY(%s)
+        """, (list(wanted),))
+        return {r[0] for r in cur.fetchall()}
+
+    if len(_have()) == len(wanted):
+        return
+
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_PAYCOLS_LOCK,))
+    have = _have()                       # re-check once we hold the lock
+    if "mode_of_payment" not in have:
+        cur.execute("ALTER TABLE invoices ADD COLUMN mode_of_payment VARCHAR(20)")
+        # every invoice created before this feature was a Cash invoice
+        cur.execute("UPDATE invoices SET mode_of_payment = 'CASH'")
+    if "receipt_no" not in have:
+        cur.execute("ALTER TABLE invoices ADD COLUMN receipt_no INTEGER")
+    if "p_number" not in have:
+        cur.execute("ALTER TABLE invoices ADD COLUMN p_number TEXT")
+    cur.connection.commit()              # one-time migration, called before any other work
+
+
+def normalize_mop(raw) -> str:
+    """Validate the Mode of Payment chosen in the popup (required for Tax invoices)."""
+    v = (raw or "").strip().upper().replace(" ", "_")
+    if v == "BANK":
+        v = "BANK_TRANSFER"
+    if v not in MOP_VALUES:
+        raise HTTPException(
+            400,
+            "Mode of Payment is required for a Tax Invoice (Cash, Cheque or Bank Transfer)."
+        )
+    return v
+
+
+def next_receipt_and_p_number(cur):
+    """Allocate the next Receipt No. and P Number. Lock is held until the caller commits."""
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_RECEIPT_LOCK,))
+    cur.execute("SELECT COALESCE(MAX(receipt_no), %s) FROM invoices", (RECEIPT_START - 1,))
+    receipt_no = int(cur.fetchone()[0]) + 1
+
+    cur.execute("""
+        SELECT COALESCE(MAX(CAST(split_part(p_number, '-', 2) AS INTEGER)), %s)
+        FROM invoices
+        WHERE p_number ~ '^P-[0-9]+-[0-9]{2}$'
+    """, (P_NUMBER_START - 1,))
+    p_seq = int(cur.fetchone()[0]) + 1
+    p_number = f"P-{p_seq}-{date.today().strftime('%y')}"
+    return receipt_no, p_number
+
+
+def finalize_tax_payment(cur, invoice_id: int, mode_of_payment, also_invoice_ids=(), paid_date=None):
+    """
+    Settle a freshly-created tax invoice: PAID + Mode of Payment + Receipt No. + P Number.
+    `also_invoice_ids` = the source proforma(s) of a TAX_ONLY conversion — they are
+    marked PAID with the same mode (no second receipt number) so they don't keep
+    showing as unpaid after the money has been collected.
+    """
+    mop = normalize_mop(mode_of_payment)
+    paid_date = paid_date or date.today()
+    receipt_no, p_number = next_receipt_and_p_number(cur)
+    cur.execute("""
+        UPDATE invoices
+           SET payment_status = 'PAID', paid_date = %s,
+               mode_of_payment = %s, receipt_no = %s, p_number = %s
+         WHERE invoice_id = %s
+    """, (paid_date, mop, receipt_no, p_number, invoice_id))
+    for other in also_invoice_ids:
+        if other:
+            cur.execute("""
+                UPDATE invoices
+                   SET payment_status = 'PAID', paid_date = %s, mode_of_payment = %s
+                 WHERE invoice_id = %s
+            """, (paid_date, mop, other))
+    return receipt_no, p_number
+
+
+# =====================================================================
+# EDITED TEST NAMES (Generate Invoice)
+# The name typed in Generate Invoice replaces the catalogue name ONLY on the
+# invoice being generated: it is stored on invoice_items.description, which is
+# what every Excel builder (and regenerate-excel from View Invoices) reads.
+# =====================================================================
+class LineNameOverride(BaseModel):
+    """Non-walk-in line, identified by the same key the invoice groups on."""
+    description: str                      # original name
+    test_standard: Optional[str] = None
+    unit_rate: float = 0
+    new_description: str                  # edited name
+
+
+def _apply_walkin_item_names(items, item_names):
+    """items: [{item_id, description, ...}]; item_names: {item_id(str|int): edited name}."""
+    if not item_names:
+        return items
+    names = {}
+    for k, v in item_names.items():
+        try:
+            nm = (v or "").strip()
+            if nm:
+                names[int(k)] = nm
+        except (ValueError, TypeError):
+            continue
+    for it in items:
+        if it["item_id"] in names:
+            it["description"] = names[it["item_id"]]
+    return items
+
+
+def _apply_line_overrides(final_items, overrides):
+    """final_items: [(desc, std, rate, qty, sample_ids)] -> same shape, renamed."""
+    if not overrides:
+        return final_items
+    lookup = {}
+    for o in overrides:
+        new = (o.new_description or "").strip()
+        if new:
+            lookup[(o.description, o.test_standard or "", round(float(o.unit_rate or 0), 4))] = new
+    out = []
+    for desc, std, rate, qty, sids in final_items:
+        key = (desc, std or "", round(float(rate or 0), 4))
+        out.append((lookup.get(key, desc), std, rate, qty, sids))
+    return out
+
+
+def _carry_over_item_names(cur, from_invoice_id: int, to_invoice_id: int):
+    """TAX_ONLY (non-walk-in) rebuilds items from samples — keep the Proforma's
+    (possibly edited) test names on the new Tax invoice."""
+    cur.execute("""SELECT description, test_standard, unit_rate, quantity, sample_id
+                   FROM invoice_items WHERE invoice_id = %s ORDER BY item_id""", (from_invoice_id,))
+    src = cur.fetchall()
+    cur.execute("""SELECT item_id, description, test_standard, unit_rate, quantity, sample_id
+                   FROM invoice_items WHERE invoice_id = %s ORDER BY item_id""", (to_invoice_id,))
+    dst = cur.fetchall()
+    by_sample = {r[4]: r[0] for r in src if r[4]}
+    by_shape  = {(r[1] or "", round(float(r[2] or 0), 4), r[3]): r[0] for r in src}
+    for item_id, desc, std, rate, qty, sample_id in dst:
+        new = by_sample.get(sample_id) or by_shape.get((std or "", round(float(rate or 0), 4), qty))
+        if new and new != desc:
+            cur.execute("UPDATE invoice_items SET description = %s WHERE item_id = %s", (new, item_id))
 
 
 import openpyxl
@@ -249,6 +455,7 @@ def generate_invoice_no(cur, invoice_type: str) -> str:
     invoice_no = f"{next_number}/{year_short}"
     print(f"DEBUG: Generated non-PROFORMA invoice_no: {invoice_no}")
     return invoice_no
+@_run_once
 def ensure_delivery_note_reports_table(cur):
     """Ensure the delivery_note_reports junction table exists"""
     cur.execute("""
@@ -697,6 +904,7 @@ def _create_invoice_with_payment_method_impl(
     deduct_advance: bool = True,                  # NEW: see ADVANCE PAYMENT note below
     override_payment_status: Optional[str] = None,  # NEW
     override_paid_date=None,                         # NEW
+    line_overrides: Optional[list] = None,           # NEW: edited test names (List[LineNameOverride])
 ):
     """
     Shared implementation for creating an invoice.
@@ -774,6 +982,8 @@ def _create_invoice_with_payment_method_impl(
             (desc, std, rate, data["quantity"], data["sample_ids"])
             for (desc, std, rate), data in grouped_items.items()
         ]
+        # Edited test names from Generate Invoice (this invoice only)
+        final_items = _apply_line_overrides(final_items, line_overrides)
 
         # ---------------------------------------------------
         # 3. Generate invoice number
@@ -979,16 +1189,28 @@ def delete_invoice(invoice_id: int):
 # ----------------------------
 # GET LATEST PROJECTS FOR INVOICE DROPDOWN - ENHANCED VERSION
 # ----------------------------
+# Newest LP number first (same order as Create Test Request). Row ids are NOT in LP order
+# for imported LPs, so ordering by project_id showed stale LPs. Non-LP numbers sort last.
+_LP_NUM_SQL = "COALESCE(NULLIF(substring(p.project_no from '(?i)^(?:LP|GSL)/([0-9]+)/'), '')::bigint, -1)"
+_LP_ORDER_SQL = f"""
+            ORDER BY {_LP_NUM_SQL} DESC,
+                     p.project_id DESC
+"""
+
+
 @router.get("/projects/latest/")
-def get_latest_projects():
+def get_latest_projects(include_project_id: Optional[int] = None):
     """
-    Get the latest 10 projects with complete info for invoice creation.
+    Get the latest 10 projects (by LP number) with complete info for invoice creation.
+    include_project_id: always append this project if it is invoiceable but not in the latest 10
+    (used when Generate Invoice is opened from the Walk-In screen for one particular LP).
     Returns: Array of project objects with details.
     """
     conn = get_connection()
     cur = conn.cursor()
 
     try:
+        ensure_client_trn_column(cur)
         cur.execute("""
             SELECT
                 p.project_id,
@@ -998,30 +1220,52 @@ def get_latest_projects():
                 p.location,
                 q.quotation_no,
                 p.is_walk_in,
-                c.client_id
+                c.client_id,
+                c.trn,
+                p.plot_no
             FROM projects p
             LEFT JOIN clients c ON p.client_id = c.client_id
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
-            WHERE p.is_walk_in IS NOT TRUE
-               OR (p.is_walk_in = TRUE AND p.quotation_id IS NOT NULL AND p.project_no != 'PENDING')
-            ORDER BY p.project_id DESC
+            WHERE (p.is_walk_in IS NOT TRUE
+               OR (p.is_walk_in = TRUE AND p.quotation_id IS NOT NULL AND p.project_no != 'PENDING'))
+            """ + _LP_ORDER_SQL + """
             LIMIT 10
         """)
+        rows = cur.fetchall()
+
+        if include_project_id and not any(r[0] == include_project_id for r in rows):
+            cur.execute("""
+                SELECT
+                    p.project_id, p.project_name, p.project_no,
+                    COALESCE(c.name, p.client_name, p.walk_in_client) as client_name,
+                    p.location, q.quotation_no, p.is_walk_in, c.client_id, c.trn, p.plot_no
+                FROM projects p
+                LEFT JOIN clients c ON p.client_id = c.client_id
+                LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
+                WHERE p.project_id = %s
+                  AND (p.is_walk_in IS NOT TRUE
+                       OR (p.is_walk_in = TRUE AND p.quotation_id IS NOT NULL AND p.project_no != 'PENDING'))
+            """, (include_project_id,))
+            extra = cur.fetchone()
+            if extra:
+                rows = [extra] + list(rows)
 
         projects = []
-        for row in cur.fetchall():
-            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in, client_id = row
+        for row in rows:
+            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in, client_id, client_trn, plot_no = row
             display_label = f"{project_no} - {project_name} ({client_name})"
             projects.append({
                 "project_id": project_id,
                 "project_name": display_label,
                 "project_no": project_no,
+                "plot_no": plot_no,
                 "project_name_raw": project_name,
                 "client_name": client_name,
                 "location": location,
                 "quotation_no": quotation_no,
                 "is_walk_in": bool(is_walk_in),
                 "client_id": client_id,  # NEW: used to look up advance balance
+                "client_trn": client_trn,  # Customer TRN (clients.trn)
                 "value": project_id,
                 "label": display_label,
             })
@@ -1038,8 +1282,9 @@ def get_latest_projects():
 @router.get("/projects/search/")
 def search_projects(q: str = ""):
     """
-    Search projects by Plot Number (project_no) or LP number.
-    Supports partial, case-insensitive matching.
+    Search projects by LP number (full "LP/17345/26/DXB" or just the middle number "17345"),
+    Plot Number (projects.plot_no), project name or client. Partial, case-insensitive matching.
+    Exact LP-middle-number / plot-number / LP matches come first, then newest LP number first.
     Returns up to 20 matching projects.
     Used by the Generate Invoices search feature.
     """
@@ -1047,7 +1292,9 @@ def search_projects(q: str = ""):
     cur = conn.cursor()
 
     try:
-        term = f"%{q.strip()}%"
+        ensure_client_trn_column(cur)
+        qs = q.strip()
+        term = f"%{qs}%"
         limit_clause = "LIMIT 20" if q.strip() else ""
         cur.execute(f"""
             SELECT
@@ -1058,7 +1305,9 @@ def search_projects(q: str = ""):
                 p.location,
                 q.quotation_no,
                 p.is_walk_in,
-                c.client_id
+                c.client_id,
+                c.trn,
+                p.plot_no
             FROM projects p
             LEFT JOIN clients c ON p.client_id = c.client_id
             LEFT JOIN quotations q ON p.quotation_id = q.quotation_id
@@ -1070,25 +1319,36 @@ def search_projects(q: str = ""):
                 p.project_no ILIKE %s
                 OR p.project_name ILIKE %s
                 OR COALESCE(c.name, p.client_name, p.walk_in_client) ILIKE %s
+                OR p.plot_no ILIKE %s
             )
-            ORDER BY p.project_id DESC
+            ORDER BY CASE
+                         WHEN {_LP_NUM_SQL}::text = %s OR LOWER(TRIM(COALESCE(p.plot_no, ''))) = LOWER(%s)
+                              OR LOWER(p.project_no) = LOWER(%s) THEN 0
+                         WHEN p.project_no ILIKE %s THEN 1
+                         WHEN p.plot_no ILIKE %s THEN 2
+                         ELSE 3
+                     END,
+                     {_LP_NUM_SQL} DESC,
+                     p.project_id DESC
             {limit_clause}
-        """, (term, term, term))
+        """, (term, term, term, term, qs, qs, qs, term, term))
 
         projects = []
         for row in cur.fetchall():
-            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in, client_id = row
+            project_id, project_name, project_no, client_name, location, quotation_no, is_walk_in, client_id, client_trn, plot_no = row
             display_label = f"{project_no} - {project_name} ({client_name})"
             projects.append({
                 "project_id": project_id,
                 "project_name": display_label,
                 "project_no": project_no,
+                "plot_no": plot_no,
                 "project_name_raw": project_name,
                 "client_name": client_name,
                 "location": location,
                 "quotation_no": quotation_no,
                 "is_walk_in": bool(is_walk_in),
                 "client_id": client_id,  # NEW: used to look up advance balance
+                "client_trn": client_trn,  # Customer TRN (clients.trn)
                 "value": project_id,
                 "label": display_label,
             })
@@ -1402,6 +1662,18 @@ def generate_delivery_note_excel_template(payload: DeliveryNoteRequest):
             else:
                 raise HTTPException(status_code=400, detail="No approved reports found for this project")
         
+        # Report Identification per report_no (blank for reports uploaded without one)
+        _ensure_report_ident(conn)
+        ident_by_report = {}
+        cur.execute("""
+            SELECT DISTINCT ON (report_no) report_no, report_ident
+            FROM reports
+            WHERE report_no = ANY(%s) AND report_ident IS NOT NULL
+            ORDER BY report_no, report_id
+        """, ([r[1] for r in reports_data],))
+        for rno, rident in cur.fetchall():
+            ident_by_report[rno] = rident
+
         # Generate delivery note number
         delivery_note_no = generate_delivery_note_number(cur)
         
@@ -1423,13 +1695,13 @@ def generate_delivery_note_excel_template(payload: DeliveryNoteRequest):
         # 2. Fill Template Fields
         # =====================================================
         # Fill Ref. No.: delivery note number
-        ws["B6"] = delivery_note_no  # Ref. No.: (row 10, column B)
+        ws["B7"] = delivery_note_no  # Ref. No.
         
         # Fill Lab Project No.: project number
-        ws["B7"] = project_no  # Lab Project No.: (row 12, column B)
+        ws["B8"] = project_no  # Lab Project No.
         
         # Fill Customer Name:
-        ws["B8"] = client_name  # Customer Name: (row 13, column B)
+        ws["B9"] = client_name  # Customer Name
         
         # P.O.Box: (already has Dubai - U.A.E.)
         # This is at ws["B14"] which already has "Dubai - U.A.E."
@@ -1438,7 +1710,7 @@ def generate_delivery_note_excel_template(payload: DeliveryNoteRequest):
         # 3. Fill Report Table
         # =====================================================
         # Starting row for reports in the template (row 19 based on your template)
-        START_ROW = 12
+        START_ROW = 13
         
         for i, report in enumerate(reports_data, 1):
             row = START_ROW + i - 1
@@ -1455,11 +1727,11 @@ def generate_delivery_note_excel_template(payload: DeliveryNoteRequest):
             # G = No. Tests (based on your template with columns A-K)
             
             ws[f"A{row}"] = report_no
-            ws[f"B{row}"] = test_name or "Test Report"
+            ws[f"B{row}"] = _dn_description(test_name, ident_by_report.get(report_no))
             ws[f"G{row}"] = actual_sample_count
         
         # Clear any remaining rows in the template
-        MAX_TEMPLATE_ROWS = 34  # Adjust based on your template
+        MAX_TEMPLATE_ROWS = 53  # Adjust based on your template
         for row in range(START_ROW + len(reports_data), MAX_TEMPLATE_ROWS + 1):
             ws[f"A{row}"].value = None
             ws[f"B{row}"].value = None
@@ -1806,6 +2078,57 @@ def preview_invoice_totals(project_id: int, include_all: bool = True, report_ids
         conn.close()
 
 
+@router.get("/projects/{project_id}/preview-items",
+            summary="Grouped test lines a report selection will invoice (for editing names; nothing is created)")
+def preview_invoice_items(project_id: int, include_all: bool = True, report_ids: Optional[str] = None):
+    """
+    Same resolution as preview-totals / real invoice creation, but returns the
+    GROUPED lines (description / standard / rate / qty) so Generate Invoice can
+    let the user edit a test name before generating.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_walkin_proforma_records_table(cur)
+        if include_all:
+            cur.execute("""
+                SELECT DISTINCT r.report_id
+                FROM reports r
+                JOIN samples s ON r.sample_id = s.sample_id
+                JOIN test_requests tr ON s.request_id = tr.test_request_id
+                WHERE tr.project_id = %s
+                  AND r.status = 'APPROVED'
+                  AND r.report_no NOT IN (
+                      SELECT report_no FROM invoice_report_links WHERE invoice_type = 'PROFORMA'
+                  )
+            """, (project_id,))
+            ids = [r[0] for r in cur.fetchall()]
+        else:
+            ids = [int(x) for x in report_ids.split(",") if x.strip().isdigit()] if report_ids else []
+        if not ids:
+            return {"lines": []}
+        sample_ids = get_sample_ids_for_reports(ids, cur)
+        if not sample_ids:
+            return {"lines": []}
+        items = get_project_quotation_items(project_id, cur, sample_ids=sample_ids)
+        grouped = {}
+        for it in items:
+            desc, std, rate, qty = it[1], it[2], it[3], it[4]
+            key = (desc, std, rate)
+            grouped[key] = grouped.get(key, 0) + qty
+        lines = []
+        for (desc, std, rate), qty in grouped.items():
+            r = float(rate) if isinstance(rate, Decimal) else (rate or 0)
+            lines.append({"description": desc, "test_standard": std or "",
+                          "unit_rate": r, "quantity": qty, "amount": round(r * qty, 2)})
+        return {"lines": lines}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
 # =====================================================
 # MODIFIED: Create Invoice - Record report links
 # =====================================================
@@ -1908,6 +2231,11 @@ import re as _trn_re
 TRN_SETTING_KEY = "active_trn"
 TRN_CELL = "H3"
 
+# On the Tax-1 sheet H3 sits inside the merged title range A3:H3, so stamping
+# there overwrote the "TAX INVOICE" title with the TRN. The TRN goes to L3
+# (where the template's old hard-coded TRN used to be) on that sheet instead.
+TRN_CELL_OVERRIDES = {"Tax-1": "L3"}
+
 # Used only until a TRN is set from the UI for the first time.
 # Set the DEFAULT_TRN environment variable to seed it; otherwise H3 stays blank.
 DEFAULT_TRN = os.getenv("DEFAULT_TRN", "").strip()
@@ -2004,15 +2332,20 @@ def stamp_trn(ws, trn=None):
     if trn is None:
         trn = get_active_trn()
 
-    target = ws[TRN_CELL]
+    trn_cell = TRN_CELL_OVERRIDES.get(ws.title, TRN_CELL)
+    target = ws[trn_cell]
     for merged in ws.merged_cells.ranges:
-        if TRN_CELL in merged:
+        if trn_cell in merged:
             target = ws.cell(row=merged.min_row, column=merged.min_col)
             break
 
     target.value = f"TRN : {trn}" if trn else None
     target.font = Font(name="Arial", size=12, bold=True, color="FF0000")
-    target.alignment = Alignment(horizontal="center", vertical="center")
+    # Tax-1's TRN cell (L3) is right-aligned so it keeps the old look
+    target.alignment = Alignment(
+        horizontal="right" if ws.title in TRN_CELL_OVERRIDES else "center",
+        vertical="center",
+    )
 
 
 class TRNUpdate(BaseModel):
@@ -2097,6 +2430,7 @@ def _fill_proforma_sheet(ws, invoice: dict, project: dict, items: list):
       I4  - Invoice Number (Proforma)
       I5  - Date
       I6  - LP No.
+      I7  - Customer Ref. No. (invoices.client_reference)
       Rows 18-34, cols A/B/D/I/J/K - line items
         A  - Report No. (of the report covering this test/sample)
         B  - Report creation date (dd-mm-yy)
@@ -2142,6 +2476,7 @@ def _fill_proforma_sheet(ws, invoice: dict, project: dict, items: list):
     set_cell(ws, "I4",  invoice.get("invoice_no") or " - ")        # Invoice No.
     set_cell(ws, "I5",  fmt_date(invoice.get("invoice_date")))      # Date
     set_cell(ws, "I6",  project.get("project_no") or invoice.get("lpo_reference") or " - ")  # LP No.
+    set_cell(ws, "I7",  invoice.get("client_reference") or " - ")  # Customer Ref. No.
 
     FIRST_ROW = 18
     LAST_TEMPLATE_ROW = 34
@@ -2218,6 +2553,7 @@ def _fill_tax_sheet(ws, invoice: dict, project: dict, items: list):
       K4  - Invoice Number (Tax)
       K5  - Date
       K6  - LP No. (this is the project_no from the projects table, NOT the LPO number)
+      K7  - Customer Ref. No. (invoices.client_reference)
       Rows 18-34, cols A/B/D/I/J/K/L/M - line items
         A  - Report No. (of the report covering this test/sample)
         B  - Report creation date (dd-mm-yy)
@@ -2265,6 +2601,7 @@ def _fill_tax_sheet(ws, invoice: dict, project: dict, items: list):
     set_cell(ws, "K4",  invoice.get("tax_invoice_no") or invoice.get("invoice_no") or " - ")
     set_cell(ws, "K5",  fmt_date(invoice.get("invoice_date")))
     set_cell(ws, "K6",  project.get("project_no") or " - ")
+    set_cell(ws, "K7",  invoice.get("client_reference") or " - ")  # Customer Ref. No.
 
     FIRST_ROW = 18
     LAST_TEMPLATE_ROW = 34
@@ -2489,6 +2826,10 @@ class WalkInInvoiceRequest(BaseModel):
     payment_method: Optional[Literal['CASH', 'CREDIT', 'ADVANCE']] = 'CASH'  # NEW: added ADVANCE
     selected_item_ids: Optional[List[int]] = None
     include_all_items: bool = True
+    # Mode of Payment popup (required — a Tax Invoice is generated here)
+    mode_of_payment: Optional[Literal['CASH', 'CHEQUE', 'BANK_TRANSFER']] = None
+    # Edited test names, {walk_in_items.item_id: "new name"} — this invoice only
+    item_names: Optional[dict] = None
 
 
 @router.post("/walkin/generate-invoice")
@@ -2500,10 +2841,13 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
     import re as _re
     import urllib.parse as _urlparse
 
+    normalize_mop(payload.mode_of_payment)       # Tax Invoice is made here → MoP required
+
     conn = get_connection()
     cur = conn.cursor()
 
     try:
+        ensure_payment_receipt_columns(cur)
         # ──────────────────────────────────────────────────────────
         # 1. Load walk-in project details
         # ──────────────────────────────────────────────────────────
@@ -2533,32 +2877,31 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
         # ──────────────────────────────────────────────────────────
         # 2. Resolve items
         #
-        # BUSINESS RULE: Only tests that have a Payment Advice
-        # (pa_generated = TRUE) AND have NOT already been invoiced
-        # can be invoiced. Tests without a PA, or already consumed by
-        # a previous invoice, must be excluded regardless of what the
-        # frontend sends.
+        # BUSINESS RULE: A Payment Advice is NOT required to invoice.
+        # Any test on the LP that has NOT already been invoiced can be
+        # invoiced (before or after a PA). Tests already consumed by a
+        # previous invoice are excluded regardless of what the frontend
+        # sends. Amounts come from walk_in_items (the editable LP rate).
         # ──────────────────────────────────────────────────────────
         _ensure_walkin_items_invoiced_columns(cur)
 
         if payload.include_all_items:
-            # "Select All" from the UI = all ADVISED, NOT-YET-INVOICED items
+            # "Select All" from the UI = all NOT-YET-INVOICED items
             cur.execute("""
                 SELECT item_id, description, test_standard, unit_rate, quantity, amount
                 FROM walk_in_items
-                WHERE project_id = %s AND pa_generated = TRUE AND invoiced = FALSE
+                WHERE project_id = %s AND invoiced = FALSE
                 ORDER BY item_id
             """, (project_id,))
         else:
             if not payload.selected_item_ids:
                 raise HTTPException(400, "No tests selected")
-            # Explicit selection — enforce pa_generated = TRUE and not-yet-invoiced
+            # Explicit selection — enforce not-yet-invoiced only (no PA needed)
             cur.execute("""
                 SELECT item_id, description, test_standard, unit_rate, quantity, amount
                 FROM walk_in_items
                 WHERE project_id = %s
                   AND item_id = ANY(%s)
-                  AND pa_generated = TRUE
                   AND invoiced = FALSE
                 ORDER BY item_id
             """, (project_id, payload.selected_item_ids))
@@ -2567,9 +2910,8 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
         if not rows:
             raise HTTPException(
                 400,
-                "No invoiceable tests found. Only tests with a Payment Advice (Already Advised) "
-                "that haven't already been invoiced can be included. Please generate a Payment "
-                "Advice first, or check whether these tests were already invoiced."
+                "No invoiceable tests found. Please check whether these tests were "
+                "already invoiced."
             )
 
         items = [
@@ -2583,6 +2925,9 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
             }
             for r in rows
         ]
+
+        # Edited test names (this invoice only)
+        items = _apply_walkin_item_names(items, payload.item_names)
 
         # ──────────────────────────────────────────────────────────
         # 3. Totals
@@ -2700,6 +3045,9 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
                 note=f"Applied to invoice {proforma_no}",
             )
 
+        # Tax Invoice made → PAID + Mode of Payment + Receipt No. + P Number
+        finalize_tax_payment(cur, invoice_id, payload.mode_of_payment)
+
         conn.commit()
 
         # ──────────────────────────────────────────────────────────
@@ -2806,6 +3154,16 @@ def generate_walkin_invoice(payload: WalkInInvoiceRequest):
 #  standard report-based invoices — different header cell layout)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _wi_dn_ref_cells(ws, row: int, item: dict):
+    """Delivery-Note invoices only: A = D.N.No (D.O ref), B = D.N Date (D.O created date)."""
+    ref = item.get("report_no")
+    if not ref:
+        return
+    set_cell(ws, f"A{row}", ref)
+    dt = item.get("report_created_at")
+    set_cell(ws, f"B{row}", dt.strftime("%d-%m-%y") if hasattr(dt, "strftime") else (dt or None))
+
+
 def _wi_fill_proforma(ws, meta: dict, items: list):
     """
     Fill Sheet 1 (Proforma Invoice) for a Walk-In LP.
@@ -2849,6 +3207,7 @@ def _wi_fill_proforma(ws, meta: dict, items: list):
     set_cell(ws, "I4",  meta.get("invoice_no") or "")
     set_cell(ws, "I5",  meta.get("date") or "")
     set_cell(ws, "I6",  meta.get("lp_number") or "")
+    set_cell(ws, "I7",  meta.get("customer_ref") or "")   # Customer Ref. No.
 
     # Clear existing item rows
     for r in range(FIRST_ROW, LAST_TEMPLATE_ROW + 1):
@@ -2875,10 +3234,15 @@ def _wi_fill_proforma(ws, meta: dict, items: list):
     # Fill item rows
     for idx, item in enumerate(items):
         row = FIRST_ROW + idx
+        _wi_dn_ref_cells(ws, row, item)          # A = D.N.No, B = D.N Date (Delivery-Note invoices only)
         set_cell(ws, f"D{row}", item.get("description") or "—")
         set_cell(ws, f"I{row}", item.get("quantity") or 0)
-        set_cell(ws, f"J{row}", item.get("unit_rate") or 0)
-        set_cell(ws, f"K{row}", f'=IF(I{row}="","",(I{row}*J{row}))')
+        if item.get("blank_rate"):               # Rate left blank, amount written directly
+            set_cell(ws, f"J{row}", None)
+            set_cell(ws, f"K{row}", round(float(item.get("amount") or 0), 2))
+        else:
+            set_cell(ws, f"J{row}", item.get("unit_rate") or 0)
+            set_cell(ws, f"K{row}", f'=IF(I{row}="","",(I{row}*J{row}))')
 
     # Blank remaining IF formulas inside K35 SUM range
     for row in range(FIRST_ROW + num_items, LAST_TEMPLATE_ROW + 1):
@@ -2936,6 +3300,7 @@ def _wi_fill_tax(ws, meta: dict, items: list):
     set_cell(ws, "K4",  meta.get("invoice_no") or "")
     set_cell(ws, "K5",  meta.get("date") or "")
     set_cell(ws, "K6",  meta.get("lp_number") or "")
+    set_cell(ws, "K7",  meta.get("customer_ref") or "")   # Customer Ref. No.
 
     # Clear existing item rows
     for r in range(FIRST_ROW, LAST_TEMPLATE_ROW + 1):
@@ -2962,10 +3327,15 @@ def _wi_fill_tax(ws, meta: dict, items: list):
     # Fill item rows with formulas for VAT split
     for idx, item in enumerate(items):
         row = FIRST_ROW + idx
+        _wi_dn_ref_cells(ws, row, item)          # A = D.N.No, B = D.N Date (Delivery-Note invoices only)
         set_cell(ws, f"D{row}", item.get("description") or "—")
         set_cell(ws, f"I{row}", item.get("quantity") or 0)
-        set_cell(ws, f"J{row}", item.get("unit_rate") or 0)
-        set_cell(ws, f"K{row}", f'=IF(I{row}="","",(I{row}*J{row}))')
+        if item.get("blank_rate"):               # Rate left blank, amount written directly
+            set_cell(ws, f"J{row}", None)
+            set_cell(ws, f"K{row}", round(float(item.get("amount") or 0), 2))
+        else:
+            set_cell(ws, f"J{row}", item.get("unit_rate") or 0)
+            set_cell(ws, f"K{row}", f'=IF(I{row}="","",(I{row}*J{row}))')
         set_cell(ws, f"L{row}", f'=IF(K{row}="","",K{row}*5%)')
         set_cell(ws, f"M{row}", f'=IF(K{row}="","",K{row}+L{row})')
 
@@ -3035,8 +3405,9 @@ class WalkInProformaOnlyRequest(BaseModel):
     """Option B — Proforma Only (walk-in LP)"""
     project_id:         int
     payment_method:     Optional[Literal['CASH', 'CREDIT', 'ADVANCE']] = 'CASH'  # NEW: added ADVANCE
-    selected_item_ids:  Optional[List[int]] = None   # None / empty → all advised
+    selected_item_ids:  Optional[List[int]] = None   # None / empty → all uninvoiced
     include_all_items:  bool = True
+    item_names:         Optional[dict] = None        # edited test names {item_id: "new name"}
 
 
 class WalkInTaxOnlyRequest(BaseModel):
@@ -3044,6 +3415,7 @@ class WalkInTaxOnlyRequest(BaseModel):
     project_id:         int
     proforma_record_id: int          # walkin_proforma_records.id chosen by user
     payment_method:     Optional[Literal['CASH', 'CREDIT', 'ADVANCE']] = 'CASH'  # NEW: added ADVANCE
+    mode_of_payment:    Optional[Literal['CASH', 'CHEQUE', 'BANK_TRANSFER']] = None  # required (popup)
 
 
 class NonWalkInInvoiceRequest(BaseModel):
@@ -3056,12 +3428,17 @@ class NonWalkInInvoiceRequest(BaseModel):
     # Only required for TAX_ONLY
     proforma_invoice_id: Optional[int] = None        # invoices.invoice_id of the existing proforma
     services_description: Optional[str] = None
+    # Mode of Payment popup — required for BOTH and TAX_ONLY (a Tax Invoice is made)
+    mode_of_payment: Optional[Literal['CASH', 'CHEQUE', 'BANK_TRANSFER']] = None
+    # Edited test names for BOTH / PROFORMA_ONLY (TAX_ONLY inherits the Proforma's names)
+    line_overrides: Optional[List[LineNameOverride]] = None
 
 
 # ============================================================================
 # DB migration helper — call once
 # ============================================================================
 
+@_run_once
 def ensure_walkin_proforma_records_table(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS walkin_proforma_records (
@@ -3141,7 +3518,7 @@ def _wi_blank_tax_sheet(ws):
     Template borders / formatting remain intact.
     """
     # Header number / date / LP cells
-    for addr in ("K4", "K5", "K6", "A5", "B7", "C11", "C12", "C13", "C15", "D38"):
+    for addr in ("K4", "K5", "K6", "K7", "A5", "B7", "C11", "C12", "C13", "C15", "D38"):
         set_cell(ws, addr, None)
 
     FIRST_ROW = 18
@@ -3155,7 +3532,7 @@ def _wi_blank_tax_sheet(ws):
 
 def _nonwi_blank_tax_sheet(ws):
     """Same idea for non-walk-in Sheet 2 (different header cells)."""
-    for addr in ("K4", "K5", "K6", "A5", "C11", "C12", "C13", "C15", "D38"):
+    for addr in ("K4", "K5", "K6", "K7", "A5", "C11", "C12", "C13", "C15", "D38"):
         set_cell(ws, addr, None)
 
     FIRST_ROW = 18
@@ -3184,6 +3561,7 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
 
     try:
         ensure_walkin_proforma_records_table(cur)
+        ensure_payment_receipt_columns(cur)
 
         # 1. Load project
         cur.execute("""
@@ -3199,14 +3577,14 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
             raise HTTPException(400, "LP number has not been generated yet")
         walkin_client_id = proj[8]
 
-        # 2. Resolve items (pa_generated = TRUE guard, and not already invoiced)
+        # 2. Resolve items (not already invoiced; Payment Advice NOT required)
         _ensure_walkin_items_invoiced_columns(cur)
 
         if payload.include_all_items or not payload.selected_item_ids:
             cur.execute("""
                 SELECT item_id, description, test_standard, unit_rate, quantity, amount
                 FROM walk_in_items
-                WHERE project_id = %s AND pa_generated = TRUE AND invoiced = FALSE
+                WHERE project_id = %s AND invoiced = FALSE
                 ORDER BY item_id
             """, (payload.project_id,))
         else:
@@ -3215,7 +3593,6 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
                 FROM walk_in_items
                 WHERE project_id = %s
                   AND item_id = ANY(%s)
-                  AND pa_generated = TRUE
                   AND invoiced = FALSE
                 ORDER BY item_id
             """, (payload.project_id, payload.selected_item_ids))
@@ -3224,8 +3601,7 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
         if not rows:
             raise HTTPException(
                 400,
-                "No invoiceable tests found. Only tests with a Payment Advice that "
-                "haven't already been invoiced can be invoiced."
+                "No invoiceable tests found. These tests may already have been invoiced."
             )
 
         items = [
@@ -3240,6 +3616,9 @@ def generate_walkin_proforma_only(payload: WalkInProformaOnlyRequest):
             for r in rows
         ]
         item_ids = [i["item_id"] for i in items]
+
+        # Edited test names (this invoice only)
+        items = _apply_walkin_item_names(items, payload.item_names)
 
         # 3. Totals
         subtotal    = sum(i["amount"] for i in items)
@@ -3427,14 +3806,15 @@ def list_walkin_pending_proformas(project_id: int):
             (rec_id, proforma_no, invoice_id, item_ids,
              created_at, subtotal, vat, total, payment_method) = row
 
-            # Fetch the item descriptions so the UI can show the test list
+            # Fetch the item descriptions so the UI can show the test list —
+            # read from the PROFORMA's own invoice_items so edited test names show.
             if item_ids:
                 cur.execute("""
                     SELECT item_id, description, test_standard, unit_rate, quantity, amount
-                    FROM walk_in_items
-                    WHERE item_id = ANY(%s)
+                    FROM invoice_items
+                    WHERE invoice_id = %s
                     ORDER BY item_id
-                """, (item_ids,))
+                """, (invoice_id,))
                 items = [
                     {
                         "item_id":       r[0],
@@ -3483,11 +3863,14 @@ def generate_walkin_tax_only(payload: WalkInTaxOnlyRequest):
     fills BOTH sheets (Sheet 1 = existing proforma data, Sheet 2 = new tax).
     Marks the proforma record as converted.
     """
+    normalize_mop(payload.mode_of_payment)       # Tax Invoice is made here → MoP required
+
     conn = get_connection()
     cur  = conn.cursor()
 
     try:
         ensure_walkin_proforma_records_table(cur)
+        ensure_payment_receipt_columns(cur)
 
         # 1. Load the proforma record
         cur.execute("""
@@ -3544,13 +3927,14 @@ def generate_walkin_tax_only(payload: WalkInTaxOnlyRequest):
         is_advance_settled = (orig_method == "ADVANCE")
         tax_payment_method = "ADVANCE" if is_advance_settled else payload.payment_method
 
-        # 4. Load original items from walk_in_items
+        # 4. Load the items EXACTLY as they were put on the Proforma (its own
+        #    invoice_items) so any test names edited at Proforma time carry over.
         cur.execute("""
             SELECT item_id, description, test_standard, unit_rate, quantity, amount
-            FROM walk_in_items
-            WHERE item_id = ANY(%s)
+            FROM invoice_items
+            WHERE invoice_id = %s
             ORDER BY item_id
-        """, (item_ids,))
+        """, (proforma_invoice_id,))
         items = [
             {
                 "item_id":       r[0],
@@ -3562,6 +3946,17 @@ def generate_walkin_tax_only(payload: WalkInTaxOnlyRequest):
             }
             for r in cur.fetchall()
         ]
+        if not items:   # safety net for very old records without invoice_items
+            cur.execute("""
+                SELECT item_id, description, test_standard, unit_rate, quantity, amount
+                FROM walk_in_items WHERE item_id = ANY(%s) ORDER BY item_id
+            """, (item_ids,))
+            items = [
+                {"item_id": r[0], "description": r[1] or "—", "test_standard": r[2] or "",
+                 "unit_rate": float(r[3]) if r[3] is not None else 0.0,
+                 "quantity": r[4] or 1, "amount": float(r[5]) if r[5] is not None else 0.0}
+                for r in cur.fetchall()
+            ]
 
         # 5. Generate Tax Invoice number
         tax_no        = generate_invoice_no(cur, "TAX")
@@ -3621,6 +4016,11 @@ def generate_walkin_tax_only(payload: WalkInTaxOnlyRequest):
             UPDATE invoices SET remarks = %s
             WHERE invoice_id = %s
         """, (f"Tax Invoice No: {tax_no}", proforma_invoice_id))
+
+        # 8a. Tax Invoice made → PAID + Mode of Payment + Receipt No. + P Number
+        #     (the converted Proforma is settled with it, same mode)
+        finalize_tax_payment(cur, tax_invoice_id, payload.mode_of_payment,
+                             also_invoice_ids=[proforma_invoice_id])
 
         conn.commit()
 
@@ -3699,11 +4099,16 @@ def generate_invoice_with_reports_and_tests_v2(payload: NonWalkInInvoiceRequest)
       TAX_ONLY      → requires proforma_invoice_id; creates TAX invoice,
                        Sheet 1 = original proforma data, Sheet 2 = new tax
     """
+    # A Tax Invoice is made in BOTH and TAX_ONLY → Mode of Payment is required
+    if payload.generation_mode in ("BOTH", "TAX_ONLY"):
+        normalize_mop(payload.mode_of_payment)
+
     conn = get_connection()
     cur  = conn.cursor()
 
     try:
         ensure_walkin_proforma_records_table(cur)
+        ensure_payment_receipt_columns(cur)
 
         project_id      = payload.project_id
         generation_mode = payload.generation_mode
@@ -3775,12 +4180,17 @@ def generate_invoice_with_reports_and_tests_v2(payload: NonWalkInInvoiceRequest)
                 payment_terms       = "30 days" if payment_method == "CREDIT" else "Immediate",
                 services_description= payload.services_description or "Professional services rendered",
             )
-            invoice_result = _create_invoice_with_payment_method_impl(inv_payload, sample_ids=sample_ids_filter, shared_cur=cur)
+            invoice_result = _create_invoice_with_payment_method_impl(
+                inv_payload, sample_ids=sample_ids_filter, shared_cur=cur,
+                line_overrides=payload.line_overrides)
             invoice_id = invoice_result["invoice_id"]
 
             # Record report links + generation mode
             _link_reports(cur, invoice_id, report_nos, "PROFORMA")
             cur.execute("UPDATE invoices SET generation_mode='BOTH' WHERE invoice_id=%s", (invoice_id,))
+
+            # Tax Invoice made → PAID + Mode of Payment + Receipt No. + P Number
+            finalize_tax_payment(cur, invoice_id, payload.mode_of_payment)
 
             # Commit to release the row lock before generating the TAX number
             conn.commit()
@@ -3817,7 +4227,9 @@ def generate_invoice_with_reports_and_tests_v2(payload: NonWalkInInvoiceRequest)
                 payment_terms       = "30 days" if payment_method == "CREDIT" else "Immediate",
                 services_description= payload.services_description or "Professional services rendered",
             )
-            invoice_result = _create_invoice_with_payment_method_impl(inv_payload, sample_ids=sample_ids_filter, shared_cur=cur)
+            invoice_result = _create_invoice_with_payment_method_impl(
+                inv_payload, sample_ids=sample_ids_filter, shared_cur=cur,
+                line_overrides=payload.line_overrides)
             invoice_id = invoice_result["invoice_id"]
 
             _link_reports(cur, invoice_id, report_nos, "PROFORMA")
@@ -3922,10 +4334,18 @@ def generate_invoice_with_reports_and_tests_v2(payload: NonWalkInInvoiceRequest)
             _link_reports(cur, tax_invoice_id, proforma_report_nos, "TAX")
             cur.execute("UPDATE invoices SET generation_mode='TAX_ONLY' WHERE invoice_id=%s", (tax_invoice_id,))
 
+            # Keep the (possibly edited) test names that were put on the Proforma
+            _carry_over_item_names(cur, proforma_invoice_id, tax_invoice_id)
+
             # Update proforma remarks to cross-reference tax no
             cur.execute("""
                 UPDATE invoices SET remarks = %s WHERE invoice_id = %s
             """, (f"Tax Invoice No: {tax_no}", proforma_invoice_id))
+
+            # Tax Invoice made → PAID + Mode of Payment + Receipt No. + P Number
+            # (the converted Proforma is settled with it, same mode)
+            finalize_tax_payment(cur, tax_invoice_id, payload.mode_of_payment,
+                                 also_invoice_ids=[proforma_invoice_id])
             conn.commit()
 
             # Build Excel — both sheets
@@ -4238,6 +4658,7 @@ def list_all_invoices():
     conn = get_connection()
     cur  = conn.cursor()
     try:
+        ensure_payment_receipt_columns(cur)
         cur.execute("""
             SELECT
                 i.invoice_id,
@@ -4250,6 +4671,9 @@ def list_all_invoices():
                 i.remarks,
                 i.total,
                 p.is_walk_in,
+                i.mode_of_payment,
+                i.receipt_no,
+                i.p_number,
                 -- Contractor name: walk-in uses walk_in_client / project_name,
                 -- non-walk-in uses clients.name
                 CASE
@@ -4271,6 +4695,7 @@ def list_all_invoices():
             (invoice_id, invoice_no, invoice_type, generation_mode,
              invoice_date, payment_status, paid_date, remarks,
              total, is_walk_in,
+             mode_of_payment, receipt_no, p_number,
              contractor_name) = row
 
             # For TAX_ONLY invoices the proforma number is stored in remarks;
@@ -4294,6 +4719,10 @@ def list_all_invoices():
                 "linked_invoice_no": linked_invoice_no,
                 "total":            float(total) if total is not None else 0.0,
                 "is_walk_in":       bool(is_walk_in),
+                # Mode of Payment: CASH | CHEQUE | BANK_TRANSFER (NULL on Proforma-only)
+                "mode_of_payment":  mode_of_payment,
+                "receipt_no":       receipt_no,
+                "p_number":         p_number,
             })
 
         return result
@@ -4756,6 +5185,8 @@ def get_project_reports_invoiced_status(project_id: int):
     cur  = conn.cursor()
 
     try:
+        _ensure_report_ident(conn)
+
         # ── 1. Fetch project basics ───────────────────────────────────────────
         cur.execute("""
             SELECT p.project_id, p.project_no, p.project_name,
@@ -4802,7 +5233,8 @@ def get_project_reports_invoiced_status(project_id: int):
                     FROM   invoice_report_links irl
                     WHERE  irl.report_no   = r.report_no
                     AND    irl.invoice_type = 'PROFORMA'
-                ) AS is_invoiced
+                ) AS is_invoiced,
+                r.report_ident
             FROM   reports r
             JOIN   samples      s  ON r.sample_id   = s.sample_id
             JOIN   test_requests tr ON s.request_id  = tr.test_request_id
@@ -4816,7 +5248,7 @@ def get_project_reports_invoiced_status(project_id: int):
         reports = []
         for row in rows:
             (report_id, report_no, status, created_at,
-             test_name, covers_samples, sample_count, is_invoiced) = row
+             test_name, covers_samples, sample_count, is_invoiced, report_ident) = row
 
             # Resolve sample list
             if covers_samples:
@@ -4840,6 +5272,7 @@ def get_project_reports_invoiced_status(project_id: int):
                 "sample_count":  sample_count,
                 "covers_samples": sample_nos,
                 "is_invoiced":   bool(is_invoiced),
+                "report_ident":  report_ident or "",
             })
 
         return {
@@ -5020,3 +5453,738 @@ def get_department_revenue_breakdown(department: str):
         raise HTTPException(500, str(e))
     finally:
         cur.close(); conn.close()
+
+
+# ============================================================================
+# DELIVERY NOTES FROM GRs  ->  INVOICES FROM DELIVERY NOTES
+# ----------------------------------------------------------------------------
+#  Works for BOTH walk-in and non-walk-in LPs (everything is read through
+#  test_requests (GQ) -> gr_reports (GR) -> samples (GS rows) -> tests).
+#
+#  Cost of a GR   = sum over its sample rows of the test's official rate
+#                   (quotation_items.unit_rate - the edited rate; walk-in rate
+#                   edits are mirrored into quotation_items, see walkin.py).
+#                   Falls back to samples.unit_rate if the item link is gone.
+#  Cost of a D.O  = sum of the cost of the GRs inside it.
+#
+#  Endpoints
+#    GET  /invoices/projects/{project_id}/grs-for-delivery-note
+#    POST /invoices/delivery-notes/generate-from-grs
+#    GET  /invoices/projects/{project_id}/delivery-notes-for-invoice
+#    POST /invoices/delivery-notes/generate-invoice     (BOTH / PROFORMA_ONLY / TAX_ONLY)
+# ============================================================================
+
+DN_TEMPLATE_URLS = [
+    "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/delivery_note.xlsx",
+    "https://hqwgkmbjmcxpxbwccclo.supabase.co/storage/v1/object/public/templates/invoices/delivery_note.xlsx",
+]
+
+
+def _download_dn_template():
+    """Try templates/delivery_note.xlsx first, then templates/invoices/delivery_note.xlsx."""
+    last_err = None
+    for url in DN_TEMPLATE_URLS:
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+                f.write(r.content)
+                return f.name
+        except requests.exceptions.RequestException as e:
+            last_err = e
+    raise HTTPException(500, f"Failed to download delivery note template: {last_err}")
+
+
+def _ensure_report_ident(conn):
+    """Report Identification columns on `reports` (lazy import avoids an import cycle)."""
+    from gr_workflow import ensure_report_ident_columns
+    ensure_report_ident_columns(conn)
+
+
+def _dn_description(tests, ident):
+    """Delivery Note description: 'Density - CAR 123 BF 234 R# 566' (ident omitted when blank)."""
+    base = tests or "Test Report"
+    return f"{base} - {ident}" if ident else base
+
+
+@_run_once
+def ensure_dn_invoice_schema(cur):
+    """Idempotent: DN tables + the two columns that track invoicing of a D.O."""
+    ensure_delivery_note_reports_table(cur)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS delivery_notes (
+            delivery_note_id SERIAL PRIMARY KEY,
+            delivery_note_no VARCHAR(50) NOT NULL UNIQUE,
+            project_id INTEGER NOT NULL REFERENCES projects(project_id),
+            generated_by INTEGER REFERENCES users(user_id),
+            generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_reports INTEGER DEFAULT 0,
+            file_path TEXT
+        )
+    """)
+    cur.execute("""
+        ALTER TABLE delivery_notes
+            ADD COLUMN IF NOT EXISTS proforma_invoice_id INTEGER,
+            ADD COLUMN IF NOT EXISTS tax_invoice_id      INTEGER
+    """)
+    # Report Identification columns read by _fetch_project_grs.
+    # Use gr_workflow's helper so reports / gr_reports are always altered in the SAME order
+    # (gr_reports, then reports). Doing it here in the opposite order caused the deadlock.
+    _ensure_report_ident(cur.connection)
+    # also guarantees invoices.generation_mode exists
+    ensure_walkin_proforma_records_table(cur)
+
+
+# GR status: no reports row => GENERATED, else the report's own status.
+_GR_STATUS_EXPR = """
+    COALESCE(
+        (SELECT r.status FROM reports r WHERE r.report_no = g.gr_no
+         ORDER BY r.linked_to_report_id NULLS FIRST, r.report_id LIMIT 1),
+        'GENERATED')
+"""
+
+
+def _gr_status_label(raw: str) -> str:
+    """APPROVED -> approved by supervisor | GENERATED -> nothing uploaded | else uploaded, awaiting approval."""
+    if raw == "APPROVED":
+        return "APPROVED"
+    if raw == "GENERATED":
+        return "NOT_UPLOADED"
+    return "PENDING_APPROVAL"
+
+
+def _summarise_tests(names):
+    """['Cube','Cube','Sulphate'] -> 'Cube (2), Sulphate'  (keeps first-seen order)."""
+    counts = {}
+    for n in names or []:
+        n = (n or "").strip()
+        if n:
+            counts[n] = counts.get(n, 0) + 1
+    return ", ".join(f"{k} ({v})" if v > 1 else k for k, v in counts.items())
+
+
+def _fetch_project_grs(cur, project_id: int, gr_nos=None):
+    extra = ""
+    params = [project_id]
+    if gr_nos is not None:
+        extra = "AND g.gr_no = ANY(%s)"
+        params.append(list(gr_nos))
+    cur.execute(f"""
+        SELECT g.gr_id, g.gr_no, g.gr_date, tr.request_no,
+               {_GR_STATUS_EXPR} AS st,
+               COUNT(s.sample_id) AS n_tests,
+               COALESCE(SUM(COALESCE(qi.unit_rate, s.unit_rate, 0)), 0) AS cost,
+               ARRAY_REMOVE(ARRAY_AGG(s.assigned_test_name ORDER BY s.sample_id), NULL) AS tests,
+               (SELECT dnr.delivery_note_no FROM delivery_note_reports dnr
+                 WHERE dnr.report_no = g.gr_no ORDER BY dnr.id DESC LIMIT 1) AS dn_no,
+               g.report_ident AS ident
+        FROM gr_reports g
+        JOIN test_requests tr ON tr.test_request_id = g.test_request_id
+        LEFT JOIN samples s ON s.gr_id = g.gr_id
+        LEFT JOIN quotation_items qi ON qi.item_id = s.assigned_quotation_item_id
+        WHERE tr.project_id = %s {extra}
+        GROUP BY g.gr_id, g.gr_no, g.gr_date, g.gr_seq, tr.request_no, g.report_ident
+        ORDER BY g.gr_date, g.gr_seq
+    """, params)
+    out = []
+    for r in cur.fetchall():
+        out.append({
+            "gr_id": r[0],
+            "gr_no": r[1],
+            "gr_date": r[2].strftime("%Y-%m-%d") if r[2] else None,
+            "gq_no": r[3],
+            "raw_status": r[4],
+            "status": _gr_status_label(r[4]),
+            "test_count": int(r[5] or 0),
+            "tests": _summarise_tests(r[7]),
+            "cost": round(float(r[6] or 0), 2),
+            "delivery_note_no": r[8],
+            "already_delivered": r[8] is not None,
+            "ident": r[9] or "",                                     # e.g. "CAR 123 BF 234 R# 566"
+            "description": _dn_description(_summarise_tests(r[7]), r[9]),
+        })
+    return out
+
+
+def _dn_project_row(cur, project_id: int):
+    cur.execute("""
+        SELECT p.project_id, p.project_no, p.is_walk_in, p.walk_in_client, p.walk_in_phone,
+               p.consultant, p.plot_no, p.client_name, p.project_name, c.name
+        FROM projects p
+        LEFT JOIN clients c ON c.client_id = p.client_id
+        WHERE p.project_id = %s
+    """, (project_id,))
+    r = cur.fetchone()
+    if not r:
+        raise HTTPException(404, "Project not found")
+    is_wi = bool(r[2])
+    if is_wi:
+        contractor = r[3] or r[8] or "—"
+        client_field = r[7] or ""
+        phone = r[4] or ""
+    else:
+        contractor = r[9] or r[7] or "—"
+        client_field = r[9] or r[7] or ""
+        phone = ""
+    return {
+        "project_id": r[0], "project_no": r[1], "is_walk_in": is_wi,
+        "contractor": contractor, "phone": phone, "consultant": r[5] or "",
+        "plot_no": r[6] or "", "client_name": client_field,
+        "project_name": r[8] or contractor,
+        "customer_name": contractor,
+    }
+
+
+# ----------------------------------------------------------------------------
+# 1. GET - all GRs of an LP (any number of GQs), with status + cost
+# ----------------------------------------------------------------------------
+@router.get("/projects/{project_id}/grs-for-delivery-note")
+def get_grs_for_delivery_note(project_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_dn_invoice_schema(cur)
+        conn.commit()
+        proj = _dn_project_row(cur, project_id)
+        grs = _fetch_project_grs(cur, project_id)
+        return {
+            "project_id": project_id,
+            "project_no": proj["project_no"],
+            "project_name": proj["project_name"],
+            "is_walk_in": proj["is_walk_in"],
+            "total_reports": len(grs),
+            "reports": grs,
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        traceback.print_exc()
+        raise HTTPException(500, f"Error loading reports: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ----------------------------------------------------------------------------
+# 2. POST - create a Delivery Note (D.O) from selected GRs + download the xlsx
+# ----------------------------------------------------------------------------
+class GRDeliveryNoteRequest(BaseModel):
+    project_id: int
+    gr_nos: List[str]
+
+
+# ----------------------------------------------------------------------------
+# "Invoice Use" sheet of delivery_note.xlsx
+# One line per (GR, rate): a GR whose tests have different rates gets 2/3 lines
+# with the same description; the Report No. is only written on the first line.
+# Rate = quotation item unit_rate (fallback: sample unit_rate).
+# ----------------------------------------------------------------------------
+INVOICE_USE_SHEET = "Invoice Use"
+INVOICE_USE_FIRST_ROW = 13
+INVOICE_USE_LAST_ROW = 50
+
+
+def _fetch_gr_rate_lines(cur, gr_ids):
+    """{gr_id: [(qty, rate), ...]} - samples of each GR grouped by rate, first-seen order."""
+    if not gr_ids:
+        return {}
+    cur.execute("""
+        SELECT gr_id, rate, COUNT(*) AS qty
+        FROM (
+            SELECT s.gr_id, s.sample_id,
+                   ROUND(COALESCE(qi.unit_rate, s.unit_rate, 0)::numeric, 2) AS rate
+            FROM samples s
+            LEFT JOIN quotation_items qi ON qi.item_id = s.assigned_quotation_item_id
+            WHERE s.gr_id = ANY(%s)
+        ) t
+        GROUP BY gr_id, rate
+        ORDER BY gr_id, MIN(sample_id)
+    """, (list(gr_ids),))
+    out = {}
+    for gr_id, rate, qty in cur.fetchall():
+        out.setdefault(gr_id, []).append((int(qty), float(rate or 0)))
+    return out
+
+
+def _fill_invoice_use(ws, grs, rate_lines):
+    """Fill A (Report No.), B (Description), G (No. Tests), H (Rate). Total (I) is a template formula."""
+    lines = []
+    for g in grs:
+        rl = rate_lines.get(g["gr_id"]) or [(g["test_count"] or 1, 0.0)]
+        for k, (qty, rate) in enumerate(rl):
+            lines.append((g["gr_no"] if k == 0 else None,
+                          g["description"], qty, rate if rate else None))   # no rate found -> blank, fill by hand
+    cap = INVOICE_USE_LAST_ROW - INVOICE_USE_FIRST_ROW + 1
+    if len(lines) > cap:
+        raise HTTPException(
+            400, f"Invoice Use holds {cap} lines but these reports need {len(lines)} "
+                 f"(one line per rate). Select fewer reports for this Delivery Note.")
+    for i in range(cap):
+        row = INVOICE_USE_FIRST_ROW + i
+        a, b, qty, rate = lines[i] if i < len(lines) else (None, None, None, None)
+        set_cell(ws, f"A{row}", a)
+        set_cell(ws, f"B{row}", b)
+        set_cell(ws, f"G{row}", qty)
+        set_cell(ws, f"H{row}", rate)
+
+
+@router.post("/delivery-notes/generate-from-grs")
+def generate_delivery_note_from_grs(payload: GRDeliveryNoteRequest):
+    import re as _re2
+    import urllib.parse as _up2
+    from copy import copy as _copy2
+
+    if not payload.gr_nos:
+        raise HTTPException(400, "Select at least one report (GR)")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_dn_invoice_schema(cur)
+        proj = _dn_project_row(cur, payload.project_id)
+
+        wanted = list(dict.fromkeys(payload.gr_nos))          # de-dupe, keep order
+        grs = _fetch_project_grs(cur, payload.project_id, wanted)
+        found = {g["gr_no"] for g in grs}
+        missing = [g for g in wanted if g not in found]
+        if missing:
+            raise HTTPException(400, f"Not part of this LP: {', '.join(missing)}")
+        already = [f'{g["gr_no"]} (in D.O {g["delivery_note_no"]})' for g in grs if g["already_delivered"]]
+        if already:
+            raise HTTPException(400, "Already on a Delivery Note: " + ", ".join(already))
+
+        dn_no = generate_delivery_note_number(cur)
+
+        # ---- fill the template -------------------------------------------
+        template_path = _download_dn_template()
+        wb = openpyxl.load_workbook(template_path, data_only=False)
+        ws = wb.active
+        stamp_trn(ws)
+
+        set_cell(ws, "B7", dn_no)
+        set_cell(ws, "B8", proj["project_no"])
+        set_cell(ws, "B9", proj["customer_name"])
+
+        START_ROW = 13
+        LAST_TEMPLATE_ROW = 53
+        slots = LAST_TEMPLATE_ROW - START_ROW + 1
+        if len(grs) > slots:
+            extra = len(grs) - slots
+            ws.insert_rows(LAST_TEMPLATE_ROW + 1, amount=extra)
+            for i in range(extra):
+                for col in range(1, 14):
+                    src = ws.cell(row=LAST_TEMPLATE_ROW, column=col)
+                    tgt = ws.cell(row=LAST_TEMPLATE_ROW + 1 + i, column=col)
+                    tgt.font = _copy2(src.font)
+                    tgt.border = _copy2(src.border)
+                    tgt.fill = _copy2(src.fill)
+                    tgt.number_format = src.number_format
+                    tgt.alignment = _copy2(src.alignment)
+
+        for row in range(START_ROW, START_ROW + max(len(grs), slots)):
+            for col in ("A", "B", "G"):
+                set_cell(ws, f"{col}{row}", None)
+        for i, g in enumerate(grs):
+            row = START_ROW + i
+            set_cell(ws, f"A{row}", g["gr_no"])
+            set_cell(ws, f"B{row}", g["description"])   # "<tests> - CAR 123 BF 234 R# 566"
+            set_cell(ws, f"G{row}", g["test_count"] or 1)
+
+        # ---- Invoice Use sheet (one line per distinct rate) ---------------
+        if INVOICE_USE_SHEET in wb.sheetnames:
+            _fill_invoice_use(wb[INVOICE_USE_SHEET], grs,
+                              _fetch_gr_rate_lines(cur, [g["gr_id"] for g in grs]))
+
+        # ---- save file ----------------------------------------------------
+        output_dir = "generated_delivery_notes"
+        os.makedirs(output_dir, exist_ok=True)
+        clean = lambda t: _re2.sub(r"\s+", "-", _re2.sub(r'[\\/*?:"<>|]', "-", str(t or "").strip())).strip("-")
+        filename = f"DN-{dn_no.replace('/', '-')}-{clean(proj['project_no'])}.xlsx"
+        filepath = os.path.join(output_dir, filename)
+        wb.save(filepath)
+
+        # ---- record the D.O (must succeed - invoices are built from it) ----
+        cur.execute("""
+            INSERT INTO delivery_notes (delivery_note_no, project_id, generated_by, total_reports, file_path)
+            VALUES (%s, %s, NULL, %s, %s)
+        """, (dn_no, payload.project_id, len(grs), filepath))
+        for g in grs:
+            cur.execute("""
+                INSERT INTO delivery_note_reports (delivery_note_no, report_no)
+                VALUES (%s, %s) ON CONFLICT (delivery_note_no, report_no) DO NOTHING
+            """, (dn_no, g["gr_no"]))
+        conn.commit()
+
+        encoded = _up2.quote(filename)
+        return FileResponse(
+            filepath,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition":
+                     f"attachment; filename*=UTF-8''{encoded}; filename=\"{filename}\""},
+        )
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        traceback.print_exc()
+        raise HTTPException(500, f"Error generating delivery note: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ----------------------------------------------------------------------------
+# 3. GET - D.O list for the invoice "selecting area" (ref no + total cost)
+# ----------------------------------------------------------------------------
+def _fetch_dns(cur, project_id: int, dn_nos=None):
+    extra = ""
+    params = [project_id]
+    if dn_nos is not None:
+        extra = "AND dn.delivery_note_no = ANY(%s)"
+        params.append(list(dn_nos))
+    cur.execute(f"""
+        SELECT dn.delivery_note_id, dn.delivery_note_no, dn.generated_at,
+               dn.proforma_invoice_id, dn.tax_invoice_id,
+               pi.invoice_no, ti.invoice_no
+        FROM delivery_notes dn
+        LEFT JOIN invoices pi ON pi.invoice_id = dn.proforma_invoice_id
+        LEFT JOIN invoices ti ON ti.invoice_id = dn.tax_invoice_id
+        WHERE dn.project_id = %s {extra}
+        ORDER BY dn.delivery_note_id
+    """, params)
+    rows = cur.fetchall()
+    if not rows:
+        return []
+    nos = [r[1] for r in rows]
+
+    # live cost per D.O  (official, possibly edited, rate of every test in every GR)
+    cur.execute("""
+        SELECT dnr.delivery_note_no,
+               COUNT(DISTINCT dnr.report_no),
+               COALESCE(SUM(COALESCE(qi.unit_rate, s.unit_rate, 0)), 0),
+               ARRAY_AGG(DISTINCT dnr.report_no)
+        FROM delivery_note_reports dnr
+        LEFT JOIN gr_reports g ON g.gr_no = dnr.report_no
+        LEFT JOIN samples s ON s.gr_id = g.gr_id
+        LEFT JOIN quotation_items qi ON qi.item_id = s.assigned_quotation_item_id
+        WHERE dnr.delivery_note_no = ANY(%s)
+        GROUP BY dnr.delivery_note_no
+    """, (nos,))
+    cost = {r[0]: (int(r[1] or 0), round(float(r[2] or 0), 2), sorted(r[3] or [])) for r in cur.fetchall()}
+
+    out = []
+    for r in rows:
+        n_reports, total, gr_nos = cost.get(r[1], (0, 0.0, []))
+        if r[3] is None:
+            state = "NEW"
+        elif r[4] is None:
+            state = "PROFORMA_ISSUED"
+        else:
+            state = "INVOICED"
+        out.append({
+            "delivery_note_id": r[0],
+            "delivery_note_no": r[1],
+            "created_at": r[2],
+            "date": r[2].strftime("%d-%b-%Y") if r[2] else None,
+            "report_count": n_reports,
+            "gr_nos": gr_nos,
+            "total": total,                       # excl. VAT
+            "state": state,
+            "proforma_invoice_id": r[3],
+            "proforma_no": r[5],
+            "tax_invoice_id": r[4],
+            "tax_no": r[6],
+        })
+    return out
+
+
+@router.get("/projects/{project_id}/delivery-notes-for-invoice")
+def get_delivery_notes_for_invoice(project_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_dn_invoice_schema(cur)
+        conn.commit()
+        _dn_project_row(cur, project_id)
+        dns = _fetch_dns(cur, project_id)
+        for d in dns:
+            d.pop("created_at", None)
+        return {"project_id": project_id, "delivery_notes": dns}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        traceback.print_exc()
+        raise HTTPException(500, f"Error loading delivery notes: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ----------------------------------------------------------------------------
+# 4. POST - invoices built from Delivery Notes
+#     BOTH          -> Proforma + Tax in one workbook
+#     PROFORMA_ONLY -> Proforma (sheet 2 blank); D.O stays "Proforma issued"
+#     TAX_ONLY      -> Tax for an earlier Proforma (all D.O's on that proforma)
+#
+#  Sheet lines (one per D.O):
+#     A  D.N.No   = D.O ref          B  D.N Date = date the D.O was created
+#     D  Particulars = "Testing Charges as per the attached D.O Number <ref>"
+#     I  Qty = 1                     J  Rate = blank
+#     K  Amount = total cost of the D.O   (VAT / grand total work as usual)
+# ----------------------------------------------------------------------------
+class DNInvoiceRequest(BaseModel):
+    project_id: int
+    generation_mode: Literal['BOTH', 'PROFORMA_ONLY', 'TAX_ONLY'] = 'BOTH'
+    delivery_note_nos: Optional[List[str]] = None     # BOTH / PROFORMA_ONLY
+    proforma_invoice_id: Optional[int] = None         # TAX_ONLY
+    mode_of_payment: Optional[Literal['CASH', 'CHEQUE', 'BANK_TRANSFER']] = None  # BOTH / TAX_ONLY (popup)
+
+
+def _dn_sheet_items(dns, amounts):
+    items = []
+    for d in dns:
+        dn_no = d["delivery_note_no"]
+        items.append({
+            "report_no": dn_no,
+            "report_created_at": d["created_at"],
+            "description": f"Testing Charges as per the attached D.O Number {dn_no}",
+            "quantity": 1,
+            "unit_rate": None,
+            "blank_rate": True,
+            "amount": float(amounts[dn_no]),
+        })
+    return items
+
+
+@router.post("/delivery-notes/generate-invoice")
+def generate_invoice_from_delivery_notes(payload: DNInvoiceRequest):
+    import re as _re3
+    import urllib.parse as _up3
+
+    # BOTH and TAX_ONLY create a Tax Invoice → Mode of Payment required
+    if payload.generation_mode in ("BOTH", "TAX_ONLY"):
+        normalize_mop(payload.mode_of_payment)
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_dn_invoice_schema(cur)
+        ensure_payment_receipt_columns(cur)
+        proj = _dn_project_row(cur, payload.project_id)
+        if not proj["project_no"] or proj["project_no"] == "PENDING":
+            raise HTTPException(400, "LP number has not been generated for this project yet")
+
+        mode = payload.generation_mode
+        today = date.today()
+        today_str = today.strftime("%d-%b-%Y")
+        payment_method = "CREDIT"
+        payment_terms = "30 days"
+        svc_desc = f"Testing services — {proj['project_name']}"
+
+        # ======================= TAX ONLY ===================================
+        if mode == "TAX_ONLY":
+            if not payload.proforma_invoice_id:
+                raise HTTPException(400, "Select the Proforma Invoice to convert")
+            cur.execute("""
+                SELECT invoice_id, invoice_no, project_id, invoice_type, invoice_date,
+                       subtotal, vat, total, amount_in_words, payment_status, paid_date
+                FROM invoices WHERE invoice_id = %s
+            """, (payload.proforma_invoice_id,))
+            pf = cur.fetchone()
+            if not pf or pf[2] != payload.project_id or pf[3] != "PROFORMA":
+                raise HTTPException(404, "Proforma invoice not found for this project")
+
+            cur.execute("""
+                SELECT delivery_note_no FROM delivery_notes
+                WHERE project_id = %s AND proforma_invoice_id = %s AND tax_invoice_id IS NULL
+            """, (payload.project_id, pf[0]))
+            dn_nos = [r[0] for r in cur.fetchall()]
+            if not dn_nos:
+                raise HTTPException(400, f"Proforma {pf[1]} has no pending Delivery Notes (already converted?)")
+            dns = _fetch_dns(cur, payload.project_id, dn_nos)
+
+            # amounts exactly as on the proforma (stored on its invoice_items)
+            cur.execute("""
+                SELECT test_standard, amount FROM invoice_items WHERE invoice_id = %s
+            """, (pf[0],))
+            stored = {}
+            for ts, amt in cur.fetchall():
+                if ts and ts.startswith("D.O "):
+                    stored[ts[4:]] = float(amt or 0)
+            amounts = {d["delivery_note_no"]: stored.get(d["delivery_note_no"], d["total"]) for d in dns}
+
+            subtotal = float(pf[5] or 0)
+            vat = float(pf[6] or 0)
+            grand_total = float(pf[7] or 0)
+            words = pf[8] or number_to_words(grand_total)
+            proforma_no = pf[1]
+            proforma_date_str = pf[4].strftime("%d-%b-%Y") if pf[4] else today_str
+
+            tax_no = generate_invoice_no(cur, "TAX")
+            cur.execute("""
+                INSERT INTO invoices (
+                    invoice_no, project_id, invoice_type, payment_method, invoice_date,
+                    lpo_reference, payment_terms, subtotal, vat, total, amount_in_words,
+                    services_description, remarks, payment_status, paid_date, generation_mode
+                ) VALUES (%s,%s,'TAX',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'UNPAID',NULL,'TAX_ONLY')
+                RETURNING invoice_id
+            """, (tax_no, payload.project_id, payment_method, today, proj["project_no"],
+                  payment_terms, subtotal, vat, grand_total, words, svc_desc,
+                  f"Proforma Invoice No: {proforma_no}"))
+            tax_invoice_id = cur.fetchone()[0]
+            for d in dns:
+                amt = amounts[d["delivery_note_no"]]
+                cur.execute("""
+                    INSERT INTO invoice_items (invoice_id, description, test_standard, unit_rate, quantity, amount)
+                    VALUES (%s,%s,%s,%s,1,%s)
+                """, (tax_invoice_id,
+                      f"Testing Charges as per the attached D.O Number {d['delivery_note_no']}",
+                      f"D.O {d['delivery_note_no']}", amt, amt))
+            cur.execute("""
+                UPDATE delivery_notes SET tax_invoice_id = %s
+                WHERE project_id = %s AND proforma_invoice_id = %s AND tax_invoice_id IS NULL
+            """, (tax_invoice_id, payload.project_id, pf[0]))
+            cur.execute("UPDATE invoices SET remarks = %s WHERE invoice_id = %s",
+                        (f"Tax Invoice No: {tax_no}", pf[0]))
+            # Tax Invoice made → PAID + Mode of Payment + Receipt No. + P Number
+            finalize_tax_payment(cur, tax_invoice_id, payload.mode_of_payment,
+                                 also_invoice_ids=[pf[0]])
+            conn.commit()
+
+            proforma_date_for_sheet = proforma_date_str
+            tax_date_for_sheet = today_str
+            fill_proforma, fill_tax = True, True
+
+        # ===================== BOTH / PROFORMA ONLY =========================
+        else:
+            if not payload.delivery_note_nos:
+                raise HTTPException(400, "Select at least one Delivery Note")
+            wanted = list(dict.fromkeys(payload.delivery_note_nos))
+            dns = _fetch_dns(cur, payload.project_id, wanted)
+            found = {d["delivery_note_no"] for d in dns}
+            missing = [n for n in wanted if n not in found]
+            if missing:
+                raise HTTPException(400, f"Not part of this LP: {', '.join(missing)}")
+            used = [d["delivery_note_no"] for d in dns if d["state"] != "NEW"]
+            if used:
+                raise HTTPException(400, "Already invoiced / proforma issued: " + ", ".join(used))
+
+            amounts = {d["delivery_note_no"]: d["total"] for d in dns}
+            subtotal = round(sum(amounts.values()), 2)
+            vat = round(subtotal * 0.05, 2)
+            grand_total = round(subtotal + vat, 2)
+            words = number_to_words(grand_total)
+
+            proforma_no = generate_invoice_no(cur, "PROFORMA")
+            tax_no = generate_invoice_no(cur, "TAX") if mode == "BOTH" else ""
+            remarks = f"Tax Invoice No: {tax_no}" if mode == "BOTH" else "Proforma Invoice — Tax Invoice pending"
+
+            cur.execute("""
+                INSERT INTO invoices (
+                    invoice_no, project_id, invoice_type, payment_method, invoice_date,
+                    lpo_reference, payment_terms, subtotal, vat, total, amount_in_words,
+                    services_description, remarks, payment_status, paid_date, generation_mode
+                ) VALUES (%s,%s,'PROFORMA',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'UNPAID',NULL,%s)
+                RETURNING invoice_id
+            """, (proforma_no, payload.project_id, payment_method, today, proj["project_no"],
+                  payment_terms, subtotal, vat, grand_total, words, svc_desc, remarks, mode))
+            invoice_id = cur.fetchone()[0]
+            for d in dns:
+                amt = amounts[d["delivery_note_no"]]
+                cur.execute("""
+                    INSERT INTO invoice_items (invoice_id, description, test_standard, unit_rate, quantity, amount)
+                    VALUES (%s,%s,%s,%s,1,%s)
+                """, (invoice_id,
+                      f"Testing Charges as per the attached D.O Number {d['delivery_note_no']}",
+                      f"D.O {d['delivery_note_no']}", amt, amt))
+            if mode == "BOTH":
+                cur.execute("""
+                    UPDATE delivery_notes SET proforma_invoice_id = %s, tax_invoice_id = %s
+                    WHERE delivery_note_no = ANY(%s)
+                """, (invoice_id, invoice_id, wanted))
+            else:
+                cur.execute("""
+                    UPDATE delivery_notes SET proforma_invoice_id = %s
+                    WHERE delivery_note_no = ANY(%s)
+                """, (invoice_id, wanted))
+            if mode == "BOTH":
+                # Tax Invoice made → PAID + Mode of Payment + Receipt No. + P Number
+                finalize_tax_payment(cur, invoice_id, payload.mode_of_payment)
+            conn.commit()
+
+            proforma_date_for_sheet = today_str
+            tax_date_for_sheet = today_str
+            fill_proforma, fill_tax = True, (mode == "BOTH")
+
+        # ---------------------- build the workbook --------------------------
+        template_path = download_template_from_supabase("invoices_combined")
+        wb = openpyxl.load_workbook(template_path, data_only=False)
+        if len(wb.worksheets) < 2:
+            raise HTTPException(500, "Combined template must have 2 sheets (Proforma + Tax).")
+        ws_pf, ws_tx = wb.worksheets[0], wb.worksheets[1]
+
+        base = dict(
+            contractor=proj["contractor"], phone=proj["phone"], consultant=proj["consultant"],
+            client_name=proj["client_name"], plot_no=proj["plot_no"], project_name=proj["project_name"],
+            lp_number=proj["project_no"], subtotal=subtotal, vat=vat, grand_total=grand_total, words=words,
+        )
+        items = _dn_sheet_items(dns, amounts)
+        _wi_fill_proforma(ws_pf, {**base, "invoice_no": proforma_no, "date": proforma_date_for_sheet}, items)
+        if fill_tax:
+            _wi_fill_tax(ws_tx, {**base, "invoice_no": tax_no, "date": tax_date_for_sheet}, items)
+        else:
+            _wi_blank_tax_sheet(ws_tx)
+
+        output_dir = "generated_invoices"
+        os.makedirs(output_dir, exist_ok=True)
+        clean = lambda t: _re3.sub(r"\s+", "-", _re3.sub(r'[\\/*?":<>|]', "-", str(t or ""))).strip("- ")
+        pno_h = proforma_no.replace("/", "-")
+        if mode == "TAX_ONLY":
+            tno_h = tax_no.replace("/", "-")
+            filename = f"{tno_h}_{clean(proj['contractor'])}.xlsx"
+            out_path = os.path.join(output_dir, f"{pno_h}-{tno_h}-dn.xlsx")
+        elif mode == "BOTH":
+            filename = f"{clean(proj['contractor'])}.xlsx"
+            out_path = os.path.join(output_dir, f"{pno_h}-dn.xlsx")
+        else:
+            filename = f"{pno_h}_{clean(proj['contractor'])}.xlsx"
+            out_path = os.path.join(output_dir, f"{pno_h}-dn-proforma.xlsx")
+        wb.save(out_path)
+
+        encoded = _up3.quote(filename)
+        return FileResponse(
+            out_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition":
+                     f"attachment; filename*=UTF-8''{encoded}; filename=\"{filename}\""},
+        )
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        traceback.print_exc()
+        raise HTTPException(500, f"Error generating invoice from delivery notes: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def warm_invoice_schema() -> None:
+    """Optional: call once at app startup (e.g. in main.py) so no request ever runs DDL."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_client_trn_column(cur)
+        ensure_payment_receipt_columns(cur)
+        _ensure_walkin_items_invoiced_columns(cur)
+        ensure_dn_invoice_schema(cur)       # also covers delivery-note + proforma/link tables
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()

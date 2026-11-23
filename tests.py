@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from datetime import datetime
+import datetime as _dt
 from typing import Optional, List
 from db import get_connection
 from psycopg2.extras import DictCursor
@@ -522,6 +523,10 @@ class TestRequestCreate(BaseModel):
     project_id: int
     requested_by: Optional[str] = None
     template_type: Optional[str] = "soil"
+    # BackData: number the GQ as if it were created on this (past) day
+    backdate: Optional[_dt.date] = None
+    # GQ number typed/edited on screen (pencil next to the next-in-line number). Omit = auto number.
+    request_no: Optional[str] = None
 
 class TestRequestItemAdd(BaseModel):
     quotation_item_id: int   # Index (1,2,3)
@@ -543,27 +548,64 @@ class ItemStandardUpdate(BaseModel):
 # ---------------------------
 # Helper - Generate Test Request No (NEW FORMAT)
 # --------------------------- 
-def generate_request_no(cur):
-    # Get current date components
-    now = datetime.utcnow()
-    date_str = now.strftime("%d%m%y")  # DDMMYY format
-    
-    # Count existing requests for today
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM test_requests
-        WHERE DATE(created_at) = CURRENT_DATE
-    """)
-    count = cur.fetchone()[0] + 1
-    
-    # Format the sequential number
-    # 01-09, then 010, 011, 012, etc.
-    if count < 10:
-        seq_no = f"0{count}"
-    else:
-        seq_no = f"0{count}"  # This gives 010, 011, etc.
-    
-    return f"GQ-{date_str}-{seq_no}"
+def generate_request_no(cur, backdate=None):
+    """
+    GQ-DDMMYY-NN for the given day (today unless `backdate` is passed).
+
+    The next number is (highest sequence already issued for that DDMMYY) + 1,
+    read from request_no itself, so a back-dated GQ continues that day's own
+    series (last GQ-101126-010 -> GQ-101126-011) no matter when it is created.
+    Format is unchanged: 01..09, then 010, 011, ...
+    """
+    day = backdate or datetime.utcnow().date()
+    date_str = day.strftime("%d%m%y")  # DDMMYY
+    prefix = f"GQ-{date_str}-"
+
+    # Serialise per day so two users can't be handed the same number.
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("gq:" + date_str,))
+    cur.execute("SELECT request_no FROM test_requests WHERE request_no LIKE %s", (prefix + "%",))
+    highest = 0
+    for (no,) in cur.fetchall():
+        tail = (no or "")[len(prefix):]
+        if tail.isdigit():
+            highest = max(highest, int(tail))
+
+    return f"{prefix}0{highest + 1}"
+
+
+# ---------------------------
+# Next-in-line GQ number (read-only preview; nothing is reserved)
+# ---------------------------
+@router.get("/next-number")
+def preview_next_request_no(backdate: Optional[_dt.date] = None):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        return {"request_no": generate_request_no(cur, backdate)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        conn.rollback()   # releases the advisory lock taken by generate_request_no
+        cur.close()
+        conn.close()
+
+
+# A GQ number typed by hand must keep the GQ-DDMMYY-NN shape (samples/GRs are derived from it)
+import re as _re_gq
+_GQ_NO_RE = _re_gq.compile(r"^GQ-\d{6}-\d{1,4}$")
+
+
+def resolve_request_no(cur, typed, backdate=None):
+    """Hand-typed GQ number (validated, must be free) or the next auto number."""
+    typed = (typed or "").strip().upper()
+    if not typed:
+        return generate_request_no(cur, backdate)
+    if not _GQ_NO_RE.match(typed):
+        raise HTTPException(400, "GQ number must look like GQ-DDMMYY-NN (e.g. GQ-161126-05)")
+    cur.execute("SELECT 1 FROM test_requests WHERE request_no = %s", (typed,))
+    if cur.fetchone():
+        raise HTTPException(409, f"{typed} already exists. Choose a different GQ number.")
+    return typed
 
 
 # ---------------------------
@@ -585,7 +627,8 @@ def get_all_test_requests():
                 p.project_id,
                 p.project_no,
                 p.project_name,
-                tr.template_type
+                tr.template_type,
+                p.plot_no
             FROM test_requests tr
             JOIN projects p ON tr.project_id = p.project_id
             ORDER BY tr.created_at DESC
@@ -601,7 +644,9 @@ def get_all_test_requests():
                 "project_id": row[5],
                 "project_no": row[6],
                 "project_name": row[7],
-                "template_type": row[8] or "soil"
+                "template_type": row[8] or "soil",
+                # [Project No. - Plot No.]  (1 LP = 1 plot)
+                "plot_ref": f"{row[6]}-{row[9]}" if row[9] else row[6]
             }
             for row in cur.fetchall()
         ]
@@ -639,18 +684,32 @@ def create_test_request(payload: TestRequestCreate):
                 "before Test Requests can be created for this project."
             )
 
-        request_no = generate_request_no(cur)
+        backdate = payload.backdate
+        if backdate and backdate > (datetime.utcnow() + _dt.timedelta(hours=4)).date():
+            raise HTTPException(400, "BackData date cannot be in the future")
+
+        request_no = resolve_request_no(cur, payload.request_no, backdate)
 
         # Fall back to "soil" if an unrecognized/empty template_type slips through
         template_type = payload.template_type or "soil"
         if template_type not in TEMPLATE_TYPES:
             template_type = "soil"
 
-        cur.execute("""
-            INSERT INTO test_requests (project_id, request_no, requested_by, status, template_type)
-            VALUES (%s, %s, %s, 'PENDING_SAMPLES', %s)
-            RETURNING test_request_id
-        """, (payload.project_id, request_no, payload.requested_by, template_type))
+        if backdate:
+            # created_at carries the back-dated day (with the real time of day) so the
+            # GQ sorts, prints and reports under the day it belongs to.
+            created_at = _dt.datetime.combine(backdate, (datetime.utcnow() + _dt.timedelta(hours=4)).time())
+            cur.execute("""
+                INSERT INTO test_requests (project_id, request_no, requested_by, status, template_type, created_at)
+                VALUES (%s, %s, %s, 'PENDING_SAMPLES', %s, %s)
+                RETURNING test_request_id
+            """, (payload.project_id, request_no, payload.requested_by, template_type, created_at))
+        else:
+            cur.execute("""
+                INSERT INTO test_requests (project_id, request_no, requested_by, status, template_type)
+                VALUES (%s, %s, %s, 'PENDING_SAMPLES', %s)
+                RETURNING test_request_id
+            """, (payload.project_id, request_no, payload.requested_by, template_type))
 
         req_id = cur.fetchone()[0]
         conn.commit()
@@ -659,9 +718,13 @@ def create_test_request(payload: TestRequestCreate):
             "message": "Test request created",
             "test_request_id": req_id,
             "request_no": request_no,
-            "template_type": template_type
+            "template_type": template_type,
+            "backdate": backdate.isoformat() if backdate else None
         }
 
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))
@@ -995,6 +1058,7 @@ def get_test_request(test_request_id: int):
             FROM test_request_items tri
             JOIN quotation_items qi ON tri.quotation_item_id = qi.item_id
             WHERE tri.test_request_id = %s
+            ORDER BY tri.tri_id
         """, (test_request_id,))
 
         items = []
@@ -1069,15 +1133,17 @@ def update_test_request(test_request_id: int, updated_data: dict):
             )
         
         if "items" in updated_data:
+            # Same path as the per-line quantity edit, so the LP, invoice figures
+            # and test instances can never drift apart from the GQ.
             for item in updated_data["items"]:
-                cursor.execute(
-                    "UPDATE test_request_items SET quantity = %s WHERE tri_id = %s AND test_request_id = %s",
-                    (item["quantity"], item["tri_id"], test_request_id)
-                )
+                _set_gq_item_quantity(cursor, test_request_id, int(item["tri_id"]), int(item["quantity"]))
         
         conn.commit()
         return {"status": "success", "message": "Test Request updated"}
         
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))
@@ -1558,7 +1624,7 @@ def download_test_request_doc(test_request_id: int, template_type: Optional[str]
             "consultant": header[16] or "",
             "plot_no": header[17] or "",
         }
-        
+
         # Generate Excel file using the selected template type
         excel_generator = get_excel_generator(template_type)
         temp_file = excel_generator.generate_excel(test_request_data, project_data, client_data, items)
@@ -1584,54 +1650,58 @@ def download_test_request_doc(test_request_id: int, template_type: Optional[str]
 
 @router.get("/projects/remaining-tests")
 def get_projects_with_remaining_tests():
-    """Get all projects with count of remaining unused tests"""
+    """Get all projects with count of remaining unused tests (single query — no per-project round trips)"""
     conn = get_connection()
     cur = conn.cursor()
 
     try:
-        # Get all active projects whose LPO + quotation have been reviewed/verified.
+        # Active projects whose LPO + quotation have been reviewed/verified.
         # Projects still pending verification are intentionally excluded here so
         # they can't be used to raise Test Requests until confirmed accurate.
+        #
+        # A test counts as "used" only once ALL of its quantity is on some GQ.
+        # The per-item allocated quantity is pre-aggregated once (`u`) instead of
+        # running one COUNT query per project, which is what made this slow.
         cur.execute("""
             SELECT p.project_id, p.project_no, p.project_name, p.status,
-                   q.quotation_id, COUNT(qi.item_id) as total_tests
+                   COUNT(qi.item_id) AS total_tests,
+                   COUNT(qi.item_id) FILTER (
+                       WHERE GREATEST(COALESCE(qi.quantity, 1), 1) > COALESCE(u.used_qty, 0)
+                   ) AS remaining_tests,
+                   COALESCE(p.is_walk_in, FALSE), p.plot_no
             FROM projects p
             JOIN quotations q ON p.quotation_id = q.quotation_id
-            JOIN quotation_items qi ON q.quotation_id = qi.quotation_id
+            LEFT JOIN quotation_items qi ON q.quotation_id = qi.quotation_id
+            LEFT JOIN (
+                SELECT tri.quotation_item_id, tr.project_id,
+                       SUM(COALESCE(tri.quantity, 1)) AS used_qty
+                FROM test_request_items tri
+                JOIN test_requests tr ON tr.test_request_id = tri.test_request_id
+                GROUP BY tri.quotation_item_id, tr.project_id
+            ) u ON u.quotation_item_id = qi.item_id AND u.project_id = p.project_id
             WHERE p.status = 'ACTIVE' AND p.lpo_verified = TRUE
-            GROUP BY p.project_id, p.project_no, p.project_name, p.status, q.quotation_id
+            GROUP BY p.project_id, p.project_no, p.project_name, p.status,
+                     p.is_walk_in, p.plot_no
             ORDER BY p.project_id DESC
         """)
-        
-        projects = cur.fetchall()
-        
+
         result = []
-        for project in projects:
-            project_id = project[0]
-            total_tests = project[5]
-            
-            # Count used tests for this project
-            cur.execute("""
-                SELECT COUNT(DISTINCT tri.quotation_item_id)
-                FROM test_request_items tri
-                JOIN test_requests tr ON tri.test_request_id = tr.test_request_id
-                WHERE tr.project_id = %s
-            """, (project_id,))
-            
-            used_tests = cur.fetchone()[0]
-            remaining_tests = total_tests - used_tests
-            
+        for row in cur.fetchall():
+            total_tests, remaining_tests = row[4], row[5]
             result.append({
-                "project_id": project_id,
-                "project_no": project[1],
-                "project_name": project[2],
-                "status": project[3],
+                "project_id": row[0],
+                "project_no": row[1],
+                "project_name": row[2],
+                "status": row[3],
                 "total_tests": total_tests,
-                "used_tests": used_tests,
+                "used_tests": total_tests - remaining_tests,
                 "remaining_tests": remaining_tests,
-                "has_remaining_tests": remaining_tests > 0
+                "has_remaining_tests": remaining_tests > 0,
+                # walk-in LPs are always listed: their tests are added on the Create Test Request screen
+                "is_walk_in": bool(row[6]),
+                "plot_no": row[7],
             })
-        
+
         return result
 
     except Exception as e:
@@ -1642,109 +1712,112 @@ def get_projects_with_remaining_tests():
 
 
 # Add to tests.py after the existing endpoints
-@router.put("/{test_request_id}/items/{item_index}/quantity")
-def update_test_item_quantity(test_request_id: int, item_index: int, payload: ItemQuantityUpdate):
-    """Update quantity of a test request item AND sync to quotation"""
+def _set_gq_item_quantity(cur, test_request_id: int, tri_id: int, new_qty: int):
+    """
+    Single place that changes a GQ line quantity. It keeps these in step:
+      GQ line (test_request_items) -> LP line (quotation_items) -> LP totals
+      -> test instances (slots). Invoice figures read from the same rows.
+    Raises HTTPException (caller rolls back). Returns the LP totals, or None if unchanged.
+    """
+    from gr_workflow import assert_sole_holder, rebalance_tri, recalc_quotation_totals, mirror_quotation_to_walkin
+
+    if new_qty <= 0:
+        raise HTTPException(400, "Quantity must be greater than zero")
+
+    cur.execute("""
+        SELECT tri.quotation_item_id, tri.quantity, tr.status, p.quotation_id
+        FROM test_request_items tri
+        JOIN test_requests tr ON tr.test_request_id = tri.test_request_id
+        JOIN projects p ON p.project_id = tr.project_id
+        WHERE tri.tri_id = %s AND tri.test_request_id = %s
+    """, (tri_id, test_request_id))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Test request item not found")
+    quotation_item_id, old_qty, status, quotation_id = row
+
+    if old_qty == new_qty:
+        return None
+    if status not in ("PENDING_SAMPLES", "SAMPLES_RECEIVED"):
+        raise HTTPException(400, f"Cannot modify items in {status} status")
+
+    # The LP quantity is rewritten below: only safe if no other GQ holds this test.
+    assert_sole_holder(cur, tri_id)
+
+    cur.execute("UPDATE test_request_items SET quantity = %s WHERE tri_id = %s", (new_qty, tri_id))
+
+    total = None
+    if quotation_id is not None:
+        cur.execute("""
+            UPDATE quotation_items SET quantity = %s
+            WHERE item_id = %s AND quotation_id = %s
+        """, (new_qty, quotation_item_id, quotation_id))
+        recalc_quotation_totals(cur, quotation_id)
+        mirror_quotation_to_walkin(cur, quotation_id)   # keep walk_in_items (Walk-In screen/invoice) equal
+        cur.execute(
+            "SELECT total_amount, vat, grand_total FROM quotations WHERE quotation_id = %s",
+            (quotation_id,),
+        )
+        total = cur.fetchone()
+
+    # Claim / release the matching slots (raises 400 if some already have samples)
+    rebalance_tri(cur, tri_id)
+    return total
+
+
+def _qty_response(tri_id: int, new_qty: int, totals):
+    return {
+        "message": "Quantity updated and synced to quotation" if totals else "Quantity unchanged or no quotation linked",
+        "tri_id": tri_id,
+        "new_quantity": new_qty,
+        "quotation_updated": bool(totals),
+        "totals": {
+            "total_amount": float(totals[0]),
+            "vat": float(totals[1]),
+            "grand_total": float(totals[2]),
+        } if totals else None,
+    }
+
+
+@router.put("/{test_request_id}/items/by-tri/{tri_id}/quantity")
+def update_test_item_quantity_by_tri(test_request_id: int, tri_id: int, payload: ItemQuantityUpdate):
+    """Edit a GQ line's quantity by its stable tri_id (preferred over the positional route)."""
     conn = get_connection()
     cur = conn.cursor()
-
     try:
-        # 1. Get test request item details including quotation_item_id
+        totals = _set_gq_item_quantity(cur, test_request_id, tri_id, payload.quantity)
+        conn.commit()
+        return _qty_response(tri_id, payload.quantity, totals)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Error updating quantity: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.put("/{test_request_id}/items/{item_index}/quantity")
+def update_test_item_quantity(test_request_id: int, item_index: int, payload: ItemQuantityUpdate):
+    """Legacy positional route (kept for existing callers). Prefer /items/by-tri/{tri_id}/quantity."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
         cur.execute("""
-            SELECT tri.tri_id, tri.quotation_item_id, tri.quantity
-            FROM test_request_items tri
-            WHERE tri.test_request_id = %s
-            ORDER BY tri.tri_id
-            OFFSET %s LIMIT 1
+            SELECT tri_id FROM test_request_items
+            WHERE test_request_id = %s ORDER BY tri_id OFFSET %s LIMIT 1
         """, (test_request_id, item_index))
-        
         item = cur.fetchone()
-        
         if not item:
             raise HTTPException(404, "Test request item not found")
-        
-        tri_id, quotation_item_id, old_quantity = item
-        
-        # 2. Validate test request status allows changes
-        cur.execute("""
-            SELECT status FROM test_requests 
-            WHERE test_request_id = %s
-        """, (test_request_id,))
-        
-        test_request = cur.fetchone()
-        if not test_request:
-            raise HTTPException(404, "Test request not found")
-        
-        # Only allow updates if status is PENDING_SAMPLES or SAMPLES_RECEIVED
-        if test_request[0] not in ['PENDING_SAMPLES', 'SAMPLES_RECEIVED']:
-            raise HTTPException(400, f"Cannot modify items in {test_request[0]} status")
-        
-        if payload.quantity <= 0:
-            raise HTTPException(400, "Quantity must be greater than zero")
-        
-        # 3. Update test request item quantity
-        cur.execute("""
-            UPDATE test_request_items
-            SET quantity = %s
-            WHERE tri_id = %s
-            RETURNING tri_id, quantity
-        """, (payload.quantity, tri_id))
-        
-        updated = cur.fetchone()
-        
-        # 4. Sync to quotation item (if needed)
-        # Get the quotation_id from the project
-        cur.execute("""
-            SELECT q.quotation_id
-            FROM test_requests tr
-            JOIN projects p ON tr.project_id = p.project_id
-            JOIN quotations q ON p.quotation_id = q.quotation_id
-            WHERE tr.test_request_id = %s
-        """, (test_request_id,))
-        
-        quotation_result = cur.fetchone()
-        if quotation_result:
-            quotation_id = quotation_result[0]
-            
-            # Update quotation item quantity
-            cur.execute("""
-                UPDATE quotation_items
-                SET quantity = %s
-                WHERE item_id = %s AND quotation_id = %s
-                RETURNING amount
-            """, (payload.quantity, quotation_item_id, quotation_id))
-            
-            # Recalculate quotation totals
-            cur.execute("""
-                UPDATE quotations
-                SET total_amount = sub.total,
-                    vat = sub.total * 0.05,
-                    grand_total = sub.total * 1.05
-                FROM (
-                    SELECT SUM(unit_rate * quantity) as total
-                    FROM quotation_items
-                    WHERE quotation_id = %s
-                ) sub
-                WHERE quotation_id = %s
-                RETURNING total_amount, vat, grand_total
-            """, (quotation_id, quotation_id))
-            
-            totals = cur.fetchone()
-        
+        totals = _set_gq_item_quantity(cur, test_request_id, item[0], payload.quantity)
         conn.commit()
-        
-        return {
-            "message": "Quantity updated and synced to quotation",
-            "tri_id": updated[0],
-            "new_quantity": updated[1],
-            "quotation_updated": bool(quotation_result),
-            "totals": {
-                "total_amount": float(totals[0]) if quotation_result else 0,
-                "vat": float(totals[1]) if quotation_result else 0,
-                "grand_total": float(totals[2]) if quotation_result else 0,
-            } if quotation_result else None
-        }
-        
+        return _qty_response(item[0], payload.quantity, totals)
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, f"Error updating quantity: {str(e)}")

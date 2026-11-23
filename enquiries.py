@@ -4,6 +4,9 @@ from pydantic import BaseModel
 from datetime import date, datetime
 from typing import Optional, List
 from db import get_connection
+# Customer TRN lives on the shared `clients` row (same table Advance Payment,
+# Walk-In and Generate Invoice use) — see advance_payments.py
+from advance_payments import ensure_client_trn_column, clean_trn, ClientTRNUpdate
 
 router = APIRouter(prefix="/enquiries", tags=["2. Enquiries"])
 
@@ -39,6 +42,7 @@ class ClientCreate(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
+    trn: Optional[str] = None            # Customer TRN
 
 class ClientOut(BaseModel):
     client_id: int
@@ -48,6 +52,7 @@ class ClientOut(BaseModel):
     phone: Optional[str] = None
     address: Optional[str] = None
     created_at: Optional[datetime] = None
+    trn: Optional[str] = None
 
 # ----------------------------
 # CLIENT ENDPOINTS - UPDATED with POST
@@ -60,8 +65,9 @@ def get_clients():
     
     try:
         # Query to get all clients (updated to include all fields)
+        ensure_client_trn_column(cur)
         cur.execute("""
-            SELECT client_id, name, contact_person, email, phone, address, created_at 
+            SELECT client_id, name, contact_person, email, phone, address, created_at, trn
             FROM clients 
             ORDER BY name ASC
         """)
@@ -78,7 +84,8 @@ def get_clients():
                 "email": client[3],
                 "phone": client[4],
                 "address": client[5],
-                "created_at": client[6]
+                "created_at": client[6],
+                "trn": client[7]
             })
         
         return client_list
@@ -98,16 +105,18 @@ def create_client(client: ClientCreate):
     cur = conn.cursor()
     
     try:
+        ensure_client_trn_column(cur)
         cur.execute("""
-            INSERT INTO clients (name, contact_person, email, phone, address, created_at)
-            VALUES (%s, %s, %s, %s, %s, NOW())
-            RETURNING client_id, name, contact_person, email, phone, address, created_at
+            INSERT INTO clients (name, contact_person, email, phone, address, trn, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            RETURNING client_id, name, contact_person, email, phone, address, created_at, trn
         """, (
             client.name,
             client.contact_person,
             client.email,
             client.phone,
-            client.address
+            client.address,
+            clean_trn(client.trn)
         ))
         
         row = cur.fetchone()
@@ -120,7 +129,8 @@ def create_client(client: ClientCreate):
             "email": row[3],
             "phone": row[4],
             "address": row[5],
-            "created_at": row[6]
+            "created_at": row[6],
+            "trn": row[7]
         }
         
     except Exception as e:
@@ -139,8 +149,9 @@ def get_client_by_id(client_id: int):
     cur = conn.cursor()
     
     try:
+        ensure_client_trn_column(cur)
         cur.execute("""
-            SELECT client_id, name, contact_person, email, phone, address, created_at 
+            SELECT client_id, name, contact_person, email, phone, address, created_at, trn
             FROM clients 
             WHERE client_id = %s
         """, (client_id,))
@@ -157,13 +168,41 @@ def get_client_by_id(client_id: int):
             "email": client[3],
             "phone": client[4],
             "address": client[5],
-            "created_at": client[6]
+            "created_at": client[6],
+            "trn": client[7]
         }
         
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error fetching client: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.patch("/clients/{client_id}/trn")
+def update_client_trn_enq(client_id: int, payload: ClientTRNUpdate):
+    """Edit a customer's TRN (same shared `clients.trn` field as everywhere else)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_client_trn_column(cur)
+        cur.execute(
+            "UPDATE clients SET trn = %s WHERE client_id = %s RETURNING client_id, name, trn",
+            (clean_trn(payload.trn), client_id)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Client not found")
+        conn.commit()
+        return {"client_id": row[0], "name": row[1], "trn": row[2]}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()

@@ -50,6 +50,29 @@ def ensure_advance_table(cur):
     """)
 
 
+def ensure_client_trn_column(cur):
+    """
+    Customer TRN (Tax Registration Number) lives on the shared `clients` row so
+    that Advance Payment, Walk-In, Enquiries and Generate Invoice all read and
+    write the SAME value. Idempotent — safe to call on every request.
+    """
+    cur.execute("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'clients' AND column_name = 'trn'
+    """)
+    if cur.fetchone():
+        return
+    cur.execute("ALTER TABLE clients ADD COLUMN IF NOT EXISTS trn TEXT")
+    cur.connection.commit()      # one-time migration; callers invoke this before any other work
+
+
+def clean_trn(raw: Optional[str]) -> Optional[str]:
+    """Trim; empty string -> None (a customer TRN is optional)."""
+    trn = (raw or "").strip()
+    return trn or None
+
+
 # ============================================================
 # Shared helpers — also used by invoices.py during invoice creation
 # ============================================================
@@ -91,6 +114,11 @@ class ClientCreate(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
+    trn: Optional[str] = None            # Customer TRN
+
+
+class ClientTRNUpdate(BaseModel):
+    trn: Optional[str] = None            # empty / null clears the TRN
 
 
 class AdvanceTopUp(BaseModel):
@@ -108,13 +136,15 @@ def list_clients_with_advance():
     cur = conn.cursor()
     try:
         ensure_advance_table(cur)
+        ensure_client_trn_column(cur)
         cur.execute("""
             SELECT
                 c.client_id, c.name, c.contact_person, c.email, c.phone, c.address,
-                COALESCE(SUM(cap.amount), 0) AS advance_balance
+                COALESCE(SUM(cap.amount), 0) AS advance_balance,
+                c.trn
             FROM clients c
             LEFT JOIN client_advance_payments cap ON cap.client_id = c.client_id
-            GROUP BY c.client_id, c.name, c.contact_person, c.email, c.phone, c.address
+            GROUP BY c.client_id, c.name, c.contact_person, c.email, c.phone, c.address, c.trn
             ORDER BY c.name ASC
         """)
         rows = cur.fetchall()
@@ -127,6 +157,7 @@ def list_clients_with_advance():
                 "phone": r[4],
                 "address": r[5],
                 "advance_balance": float(r[6]) if r[6] is not None else 0.0,
+                "trn": r[7],
             }
             for r in rows
         ]
@@ -147,15 +178,48 @@ def add_client(payload: ClientCreate):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        ensure_client_trn_column(cur)
         cur.execute("""
-            INSERT INTO clients (name, contact_person, email, phone, address, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO clients (name, contact_person, email, phone, address, trn, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING client_id
         """, (payload.name, payload.contact_person, payload.email,
-              payload.phone, payload.address, datetime.utcnow()))
+              payload.phone, payload.address, clean_trn(payload.trn), datetime.utcnow()))
         client_id = cur.fetchone()[0]
         conn.commit()
         return {"message": "Client added successfully", "client_id": client_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ============================================================
+# 2b. PATCH /advance-payments/clients/{client_id}/trn — edit a customer's TRN
+#     Single shared edit point: Advance Payment, Walk-In and Generate Invoice
+#     all call this, so the value can never drift between sections.
+# ============================================================
+
+@router.patch("/clients/{client_id}/trn", summary="Set / edit a client's customer TRN")
+def update_client_trn(client_id: int, payload: ClientTRNUpdate):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        ensure_client_trn_column(cur)
+        trn = clean_trn(payload.trn)
+        cur.execute(
+            "UPDATE clients SET trn = %s WHERE client_id = %s RETURNING client_id, name, trn",
+            (trn, client_id)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Client not found")
+        conn.commit()
+        return {"client_id": row[0], "name": row[1], "trn": row[2]}
+    except HTTPException:
+        conn.rollback(); raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(500, str(e))
