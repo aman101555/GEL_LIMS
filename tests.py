@@ -1,3 +1,4 @@
+import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from datetime import datetime
@@ -550,12 +551,12 @@ class ItemStandardUpdate(BaseModel):
 # --------------------------- 
 def generate_request_no(cur, backdate=None):
     """
-    GQ-DDMMYY-NN for the given day (today unless `backdate` is passed).
+    GQ-DDMMYY-NNN for the given day (today unless `backdate` is passed).
 
     The next number is (highest sequence already issued for that DDMMYY) + 1,
     read from request_no itself, so a back-dated GQ continues that day's own
     series (last GQ-101126-010 -> GQ-101126-011) no matter when it is created.
-    Format is unchanged: 01..09, then 010, 011, ...
+    The sequence is always zero-padded to 3 digits: 001..009, 010..099, 100..999.
     """
     day = backdate or datetime.utcnow().date()
     date_str = day.strftime("%d%m%y")  # DDMMYY
@@ -570,7 +571,19 @@ def generate_request_no(cur, backdate=None):
         if tail.isdigit():
             highest = max(highest, int(tail))
 
-    return f"{prefix}0{highest + 1}"
+    # A GQ deleted with "GQ only" leaves its samples (GS-DDMMYY-NNN/..) behind. Never hand that
+    # number out again while those samples exist; once they are gone too, the series restarts.
+    cur.execute(
+        "SELECT DISTINCT split_part(COALESCE(physical_sample_no, sample_no), '/', 1) "
+        "FROM samples WHERE COALESCE(physical_sample_no, sample_no) LIKE %s",
+        (f"GS-{date_str}-%",),
+    )
+    for (gs,) in cur.fetchall():
+        tail = (gs or "").rsplit("-", 1)[-1]
+        if tail.isdigit():
+            highest = max(highest, int(tail))
+
+    return f"{prefix}{highest + 1:03d}"
 
 
 # ---------------------------
@@ -590,9 +603,9 @@ def preview_next_request_no(backdate: Optional[_dt.date] = None):
         conn.close()
 
 
-# A GQ number typed by hand must keep the GQ-DDMMYY-NN shape (samples/GRs are derived from it)
+# A GQ number typed by hand must keep the GQ-DDMMYY-NNN shape (samples/GRs are derived from it)
 import re as _re_gq
-_GQ_NO_RE = _re_gq.compile(r"^GQ-\d{6}-\d{1,4}$")
+_GQ_NO_RE = _re_gq.compile(r"^GQ-(\d{6})-(\d{1,4})$")
 
 
 def resolve_request_no(cur, typed, backdate=None):
@@ -601,11 +614,76 @@ def resolve_request_no(cur, typed, backdate=None):
     if not typed:
         return generate_request_no(cur, backdate)
     if not _GQ_NO_RE.match(typed):
-        raise HTTPException(400, "GQ number must look like GQ-DDMMYY-NN (e.g. GQ-161126-05)")
+        raise HTTPException(400, "GQ number must look like GQ-DDMMYY-NNN (e.g. GQ-161126-005)")
+    # Typed 5 / 05 / 005 all mean the same GQ: always store the 3-digit form.
+    m = _GQ_NO_RE.match(typed)
+    typed = f"GQ-{m.group(1)}-{int(m.group(2)):03d}"
     cur.execute("SELECT 1 FROM test_requests WHERE request_no = %s", (typed,))
     if cur.fetchone():
         raise HTTPException(409, f"{typed} already exists. Choose a different GQ number.")
     return typed
+
+
+# ---------------------------
+# One-time clean-up: old GQ numbers GQ-DDMMYY-01 -> GQ-DDMMYY-001
+# ---------------------------
+def migrate_gq_numbers():
+    """
+    Pads the sequence of every existing GQ number to 3 digits (01 -> 001, 0100 -> 100).
+    Safe to run any number of times: GQs already in the 3-digit form are left alone, and a GQ whose
+    padded number is already taken by another GQ is skipped (and reported) instead of overwritten.
+    Everything else finds a GQ by its number, so nothing else needs updating.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext('gq-number-migration'))")
+        cur.execute(
+            "SELECT test_request_id, request_no FROM test_requests "
+            "WHERE request_no ~ %s ORDER BY test_request_id",
+            (r"^GQ-[0-9]{6}-[0-9]+$",),
+        )
+        rows = cur.fetchall()
+        taken = {no for _, no in rows}
+        changed, skipped = [], []
+        for tr_id, no in rows:
+            _, day, seq = no.split("-")
+            new_no = f"GQ-{day}-{int(seq):03d}"
+            if new_no == no:
+                continue
+            if new_no in taken:
+                skipped.append(no)
+                continue
+            cur.execute("UPDATE test_requests SET request_no = %s WHERE test_request_id = %s", (new_no, tr_id))
+            taken.discard(no)
+            taken.add(new_no)
+            changed.append({"from": no, "to": new_no})
+        conn.commit()
+        return {"updated": len(changed), "changed": changed, "skipped_because_number_taken": skipped}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.post("/migrate-gq-numbers")
+def migrate_gq_numbers_endpoint():
+    """Manual trigger for the clean-up above (it also runs once automatically when the app starts)."""
+    try:
+        return migrate_gq_numbers()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+try:   # runs at start-up so existing GQs are fixed without any manual step
+    _gq_migration = migrate_gq_numbers()
+    if _gq_migration["updated"] or _gq_migration["skipped_because_number_taken"]:
+        print(f"[GQ numbers] updated {_gq_migration['updated']}, "
+              f"skipped (clash) {_gq_migration['skipped_because_number_taken']}")
+except Exception as _e:
+    print(f"[GQ numbers] start-up clean-up skipped: {_e}")
 
 
 # ---------------------------
@@ -1094,6 +1172,196 @@ def get_test_request(test_request_id: int):
     finally:
         cur.close()
         conn.close()
+
+
+# ---------------------------
+# Delete a GQ  (mode = "all" | "gq_only")
+# ---------------------------
+def _gq_delete_scan(cur, test_request_id: int) -> dict:
+    """Everything hanging off a GQ, plus the reasons a delete must be refused."""
+    cur.execute("SELECT request_no, project_id FROM test_requests WHERE test_request_id = %s", (test_request_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Test request not found")
+    request_no = row[0]
+
+    cur.execute("SELECT sample_id FROM samples WHERE request_id = %s", (test_request_id,))
+    sample_ids = [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT gr_id, gr_no FROM gr_reports WHERE test_request_id = %s", (test_request_id,))
+    grs = cur.fetchall()
+    gr_nos = [g[1] for g in grs]
+
+    cur.execute(
+        """
+        SELECT r.report_id, r.report_no, r.stored_filename, COALESCE(r.is_locked, FALSE), r.status
+        FROM reports r
+        WHERE r.sample_id = ANY(%s) OR r.report_no = ANY(%s)
+           OR r.worksheet_id IN (SELECT worksheet_id FROM worksheets WHERE sample_id = ANY(%s))
+        """,
+        (sample_ids, gr_nos, sample_ids),
+    )
+    reports = cur.fetchall()
+    report_nos = list({r[1] for r in reports})
+
+    cur.execute(
+        "SELECT COUNT(*) FROM invoice_items WHERE test_request_id = %s OR sample_id = ANY(%s)",
+        (test_request_id, sample_ids),
+    )
+    invoiced_lines = int(cur.fetchone()[0])
+
+    linked_reports = 0
+    if report_nos:
+        for tbl in ("invoice_reports", "invoice_report_links", "performa_invoice_reports",
+                    "tax_invoice_reports", "delivery_note_reports"):
+            cur.execute(f"SELECT COUNT(*) FROM {tbl} WHERE report_no = ANY(%s)", (report_nos,))
+            linked_reports += int(cur.fetchone()[0])
+
+    locked = sum(1 for r in reports if r[3])
+
+    blocked_gq = blocked_all = None
+    if invoiced_lines:
+        blocked_gq = blocked_all = (
+            f"{request_no} is already on an invoice ({invoiced_lines} line(s)). "
+            "Remove it from the invoice first."
+        )
+    elif linked_reports:
+        blocked_all = (
+            f"{linked_reports} report link(s) to invoices / delivery notes exist for this GQ's reports, "
+            "so its reports cannot be deleted."
+        )
+    if not blocked_all and locked:
+        blocked_all = f"{locked} report(s) are approved and locked, so they cannot be deleted."
+
+    return {
+        "request_no": request_no, "sample_ids": sample_ids, "gr_ids": [g[0] for g in grs], "gr_nos": gr_nos,
+        "reports": reports, "blocked_gq": blocked_gq, "blocked_all": blocked_all,
+    }
+
+
+@router.get("/{test_request_id}/delete-preview")
+def delete_preview(test_request_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        sc = _gq_delete_scan(cur, test_request_id)
+        return {
+            "request_no": sc["request_no"],
+            "samples": len(sc["sample_ids"]),
+            "grs": len(sc["gr_nos"]),
+            "reports": len({r[1] for r in sc["reports"]}),
+            "blocked_gq": sc["blocked_gq"],
+            "blocked_all": sc["blocked_all"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        conn.rollback()
+        cur.close()
+        conn.close()
+
+
+@router.delete("/{test_request_id}")
+def delete_test_request(test_request_id: int, mode: str = "gq_only", deleted_by: Optional[int] = None):
+    """
+    mode=all      -> delete the GQ and every GS (samples), GR, worksheet, result and uploaded report under it.
+    mode=gq_only  -> delete just the GQ. Its samples / GRs / reports are kept (detached from the GQ);
+                     the tests go back to the LP as "not on a GQ yet".
+    In both cases the LP's tests are freed, and GQ numbering for that day continues from the highest
+    number that still exists (delete GQ-..-001 and -002 and the next one is -001 again).
+    """
+    if mode not in ("all", "gq_only"):
+        raise HTTPException(400, "mode must be 'all' or 'gq_only'")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    files_to_remove = []
+    try:
+        # serialise with sample/GR creation on this GQ
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (test_request_id,))
+        sc = _gq_delete_scan(cur, test_request_id)
+        request_no = sc["request_no"]
+        blocked = sc["blocked_all"] if mode == "all" else sc["blocked_gq"]
+        if blocked:
+            raise HTTPException(409, blocked)
+
+        sample_ids, gr_nos = sc["sample_ids"], sc["gr_nos"]
+
+        if mode == "all":
+            report_ids = [r[0] for r in sc["reports"]]
+            if report_ids:
+                cur.execute("DELETE FROM report_revisions WHERE report_id = ANY(%s)", (report_ids,))
+                cur.execute("DELETE FROM reports WHERE report_id = ANY(%s)", (report_ids,))
+                # storage files nobody else points at any more
+                names = list({r[2] for r in sc["reports"] if r[2]})
+                if names:
+                    cur.execute("SELECT DISTINCT stored_filename FROM reports WHERE stored_filename = ANY(%s)", (names,))
+                    still_used = {r[0] for r in cur.fetchall()}
+                    files_to_remove = [n for n in names if n not in still_used]
+            if sample_ids:
+                cur.execute("SELECT worksheet_id FROM worksheets WHERE sample_id = ANY(%s)", (sample_ids,))
+                ws_ids = [r[0] for r in cur.fetchall()]
+                if ws_ids:
+                    cur.execute("DELETE FROM test_results WHERE worksheet_id = ANY(%s)", (ws_ids,))
+                    cur.execute("DELETE FROM worksheet_uploads WHERE worksheet_id = ANY(%s)", (ws_ids,))
+                    cur.execute("DELETE FROM worksheets WHERE worksheet_id = ANY(%s)", (ws_ids,))
+                cur.execute("DELETE FROM samples WHERE sample_id = ANY(%s)", (sample_ids,))
+            cur.execute("DELETE FROM gr_reports WHERE test_request_id = %s", (test_request_id,))
+        else:
+            # Keep samples + GRs, just cut them loose from the GQ being deleted.
+            if sample_ids or sc["gr_ids"]:
+                for tbl, col in (("samples", "request_id"), ("samples", "assigned_tri_id"),
+                                 ("samples", "test_instance_id"), ("gr_reports", "test_request_id")):
+                    cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN {col} DROP NOT NULL")   # idempotent
+                cur.execute(
+                    "UPDATE samples SET request_id = NULL, assigned_tri_id = NULL, test_instance_id = NULL "
+                    "WHERE request_id = %s", (test_request_id,))
+                cur.execute("UPDATE gr_reports SET test_request_id = NULL WHERE test_request_id = %s", (test_request_id,))
+
+        # ---- common: free the LP's tests and remove the GQ itself ----
+        cur.execute("DELETE FROM gq_sample_batches WHERE test_request_id = %s", (test_request_id,))
+        cur.execute(
+            "UPDATE test_instances SET test_request_id = NULL, tri_id = NULL, allocated_at = NULL "
+            "WHERE test_request_id = %s", (test_request_id,))
+        cur.execute("DELETE FROM test_request_items WHERE test_request_id = %s", (test_request_id,))
+        cur.execute("DELETE FROM test_requests WHERE test_request_id = %s", (test_request_id,))
+
+        try:
+            cur.execute("SAVEPOINT audit_sp")
+            cur.execute(
+                "INSERT INTO audit_logs (entity_type, entity_id, action, old_data, new_data, performed_by, performed_at) "
+                "VALUES ('test_request', %s, %s, %s::jsonb, NULL, %s, NOW())",
+                (test_request_id, "DELETE_GQ_ALL" if mode == "all" else "DELETE_GQ_ONLY",
+                 json.dumps({"request_no": request_no, "samples": len(sample_ids), "grs": gr_nos}), deleted_by),
+            )
+        except Exception:
+            cur.execute("ROLLBACK TO SAVEPOINT audit_sp")   # auditing must never block the delete
+
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Could not delete {test_request_id}: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+    # storage clean-up is best effort and only after the DB change is safely committed
+    if files_to_remove:
+        try:
+            from reports import supabase
+            supabase.storage.from_("reports").remove(files_to_remove)
+        except Exception as e:
+            print(f"WARN: could not remove report files {files_to_remove}: {e}")
+
+    return {
+        "message": (f"{request_no} deleted together with its samples and reports"
+                    if mode == "all" else f"{request_no} deleted (samples and reports kept)"),
+        "request_no": request_no, "mode": mode,
+    }
 
 
 @router.patch("/{test_request_id}")

@@ -65,7 +65,7 @@ def range_label(base: str, start: int, end: int) -> str:
 
 def sample_base_for_gq(request_no: str) -> str:
     """
-    GQ-101126-01  -> GS-101126-001
+    GQ-101126-001 -> GS-101126-001
     GQ-101126-010 -> GS-101126-010
     The DDMMYY and sequence come straight from the GQ number so a sample can
     always be traced back to its GQ by eye.
@@ -161,6 +161,46 @@ def ensure_report_ident_columns(conn) -> None:
         _IDENT_COLS_READY = True
     finally:
         c.close()
+
+
+# ---------------------------------------------------------------------------
+# Plot number lookup. The plot no. lives on the project (or its test request /
+# quotation) depending on how the schema was migrated, so find the column(s)
+# once per process instead of hard-coding a name.
+# ---------------------------------------------------------------------------
+_PLOT_EXPR = None
+
+
+def _plot_expr(cur) -> str:
+    """SQL expression (uses aliases p = projects, tr = test_requests) yielding the plot no., or NULL."""
+    global _PLOT_EXPR
+    if _PLOT_EXPR is not None:
+        return _PLOT_EXPR
+    parts: List[str] = []
+    try:
+        cur.execute(
+            """
+            SELECT table_name, column_name FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name IN ('projects', 'test_requests', 'quotations')
+              AND column_name ILIKE '%%plot%%'
+            """
+        )
+        found = {}
+        for t, c in cur.fetchall():
+            found.setdefault(t, []).append(c)
+        for c in sorted(found.get("projects", []), key=lambda x: (x.lower() != "plot_no", x)):
+            parts.append(f'NULLIF(TRIM(p."{c}"::text), \'\')')
+        for c in sorted(found.get("test_requests", []), key=lambda x: (x.lower() != "plot_no", x)):
+            parts.append(f'NULLIF(TRIM(tr."{c}"::text), \'\')')
+        for c in sorted(found.get("quotations", []), key=lambda x: (x.lower() != "plot_no", x)):
+            parts.append(
+                f'(SELECT NULLIF(TRIM(qq."{c}"::text), \'\') FROM quotations qq WHERE qq.quotation_id = p.quotation_id)'
+            )
+    except Exception:
+        parts = []
+    _PLOT_EXPR = ("COALESCE(" + ", ".join(parts) + ")") if parts else "NULL::text"
+    return _PLOT_EXPR
 
 
 # ===========================================================================
@@ -1118,7 +1158,8 @@ def search_grs(q: str = "", limit: int = 25):
         sql = f"""
             SELECT g.gr_no, g.gr_date, tr.request_no, p.project_no, p.project_name,
                    {_gr_status_sql()} AS st,
-                   (SELECT COUNT(*) FROM samples s WHERE s.gr_id = g.gr_id)
+                   (SELECT COUNT(*) FROM samples s WHERE s.gr_id = g.gr_id),
+                   {_plot_expr(cur)} AS plot_no
             FROM gr_reports g
             JOIN test_requests tr ON tr.test_request_id = g.test_request_id
             JOIN projects p ON p.project_id = tr.project_id
@@ -1138,7 +1179,61 @@ def search_grs(q: str = "", limit: int = 25):
         return [{
             "gr_no": r[0], "gr_date": r[1], "request_no": r[2], "project_no": r[3],
             "project_name": r[4], "status": r[5], "sample_count": r[6],
+            "plot_no": r[7],
         } for r in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.get("/register")
+def sample_register(day: str):
+    """
+    Sample Register for one calendar day (YYYY-MM-DD): every GQ -> GS entry -> GR -> tests.
+
+    ONE query for the whole day. This replaces the old screen flow of /gr/search (ILIKE over
+    four columns, capped at 25 rows) followed by one /gr/{gr_no} request per GR. No schema or
+    index change needed: it filters on the GR's own date (the same `gr_date = <day>` equality
+    that GR numbering already relies on) and joins the rows that belong to those GRs.
+
+    One output row per (GR, GS entry) - the shape the register table renders directly:
+      {gq, lp, plot, gs, gr, tests[], start}
+    """
+    try:
+        d = date.fromisoformat(day)
+    except ValueError:
+        raise HTTPException(400, "day must be YYYY-MM-DD")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        plot = _plot_expr(cur)          # cached after the first call in this process
+        cur.execute(
+            f"""
+            SELECT g.gr_no, tr.request_no, p.project_no, {plot} AS plot_no,
+                   s.physical_sample_no, s.range_start, s.assigned_test_name
+            FROM gr_reports g
+            JOIN test_requests tr ON tr.test_request_id = g.test_request_id
+            JOIN projects p ON p.project_id = tr.project_id
+            LEFT JOIN samples s ON s.gr_id = g.gr_id
+            WHERE g.gr_date = %s
+            ORDER BY tr.request_no, g.gr_seq, s.range_start NULLS LAST, s.sample_id
+            """,
+            (d,),
+        )
+        groups: Dict[Tuple[str, Optional[str]], dict] = {}   # insertion order == SQL order
+        for gr_no, gq, lp, plot_no, label, start, test in cur.fetchall():
+            row = groups.get((gr_no, label))
+            if row is None:
+                row = groups[(gr_no, label)] = {
+                    "gq": gq, "lp": lp or "", "plot": plot_no or "", "gs": label or "\u2014",
+                    "gr": gr_no, "tests": [], "start": start or 0,
+                }
+            if test and test not in row["tests"]:
+                row["tests"].append(test)
+        return list(groups.values())
+    except Exception as e:
+        raise HTTPException(500, f"Error loading register: {e}")
     finally:
         cur.close()
         conn.close()
@@ -1157,7 +1252,7 @@ def gr_lineage(gr_no: str):
                    tr.request_no, tr.created_at,
                    p.project_id, p.project_no, p.project_name, p.lpo_no, p.lpo_date,
                    p.client_name, p.quotation_id, {_gr_status_sql()} AS st,
-                   g.report_ident, g.report_ident_fields
+                   g.report_ident, g.report_ident_fields, {_plot_expr(cur)} AS plot_no
             FROM gr_reports g
             JOIN test_requests tr ON tr.test_request_id = g.test_request_id
             JOIN projects p ON p.project_id = tr.project_id
@@ -1211,7 +1306,8 @@ def gr_lineage(gr_no: str):
             "gr_no": h[1], "gr_date": h[2], "created_at": h[3], "status": h[14],
             "project": {"project_id": h[7], "project_no": h[8], "project_name": h[9],
                         "lpo_no": h[10], "lpo_date": h[11], "client_name": h[12],
-                        "quotation_no": q[0] if q else None},
+                        "quotation_no": q[0] if q else None, "plot_no": h[17]},
+            "plot_no": h[17],
             "gq": {"test_request_id": h[4], "request_no": h[5], "created_at": h[6]},
             "items": items,
             "identification": _ident_fields_dict(h[16]),

@@ -354,3 +354,124 @@ def get_advance_history(client_id: int):
     finally:
         cur.close()
         conn.close()
+
+# ============================================================
+# 6. CONTRACTORS & CONSULTANTS
+#    Same shape as `clients` (name, contact person, phone, email, address) but
+#    kept in their own tables. They have NO advance ledger — advance payments
+#    only apply to clients. Used by:
+#       - Advance Payment section  (tabs + "+ Add")
+#       - New Walk-In Customer     (Contractor / Consultant search + green "+")
+#       - Create Project           (Contractor / Consultant search + green "+")
+#    Projects/walk-ins still store the name as plain text, so nothing existing
+#    changes — these tables only power the searchable lists.
+# ============================================================
+
+PARTY_KINDS = {
+    "contractor": {"table": "contractors", "id_col": "contractor_id", "label": "Contractor"},
+    "consultant": {"table": "consultants", "id_col": "consultant_id", "label": "Consultant"},
+}
+
+
+def ensure_party_table(cur, kind: str):
+    """Create contractors / consultants table if missing. Idempotent."""
+    cfg = PARTY_KINDS[kind]
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {cfg['table']} (
+            {cfg['id_col']}  SERIAL PRIMARY KEY,
+            name             TEXT NOT NULL,
+            contact_person   TEXT,
+            email            TEXT,
+            phone            TEXT,
+            address          TEXT,
+            created_at       TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    # DDL is transactional in Postgres — commit so a GET-only request still keeps the table.
+    cur.connection.commit()
+
+
+class PartyCreate(BaseModel):
+    name: str
+    contact_person: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+
+
+def _party_row(kind: str, r) -> dict:
+    return {
+        "id": r[0],
+        f"{kind}_id": r[0],
+        "name": r[1],
+        "contact_person": r[2],
+        "email": r[3],
+        "phone": r[4],
+        "address": r[5],
+        "created_at": r[6].isoformat() if r[6] else None,
+    }
+
+
+def _register_party_routes(kind: str, plural: str):
+    cfg = PARTY_KINDS[kind]
+    table, id_col, label = cfg["table"], cfg["id_col"], cfg["label"]
+
+    @router.get(f"/{plural}", summary=f"List all {plural}")
+    def list_parties():
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            ensure_party_table(cur, kind)
+            cur.execute(f"""
+                SELECT {id_col}, name, contact_person, email, phone, address, created_at
+                FROM {table}
+                ORDER BY name ASC
+            """)
+            return [_party_row(kind, r) for r in cur.fetchall()]
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(500, str(e))
+        finally:
+            cur.close()
+            conn.close()
+
+    @router.post(f"/{plural}", summary=f"Add a new {kind}")
+    def create_party(payload: PartyCreate):
+        name = (payload.name or "").strip()
+        if not name:
+            raise HTTPException(400, f"{label} name is required")
+
+        def clean(v):
+            v = (v or "").strip()
+            return v or None
+
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            ensure_party_table(cur, kind)
+
+            cur.execute(f"SELECT 1 FROM {table} WHERE LOWER(name) = LOWER(%s) LIMIT 1", (name,))
+            if cur.fetchone():
+                raise HTTPException(400, f'{label} "{name}" already exists')
+
+            cur.execute(f"""
+                INSERT INTO {table} (name, contact_person, email, phone, address, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING {id_col}, name, contact_person, email, phone, address, created_at
+            """, (name, clean(payload.contact_person), clean(payload.email),
+                  clean(payload.phone), clean(payload.address), datetime.utcnow()))
+            row = cur.fetchone()
+            conn.commit()
+            return {**_party_row(kind, row), "message": f"{label} added successfully"}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(500, str(e))
+        finally:
+            cur.close()
+            conn.close()
+
+
+_register_party_routes("contractor", "contractors")
+_register_party_routes("consultant", "consultants")
